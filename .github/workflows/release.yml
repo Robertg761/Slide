@@ -28,6 +28,23 @@ jobs:
           java-version: "17"
           cache: gradle
 
+      - name: Resolve native cache key
+        id: native-cache-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ndk=28.2.13676358" >> "$GITHUB_OUTPUT"
+          echo "cmake=3.22.1" >> "$GITHUB_OUTPUT"
+
+      - name: Restore native CMake intermediates
+        id: native-cache
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        with:
+          path: |
+            asr/.cxx
+            asr/build/intermediates/cxx
+          key: native-cmake-${{ runner.os }}-ndk${{ steps.native-cache-key.outputs.ndk }}-cmake${{ steps.native-cache-key.outputs.cmake }}-${{ hashFiles('asr/src/main/cpp/**', 'third_party/whisper.cpp/**', '**/build.gradle.kts', 'gradle/**', 'gradle.properties') }}
+
       - name: Validate release metadata
         id: metadata
         env:
@@ -82,7 +99,16 @@ jobs:
           SLIDE_SIGNING_STORE_PASSWORD: ${{ secrets.SLIDE_SIGNING_STORE_PASSWORD }}
           SLIDE_SIGNING_KEY_ALIAS: ${{ secrets.SLIDE_SIGNING_KEY_ALIAS }}
           SLIDE_SIGNING_KEY_PASSWORD: ${{ secrets.SLIDE_SIGNING_KEY_PASSWORD }}
-        run: ./gradlew --no-daemon :app:assembleRelease
+        run: ./gradlew --no-daemon --configuration-cache :app:assembleRelease
+
+      - name: Save native CMake intermediates
+        if: ${{ success() && steps.native-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        with:
+          path: |
+            asr/.cxx
+            asr/build/intermediates/cxx
+          key: ${{ steps.native-cache.outputs.cache-primary-key }}
 
       - name: Prepare release files
         id: dist

@@ -5,6 +5,8 @@ plugins {
 android {
     namespace = "com.slide.asr"
     compileSdk = 37
+    // Pin the native toolchain both for reproducible releases and cache invalidation.
+    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         minSdk = 26
