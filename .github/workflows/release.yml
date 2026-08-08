@@ -1,0 +1,120 @@
+name: Release APK
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Validate release metadata
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Expected a SemVer tag such as v0.1.0-alpha.1; got $RELEASE_TAG" >&2
+            exit 1
+          fi
+          version="${RELEASE_TAG#v}"
+          gradle_version="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)"/\1/p' app/build.gradle.kts)"
+          if [ "$gradle_version" != "$version" ]; then
+            echo "Tag $RELEASE_TAG does not match app versionName $gradle_version" >&2
+            exit 1
+          fi
+          git fetch origin main --depth=1
+          if [ "$(git rev-parse "$GITHUB_SHA")" != "$(git rev-parse origin/main)" ]; then
+            echo "Release tag must point to the current main HEAD." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Verify signing secrets
+        env:
+          KEYSTORE_B64: ${{ secrets.SLIDE_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.SLIDE_SIGNING_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SLIDE_SIGNING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.SLIDE_SIGNING_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in KEYSTORE_B64 STORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!name:-}" ]; then echo "Missing required secret: SLIDE_${name#KEYSTORE_}" >&2; exit 1; fi
+          done
+
+      - name: Decode signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.SLIDE_KEYSTORE_B64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          key_path="$RUNNER_TEMP/slide-release.jks"
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$key_path"
+          echo "SLIDE_SIGNING_STORE_FILE=$key_path" >> "$GITHUB_ENV"
+          echo "SLIDE_SIGNING_STORE_TYPE=PKCS12" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK
+        env:
+          SLIDE_SIGNING_STORE_PASSWORD: ${{ secrets.SLIDE_SIGNING_STORE_PASSWORD }}
+          SLIDE_SIGNING_KEY_ALIAS: ${{ secrets.SLIDE_SIGNING_KEY_ALIAS }}
+          SLIDE_SIGNING_KEY_PASSWORD: ${{ secrets.SLIDE_SIGNING_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon :app:assembleRelease
+
+      - name: Prepare release files
+        id: dist
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir dist
+          apk="$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' -print -quit)"
+          [ -n "$apk" ] || { echo "Release APK was not found." >&2; exit 1; }
+          output="dist/Slide-${VERSION}.apk"
+          cp "$apk" "$output"
+          awk -v version="$VERSION" '
+            $0 ~ "^## \\[" version "\\]" { found=1 }
+            found { print }
+            found && NR > 1 && $0 ~ "^## \\[" && $0 !~ "^## \\[" version "\\]" { exit }
+          ' CHANGELOG.md > dist/release-notes.md
+          [ -s dist/release-notes.md ] || { echo "No CHANGELOG section found for $VERSION" >&2; exit 1; }
+          echo "apk=$output" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: dist/release-notes.md
+          files: ${{ steps.dist.outputs.apk }}
+          prerelease: ${{ steps.metadata.outputs.prerelease == 'true' }}
+
+      - name: Upload workflow artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Slide-${{ steps.metadata.outputs.version }}
+          path: dist/*

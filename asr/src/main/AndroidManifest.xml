@@ -1,0 +1,22 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!--
+        Speech recognition is not required for the keyboard to work. Declaring the microphone as
+        optional keeps Slide installable on hardware that has none, with voice input simply absent.
+    -->
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <application>
+        <!--
+            Its own process, so that the speech model's memory belongs to something Android can
+            kill without taking the keyboard with it. Not exported: only Slide binds this.
+        -->
+        <service
+            android:name="com.slide.asr.VoiceInputService"
+            android:process=":asr"
+            android:exported="false" />
+    </application>
+
+</manifest>

@@ -1,0 +1,20 @@
+*.iml
+.gradle/
+.idea/
+build/
+local.properties
+.DS_Store
+.cxx/
+captures/
+*.apk
+*.aab
+*.hprof
+
+# Downloaded ASR models — never commit these
+/models/
+*.bin
+*.gguf
+*.ggml
+
+# ...but the lexicon is a small generated asset the build depends on, so it ships.
+!engine/src/main/assets/lexicon_en.bin
