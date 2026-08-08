@@ -170,7 +170,7 @@ packaged model. That output is what decides `WhisperModel.Default`.
 
 Nothing leaves the device during typing: speech is recognised locally, and audio is held in memory
 only for as long as it takes to transcribe. The optional update check contacts GitHub only when the
-user enables it and asks to check. Password and
+user enables it when Slide opens. Password and
 incognito fields are excluded from any learning.
 
 ## Licence and provenance

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.0-alpha.3] - 2026-08-08
+
+### Changed
+
+- Enabled update checks now run automatically when Slide opens; users still approve every download and Android installation.
+
 ## [0.1.0-alpha.2] - 2026-08-08
 
 ### Added
