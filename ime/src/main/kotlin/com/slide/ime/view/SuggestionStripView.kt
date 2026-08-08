@@ -7,6 +7,7 @@ import android.graphics.Typeface
 import android.util.TypedValue
 import android.view.MotionEvent
 import android.view.View
+import android.view.accessibility.AccessibilityNodeInfo
 import com.slide.core.theme.KeyboardTheme
 import com.slide.core.theme.Themes
 
@@ -46,6 +47,7 @@ class SuggestionStripView(context: Context) : View(context) {
     private val words = ArrayList<String>(MAX_VISIBLE)
     private var pressedIndex = -1
     private var micPressed = false
+    private var emptyMessage = "Type or swipe for suggestions"
 
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
@@ -55,6 +57,12 @@ class SuggestionStripView(context: Context) : View(context) {
         strokeWidth = dp(1f)
     }
     private val pressedPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    init {
+        isFocusable = true
+        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
+        refreshAccessibilityDescription()
+    }
 
     /**
      * Shows up to three candidates, best first, or clears the strip when given none.
@@ -66,6 +74,13 @@ class SuggestionStripView(context: Context) : View(context) {
         words.clear()
         candidates.take(MAX_VISIBLE).forEach(words::add)
         pressedIndex = -1
+        refreshAccessibilityDescription()
+        invalidate()
+    }
+
+    fun setEmptyMessage(message: String) {
+        emptyMessage = message
+        refreshAccessibilityDescription()
         invalidate()
     }
 
@@ -85,8 +100,21 @@ class SuggestionStripView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         canvas.drawColor(keyboardTheme.background)
         drawMicButton(canvas)
-        if (words.isEmpty()) return
+        if (words.isEmpty()) {
+            textPaint.color = keyboardTheme.hintText
+            textPaint.typeface = Typeface.DEFAULT
+            textPaint.textSize = minOf(sp(12f), suggestionWidth() * 0.04f)
+            val metrics = textPaint.fontMetrics
+            canvas.drawText(
+                emptyMessage,
+                suggestionWidth() / 2f,
+                height / 2f - (metrics.ascent + metrics.descent) / 2f,
+                textPaint,
+            )
+            return
+        }
 
+        textPaint.textSize = sp(16f)
         val cellWidth = suggestionWidth() / MAX_VISIBLE
         // Vertically centre on the text's own middle rather than its baseline.
         val metrics = textPaint.fontMetrics
@@ -183,8 +211,10 @@ class SuggestionStripView(context: Context) : View(context) {
                 invalidate()
 
                 if (mic) {
+                    announceForAccessibility("Voice typing")
                     listener?.onVoiceRequested()
                 } else if (index in words.indices) {
+                    announceForAccessibility("Suggestion ${words[index]}")
                     listener?.onSuggestionPicked(index, words[index])
                 }
                 return true
@@ -215,9 +245,26 @@ class SuggestionStripView(context: Context) : View(context) {
         return word.substring(0, end) + "…"
     }
 
+    override fun onInitializeAccessibilityNodeInfo(info: AccessibilityNodeInfo) {
+        super.onInitializeAccessibilityNodeInfo(info)
+        info.className = "android.view.View"
+        info.isFocusable = true
+        info.contentDescription = accessibilityDescription()
+    }
+
+    private fun refreshAccessibilityDescription() {
+        contentDescription = accessibilityDescription()
+    }
+
+    private fun accessibilityDescription(): String = buildString {
+        if (words.isEmpty()) append(emptyMessage)
+        else append("Suggestions: ").append(words.joinToString(", "))
+        append(". Voice typing button at the right")
+    }
+
     private companion object {
         const val MAX_VISIBLE = 3
-        const val HEIGHT_DP = 44f
+        const val HEIGHT_DP = 48f
 
         /** Leaves the glyph comfortably inside its square without looking lost in it. */
         const val MIC_GLYPH_FRACTION = 0.30f

@@ -54,15 +54,19 @@ is written and compiles but has **not yet run on hardware** — see *Not yet ver
 - **Emoji picker.** 1,914 emoji in nine categories, in CLDR's presentation order, reached from the
   key left of the space bar. Recently-used emoji come first, long-pressing one opens its five skin
   tones and the tone chosen becomes the default, and anything the device's font cannot draw is
-  filtered out rather than shown as an empty box. Like the voice overlay it sits over the keys, so
-  opening it never resizes the keyboard.
+  filtered out rather than shown as an empty box. It now also has a keyboard-backed search tab with
+  recent results, ranked CLDR keyword matches, and an explicit empty state. Like the voice overlay
+  it sits over the keys, so opening it never resizes the keyboard.
+- **Interaction and accessibility polish.** The symbols layer redraws immediately when selected,
+  Shift and editor-action states are visually distinct, Space moves the cursor, a leftward swipe
+  from Backspace removes the preceding word, and the keyboard panels expose useful TalkBack labels.
+  Emoji and footer controls use larger touch targets; the remaining work is device-level TalkBack,
+  font-scale, landscape, and latency verification.
 
 **Not yet built**
 - Next-word prediction (needs a bigram language-model asset) and a personal dictionary
-- Emoji search — the ranked search over CLDR keywords is built and tested in `:core`, but there is
-  no UI for it yet, because typing a query needs the keys the picker is currently covering
 - Clipboard and text-editing panels
-- Remaining appearance settings, setup-wizard polish, accessibility pass
+- Remaining appearance settings, setup-wizard polish, and full accessibility/adaptive-layout QA
 
 ## Documentation
 

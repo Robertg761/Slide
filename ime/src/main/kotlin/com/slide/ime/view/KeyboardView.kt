@@ -12,6 +12,7 @@ import android.util.TypedValue
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.accessibility.AccessibilityNodeInfo
 import com.slide.core.layout.Key
 import com.slide.core.layout.KeyType
 import com.slide.core.layout.KeyboardLayout
@@ -21,10 +22,14 @@ import com.slide.core.theme.KeyboardTheme
 import com.slide.core.theme.Themes
 import com.slide.engine.gesture.GestureKeyMap
 import com.slide.engine.gesture.GesturePoint
+import kotlin.math.abs
 import kotlin.math.hypot
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 enum class ShiftState { OFF, SHIFTED, LOCKED }
+
+enum class EnterAction { RETURN, GO, SEARCH, SEND, NEXT, DONE }
 
 /**
  * The key grid.
@@ -46,6 +51,17 @@ class KeyboardView @JvmOverloads constructor(
 
         /** Fired when a swipe completes. The decoder consumes this; see docs/technical-decisions.md. */
         fun onGestureComplete(points: List<GesturePoint>)
+
+        /** Fired while the user slides horizontally across the space bar. */
+        fun onCursorMove(steps: Int) = Unit
+
+        /** Fired when the user swipes left from Backspace to delete a preceding word. */
+        fun onDeleteWordGesture() = Unit
+
+        /** Search-mode callbacks; default implementations preserve existing embedders. */
+        fun onSearchQueryChanged(query: String) = Unit
+        fun onSearchEmojiPicked(emoji: String) = Unit
+        fun onSearchClosed() = Unit
     }
 
     var listener: Listener? = null
@@ -68,14 +84,57 @@ class KeyboardView @JvmOverloads constructor(
 
     var keyboardLayout: KeyboardLayout = Layouts.QwertyEn
         set(value) {
+            if (field == value) return
             field = value
             requestLayout()
+            // A layer switch normally keeps the same bounds. Recompute immediately as well as
+            // requesting layout; otherwise the old layer's cells remain in the hit-test map until
+            // some unrelated size change, which makes ?123 look like it did nothing.
+            if (width > 0 && height > 0) recomputeGeometry(width, height)
             invalidate()
         }
 
     var shiftState: ShiftState = ShiftState.OFF
         set(value) {
+            if (field == value) return
             field = value
+            refreshAccessibilityDescription()
+            invalidate()
+        }
+
+    var enterAction: EnterAction = EnterAction.RETURN
+        set(value) {
+            field = value
+            refreshAccessibilityDescription()
+            invalidate()
+        }
+
+    /** When true, the keyboard's top strip is an internal emoji search input. */
+    var searchMode: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            if (value) {
+                shiftState = ShiftState.OFF
+                keyboardLayout = Layouts.QwertyEn
+            }
+            requestLayout()
+            if (width > 0 && height > 0) recomputeGeometry(width, height)
+            refreshAccessibilityDescription()
+            invalidate()
+        }
+
+    var searchQuery: String = ""
+        set(value) {
+            field = value
+            refreshAccessibilityDescription()
+            invalidate()
+        }
+
+    var searchResults: List<String> = emptyList()
+        set(value) {
+            field = value.take(MAX_SEARCH_RESULTS)
+            refreshAccessibilityDescription()
             invalidate()
         }
 
@@ -104,6 +163,12 @@ class KeyboardView @JvmOverloads constructor(
         textAlign = Paint.Align.CENTER
         textSize = sp(10f)
     }
+    private val emojiPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER
+    }
+    private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        strokeWidth = dp(1f)
+    }
     private val trailPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
@@ -126,8 +191,11 @@ class KeyboardView @JvmOverloads constructor(
         val downX: Float,
         val downY: Float,
         val downTime: Long,
+        var lastX: Float = downX,
         var longPressFired: Boolean = false,
         var repeatFired: Boolean = false,
+        var cursorMove: Boolean = false,
+        var deleteWordGesture: Boolean = false,
     )
 
     private val pointers = HashMap<Int, Pointer>()
@@ -139,6 +207,17 @@ class KeyboardView @JvmOverloads constructor(
 
     private var longPressRunnable: Runnable? = null
     private var repeatRunnable: Runnable? = null
+    private var repeatPointerId: Int? = null
+    private var searchPointerActive = false
+    private var pressedSearchResult = -1
+    private var pressedSearchClose = false
+    private var cursorRemainderPx = 0f
+
+    init {
+        isFocusable = true
+        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
+        refreshAccessibilityDescription()
+    }
 
     // region Measurement and layout
 
@@ -166,18 +245,21 @@ class KeyboardView @JvmOverloads constructor(
 
     private fun recomputeGeometry(width: Int, height: Int) {
         val effective = Layouts.withNumberRow(keyboardLayout, settings.showNumberRow)
-        val contentHeight = height - topPadding - bottomInset()
+        val header = if (searchMode) searchHeaderHeight() else 0f
+        val contentHeight = (height - topPadding - bottomInset() - header).coerceAtLeast(1f)
         placedKeys = KeyGeometry.place(
             layout = effective,
             width = width.toFloat(),
             contentHeight = contentHeight,
-            topOffset = topPadding,
+            topOffset = topPadding + header,
         )
     }
 
     override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
         super.onLayout(changed, left, top, right, bottom)
-        if (changed || placedKeys.isEmpty()) recomputeGeometry(width, height)
+        // Layout changes and layer changes can both arrive with unchanged bounds. Always derive the
+        // cells from the current layout so drawing and hit testing cannot drift apart.
+        recomputeGeometry(width, height)
     }
 
     /**
@@ -214,6 +296,8 @@ class KeyboardView @JvmOverloads constructor(
 
     override fun onDraw(canvas: Canvas) {
         canvas.drawColor(keyboardTheme.background)
+
+        if (searchMode) drawSearchHeader(canvas)
 
         placedKeys.forEach { placed ->
             drawKey(canvas, placed, pressed = pointers.values.any { it.placed === placed })
@@ -255,7 +339,8 @@ class KeyboardView @JvmOverloads constructor(
         }
 
         labelPaint.color = textColorFor(key)
-        labelPaint.textSize = if (key.type == KeyType.CHARACTER) sp(22f) else sp(15f)
+        val maxText = min(placed.width * if (key.type == KeyType.CHARACTER) 0.65f else 0.8f, placed.height * 0.58f)
+        labelPaint.textSize = min(if (key.type == KeyType.CHARACTER) sp(22f) else sp(15f), maxText)
         val metrics = labelPaint.fontMetrics
         val baseline = placed.centerY - (metrics.ascent + metrics.descent) / 2f
         canvas.drawText(displayLabel(key), placed.centerX, baseline, labelPaint)
@@ -263,6 +348,7 @@ class KeyboardView @JvmOverloads constructor(
         val hint = key.hint
         if (hint != null && !settings.showNumberRow) {
             hintPaint.color = keyboardTheme.hintText
+            hintPaint.textSize = min(sp(10f), placed.width * 0.24f)
             canvas.drawText(hint, placed.right - keyGapH - dp(8f), placed.top + keyGapV + dp(13f), hintPaint)
         }
     }
@@ -271,6 +357,8 @@ class KeyboardView @JvmOverloads constructor(
     private fun drawActionIcon(canvas: Canvas, type: KeyType, placed: PlacedKey) {
         val oldStyle = labelPaint.style
         val oldStroke = labelPaint.strokeWidth
+        val oldCap = labelPaint.strokeCap
+        val oldJoin = labelPaint.strokeJoin
         labelPaint.color = textColorFor(placed.key)
         labelPaint.style = Paint.Style.STROKE
         labelPaint.strokeWidth = dp(2.1f)
@@ -283,21 +371,56 @@ class KeyboardView @JvmOverloads constructor(
                 val p = Path().apply { moveTo(x, y-r); lineTo(x-r*.78f, y-r*.1f); lineTo(x-r*.38f, y-r*.1f); lineTo(x-r*.38f, y+r); lineTo(x+r*.38f, y+r); lineTo(x+r*.38f, y-r*.1f); lineTo(x+r*.78f, y-r*.1f); close() }
                 canvas.drawPath(p, labelPaint)
                 if (shiftState == ShiftState.LOCKED) canvas.drawCircle(x, y-r*.42f, dp(1.8f), labelPaint)
+                if (shiftState == ShiftState.SHIFTED) canvas.drawLine(x-r*.35f, y+r*.72f, x+r*.35f, y+r*.72f, labelPaint)
             }
             KeyType.DELETE -> {
                 val p = Path().apply { moveTo(x-r, y); lineTo(x-r*.42f, y-r*.62f); lineTo(x+r, y-r*.62f); lineTo(x+r, y+r*.62f); lineTo(x-r*.42f, y+r*.62f); close() }
                 canvas.drawPath(p, labelPaint); canvas.drawLine(x-r*.02f, y-r*.25f, x+r*.45f, y+r*.25f, labelPaint); canvas.drawLine(x+r*.45f, y-r*.25f, x-r*.02f, y+r*.25f, labelPaint)
             }
-            KeyType.ENTER -> { canvas.drawLine(x-r, y, x+r*.65f, y, labelPaint); canvas.drawLine(x-r, y, x-r*.38f, y-r*.38f, labelPaint); canvas.drawLine(x-r, y, x-r*.38f, y+r*.38f, labelPaint); canvas.drawLine(x+r*.65f, y, x+r*.65f, y-r*.68f, labelPaint) }
+            KeyType.ENTER -> drawEnterIcon(canvas, x, y, r)
             KeyType.EMOJI -> { canvas.drawCircle(x, y, r*.78f, labelPaint); canvas.drawCircle(x-r*.28f, y-r*.16f, dp(1.3f), labelPaint); canvas.drawCircle(x+r*.28f, y-r*.16f, dp(1.3f), labelPaint); canvas.drawArc(x-r*.4f, y-r*.1f, x+r*.4f, y+r*.42f, 15f, 150f, false, labelPaint) }
             else -> Unit
         }
-        labelPaint.style = oldStyle; labelPaint.strokeWidth = oldStroke
+        labelPaint.style = oldStyle
+        labelPaint.strokeWidth = oldStroke
+        labelPaint.strokeCap = oldCap
+        labelPaint.strokeJoin = oldJoin
+    }
+
+    private fun drawEnterIcon(canvas: Canvas, x: Float, y: Float, r: Float) {
+        when (enterAction) {
+            EnterAction.RETURN -> {
+                canvas.drawLine(x-r, y, x+r*.65f, y, labelPaint)
+                canvas.drawLine(x-r, y, x-r*.38f, y-r*.38f, labelPaint)
+                canvas.drawLine(x-r, y, x-r*.38f, y+r*.38f, labelPaint)
+                canvas.drawLine(x+r*.65f, y, x+r*.65f, y-r*.68f, labelPaint)
+            }
+            EnterAction.SEARCH -> {
+                canvas.drawCircle(x-r*.18f, y-r*.12f, r*.52f, labelPaint)
+                canvas.drawLine(x+r*.2f, y+r*.26f, x+r*.72f, y+r*.78f, labelPaint)
+            }
+            EnterAction.SEND -> {
+                val p = Path().apply {
+                    moveTo(x-r*.85f, y-r*.72f); lineTo(x+r*.85f, y); lineTo(x-r*.85f, y+r*.72f)
+                    lineTo(x-r*.38f, y); close()
+                }
+                canvas.drawPath(p, labelPaint)
+            }
+            EnterAction.GO, EnterAction.NEXT -> {
+                canvas.drawLine(x-r*.8f, y, x+r*.62f, y, labelPaint)
+                canvas.drawLine(x+r*.62f, y, x+r*.18f, y-r*.42f, labelPaint)
+                canvas.drawLine(x+r*.62f, y, x+r*.18f, y+r*.42f, labelPaint)
+            }
+            EnterAction.DONE -> {
+                canvas.drawLine(x-r*.75f, y, x-r*.15f, y+r*.5f, labelPaint)
+                canvas.drawLine(x-r*.15f, y+r*.5f, x+r*.82f, y-r*.58f, labelPaint)
+            }
+        }
     }
 
     private fun drawSpaceLabel(canvas: Canvas, placed: PlacedKey) {
         labelPaint.color = keyboardTheme.hintText
-        labelPaint.textSize = sp(12f)
+        labelPaint.textSize = min(sp(12f), placed.width * 0.28f)
         val metrics = labelPaint.fontMetrics
         val baseline = placed.centerY - (metrics.ascent + metrics.descent) / 2f
         canvas.drawText(keyboardLayout.label, placed.centerX, baseline, labelPaint)
@@ -324,12 +447,14 @@ class KeyboardView @JvmOverloads constructor(
 
     private fun backgroundColorFor(key: Key): Int = when (key.type) {
         KeyType.ENTER -> keyboardTheme.accentBackground
+        KeyType.SHIFT -> if (shiftState != ShiftState.OFF) keyboardTheme.accentBackground else keyboardTheme.specialKeyBackground
         KeyType.CHARACTER, KeyType.SPACE -> keyboardTheme.keyBackground
         else -> keyboardTheme.specialKeyBackground
     }
 
     private fun textColorFor(key: Key): Int = when (key.type) {
         KeyType.ENTER -> keyboardTheme.accentText
+        KeyType.SHIFT -> if (shiftState != ShiftState.OFF) keyboardTheme.accentText else keyboardTheme.specialKeyText
         KeyType.CHARACTER, KeyType.SPACE -> keyboardTheme.keyText
         else -> keyboardTheme.specialKeyText
     }
@@ -354,9 +479,111 @@ class KeyboardView @JvmOverloads constructor(
 
     // endregion
 
+    // region Emoji search
+
+    private fun searchHeaderHeight(): Float = dp(68f)
+
+    private fun drawSearchHeader(canvas: Canvas) {
+        val header = searchHeaderHeight()
+        fillPaint.color = keyboardTheme.specialKeyBackground
+        canvas.drawRect(0f, 0f, width.toFloat(), header, fillPaint)
+
+        labelPaint.color = if (searchQuery.isEmpty()) keyboardTheme.hintText else keyboardTheme.specialKeyText
+        labelPaint.textSize = min(sp(16f), width * 0.055f)
+        labelPaint.typeface = android.graphics.Typeface.DEFAULT
+        labelPaint.textAlign = Paint.Align.LEFT
+        val query = if (searchQuery.isEmpty()) "Search emoji" else searchQuery
+        canvas.drawText(query, dp(16f), dp(24f), labelPaint)
+
+        val closeSize = dp(48f)
+        labelPaint.textAlign = Paint.Align.CENTER
+        labelPaint.color = keyboardTheme.specialKeyText
+        labelPaint.textSize = sp(25f)
+        canvas.drawText("×", width - closeSize / 2f, dp(25f), labelPaint)
+
+        linePaint.color = keyboardTheme.divider
+        linePaint.strokeWidth = dp(1f)
+        canvas.drawLine(0f, header - dp(1f), width.toFloat(), header - dp(1f), linePaint)
+
+        val results = searchResults.take(MAX_SEARCH_RESULTS)
+        if (results.isEmpty()) {
+            labelPaint.color = keyboardTheme.hintText
+            labelPaint.textSize = min(sp(12f), width * 0.04f)
+            canvas.drawText(
+                if (searchQuery.isBlank()) "Type a word to search" else "No matching emoji",
+                width / 2f,
+                header - dp(18f),
+                labelPaint,
+            )
+            return
+        }
+
+        emojiPaint.textSize = min(sp(25f), dp(34f))
+        val rowTop = header - dp(42f)
+        val cellWidth = width / MAX_SEARCH_RESULTS.toFloat()
+        results.forEachIndexed { index, emoji ->
+            if (index == pressedSearchResult) {
+                fillPaint.color = keyboardTheme.keyPressedOverlay
+                canvas.drawRoundRect(
+                    index * cellWidth + dp(2f), rowTop + dp(2f),
+                    (index + 1) * cellWidth - dp(2f), header - dp(2f),
+                    dp(8f), dp(8f), fillPaint,
+                )
+            }
+            val metrics = emojiPaint.fontMetrics
+            canvas.drawText(emoji, index * cellWidth + cellWidth / 2f, rowTop + dp(21f) - (metrics.ascent + metrics.descent) / 2f, emojiPaint)
+        }
+    }
+
+    private fun searchResultAt(x: Float, y: Float): Int {
+        val header = searchHeaderHeight()
+        if (y < header - dp(44f) || y >= header) return -1
+        val index = (x / (width / MAX_SEARCH_RESULTS.toFloat())).toInt()
+        return index.takeIf { it in searchResults.indices } ?: -1
+    }
+
+    private fun searchCloseAt(x: Float, y: Float): Boolean =
+        y in 0f..dp(48f) && x >= width - dp(48f)
+
+    // endregion
+
     // region Touch
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (searchMode && (searchPointerActive || event.actionMasked == MotionEvent.ACTION_DOWN && event.y < searchHeaderHeight())) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    searchPointerActive = true
+                    pressedSearchClose = searchCloseAt(event.x, event.y)
+                    pressedSearchResult = if (pressedSearchClose) -1 else searchResultAt(event.x, event.y)
+                    invalidate()
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (pressedSearchClose && !searchCloseAt(event.x, event.y)) pressedSearchClose = false
+                    val next = if (pressedSearchClose) -1 else searchResultAt(event.x, event.y)
+                    if (next != pressedSearchResult) pressedSearchResult = next
+                    invalidate()
+                }
+                MotionEvent.ACTION_UP -> {
+                    val close = pressedSearchClose
+                    val result = pressedSearchResult
+                    searchPointerActive = false
+                    pressedSearchClose = false
+                    pressedSearchResult = -1
+                    invalidate()
+                    if (close) listener?.onSearchClosed()
+                    else if (result in searchResults.indices) listener?.onSearchEmojiPicked(searchResults[result])
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    searchPointerActive = false
+                    pressedSearchClose = false
+                    pressedSearchResult = -1
+                    invalidate()
+                }
+            }
+            return true
+        }
+
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
                 val index = event.actionIndex
@@ -382,6 +609,7 @@ class KeyboardView @JvmOverloads constructor(
     private fun handlePointerDown(pointerId: Int, x: Float, y: Float) {
         val placed = KeyGeometry.hitTest(placedKeys, x, y) ?: return
         pointers[pointerId] = Pointer(placed, x, y, System.currentTimeMillis())
+        cursorRemainderPx = 0f
 
         listener?.onKeyDown(placed.key)
         showPreviewFor(placed)
@@ -400,6 +628,45 @@ class KeyboardView @JvmOverloads constructor(
         }
 
         val travelled = hypot(x - pointer.downX, y - pointer.downY)
+
+        if (!searchMode && pointer.placed.key.type == KeyType.SPACE && gesturePointerId == null && pointers.size == 1) {
+            val dx = x - pointer.downX
+            val dy = y - pointer.downY
+            if (!pointer.cursorMove && abs(dx) > touchSlop * GESTURE_SLOP_FACTOR && abs(dx) > abs(dy) * 1.15f) {
+                pointer.cursorMove = true
+                cancelPendingLongPress()
+                cancelRepeat(pointerId)
+                previewPopup.dismiss()
+                pointer.lastX = x
+            }
+            if (pointer.cursorMove) {
+                cursorRemainderPx += x - pointer.lastX
+                pointer.lastX = x
+                val stepPx = dp(16f)
+                val steps = (cursorRemainderPx / stepPx).toInt()
+                if (steps != 0) {
+                    listener?.onCursorMove(steps)
+                    cursorRemainderPx -= steps * stepPx
+                }
+                invalidate()
+                return
+            }
+        }
+
+        if (!searchMode && pointer.placed.key.type == KeyType.DELETE && gesturePointerId == null && pointers.size == 1) {
+            val dx = x - pointer.downX
+            val dy = y - pointer.downY
+            if (!pointer.deleteWordGesture && dx < -touchSlop * GESTURE_SLOP_FACTOR && abs(dx) > abs(dy) * 1.15f) {
+                pointer.deleteWordGesture = true
+                cancelPendingLongPress()
+                cancelRepeat(pointerId)
+                previewPopup.dismiss()
+            }
+            if (pointer.deleteWordGesture) {
+                invalidate()
+                return
+            }
+        }
 
         // A swipe that starts on a letter key becomes a gesture; anything else stays a key press.
         if (settings.gestureTypingEnabled &&
@@ -437,8 +704,19 @@ class KeyboardView @JvmOverloads constructor(
     private fun handlePointerUp(pointerId: Int, x: Float, y: Float) {
         val pointer = pointers.remove(pointerId) ?: return
         cancelPendingLongPress()
-        cancelRepeat()
+        cancelRepeat(pointerId)
         previewPopup.dismiss()
+
+        if (pointer.cursorMove) {
+            cursorRemainderPx = 0f
+            invalidate()
+            return
+        }
+        if (pointer.deleteWordGesture) {
+            listener?.onDeleteWordGesture()
+            invalidate()
+            return
+        }
 
         if (gesturePointerId == pointerId) {
             appendGesturePoint(x, y)
@@ -460,6 +738,7 @@ class KeyboardView @JvmOverloads constructor(
         // A press that already acted — an auto-repeat that fired, or an alternates popup dismissed
         // without a selection — must not commit the key a second time on release.
         if (!pointer.longPressFired && !pointer.repeatFired) {
+            announceForAccessibility(accessibilityLabel(pointer.placed.key))
             listener?.onKeyCommit(pointer.placed.key, outputFor(pointer.placed.key))
         }
         invalidate()
@@ -517,6 +796,7 @@ class KeyboardView @JvmOverloads constructor(
     private fun scheduleRepeat(pointerId: Int, placed: PlacedKey) {
         if (!placed.key.repeatable) return
         cancelRepeat()
+        repeatPointerId = pointerId
         var delay = REPEAT_INITIAL_DELAY_MS
         val runnable = object : Runnable {
             override fun run() {
@@ -533,6 +813,11 @@ class KeyboardView @JvmOverloads constructor(
     private fun cancelRepeat() {
         repeatRunnable?.let { handler.removeCallbacks(it) }
         repeatRunnable = null
+        repeatPointerId = null
+    }
+
+    private fun cancelRepeat(pointerId: Int) {
+        if (repeatPointerId == pointerId) cancelRepeat()
     }
 
     // endregion
@@ -571,10 +856,55 @@ class KeyboardView @JvmOverloads constructor(
         cancelAllPointers()
     }
 
+    override fun onInitializeAccessibilityNodeInfo(info: AccessibilityNodeInfo) {
+        super.onInitializeAccessibilityNodeInfo(info)
+        info.className = "android.inputmethodservice.KeyboardView"
+        info.isFocusable = true
+        info.contentDescription = accessibilityDescription()
+    }
+
+    private fun refreshAccessibilityDescription() {
+        contentDescription = accessibilityDescription()
+    }
+
+    private fun accessibilityDescription(): String {
+        val layer = if (searchMode) "emoji search" else keyboardLayout.label
+        val shift = when (shiftState) {
+            ShiftState.OFF -> "shift off"
+            ShiftState.SHIFTED -> "shift on"
+            ShiftState.LOCKED -> "caps lock on"
+        }
+        return if (searchMode) {
+            "Slide keyboard, emoji search. ${if (searchQuery.isEmpty()) "Search field empty" else "Search: $searchQuery"}. " +
+                "${searchResults.size} results. Swipe across the keys to enter a search term."
+        } else {
+            "Slide keyboard, $layer, $shift. Double tap Shift for caps lock. Swipe Space to move the cursor."
+        }
+    }
+
+    private fun accessibilityLabel(key: Key): String = when (key.type) {
+        KeyType.CHARACTER -> displayLabel(key)
+        KeyType.SHIFT -> when (shiftState) {
+            ShiftState.OFF -> "Shift off"
+            ShiftState.SHIFTED -> "Shift on"
+            ShiftState.LOCKED -> "Caps lock on"
+        }
+        KeyType.DELETE -> "Backspace"
+        KeyType.SPACE -> "Space"
+        KeyType.ENTER -> enterAction.name.lowercase().replaceFirstChar(Char::uppercaseChar)
+        KeyType.SYMBOLS -> "Symbols"
+        KeyType.ALPHA -> "Letters"
+        KeyType.EMOJI -> "Emoji"
+        KeyType.MIC -> "Voice typing"
+        KeyType.SETTINGS -> "Settings"
+        KeyType.GLOBE -> "Input method switcher"
+    }
+
     private companion object {
         const val TRAIL_POINTS = 48
         const val MIN_GESTURE_POINTS = 4
         const val GESTURE_SLOP_FACTOR = 1.4f
+        const val MAX_SEARCH_RESULTS = 6
         // Gboard-like: the first repeat arrives quickly after the initial delete, then ramps.
         const val REPEAT_INITIAL_DELAY_MS = 280L
         const val REPEAT_MIN_DELAY_MS = 45L

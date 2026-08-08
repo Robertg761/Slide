@@ -11,8 +11,8 @@ android {
         applicationId = "com.slide"
         minSdk = 26
         targetSdk = 36
-        versionCode = 4
-        versionName = "0.1.0-alpha.4"
+        versionCode = 5
+        versionName = "0.1.0-alpha.5"
     }
 
     val signingStoreFile = providers.environmentVariable("SLIDE_SIGNING_STORE_FILE").orNull

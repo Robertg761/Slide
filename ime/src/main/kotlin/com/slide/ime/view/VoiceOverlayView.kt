@@ -8,6 +8,7 @@ import android.graphics.Typeface
 import android.util.TypedValue
 import android.view.MotionEvent
 import android.view.View
+import android.view.accessibility.AccessibilityNodeInfo
 import android.view.animation.AnimationUtils
 import com.slide.asr.VoiceInput
 import com.slide.core.theme.KeyboardTheme
@@ -48,6 +49,7 @@ class VoiceOverlayView(context: Context) : View(context) {
             field = value
             if (value != VoiceInput.State.Listening) level = 0f
             syncAnimation()
+            refreshAccessibilityDescription()
             invalidate()
         }
 
@@ -55,6 +57,7 @@ class VoiceOverlayView(context: Context) : View(context) {
     var errorText: String? = null
         set(value) {
             field = value
+            refreshAccessibilityDescription()
             invalidate()
         }
 
@@ -88,6 +91,13 @@ class VoiceOverlayView(context: Context) : View(context) {
     private val wavePath = Path()
 
     private var cancelBounds = floatArrayOf(0f, 0f, 0f, 0f)
+    private var pressedCancel = false
+
+    init {
+        isFocusable = true
+        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
+        refreshAccessibilityDescription()
+    }
 
     // region The wave
 
@@ -226,6 +236,9 @@ class VoiceOverlayView(context: Context) : View(context) {
 
         fillPaint.color = keyboardTheme.specialKeyBackground
         fillPaint.alpha = 255
+        if (pressedCancel) {
+            fillPaint.color = keyboardTheme.keyPressedOverlay
+        }
         canvas.drawRoundRect(
             cancelBounds[0], cancelBounds[1], cancelBounds[2], cancelBounds[3],
             halfHeight, halfHeight, fillPaint,
@@ -243,24 +256,63 @@ class VoiceOverlayView(context: Context) : View(context) {
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (event.actionMasked != MotionEvent.ACTION_UP) {
-            return event.actionMasked == MotionEvent.ACTION_DOWN
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                pressedCancel = isInCancel(event.x, event.y)
+                invalidate()
+                return true
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                if (pressedCancel && !isInCancel(event.x, event.y)) {
+                    pressedCancel = false
+                    invalidate()
+                }
+                return true
+            }
+
+            MotionEvent.ACTION_CANCEL -> {
+                pressedCancel = false
+                invalidate()
+                return true
+            }
         }
 
-        val cancelled = event.x in cancelBounds[0]..cancelBounds[2] &&
-            event.y in cancelBounds[1]..cancelBounds[3]
+        val cancelled = pressedCancel && isInCancel(event.x, event.y)
+        pressedCancel = false
+        invalidate()
 
         // Tapping anywhere else finishes the dictation. While transcribing there is nothing to
         // finish, so only Cancel does anything.
         if (cancelled) {
+            announceForAccessibility("Cancel voice typing")
             listener?.onVoiceDismissed(committed = false)
         } else if (state == VoiceInput.State.Listening) {
+            announceForAccessibility("Finish voice typing")
             listener?.onVoiceDismissed(committed = true)
         } else if (state == VoiceInput.State.Idle) {
+            announceForAccessibility("Close voice typing")
             listener?.onVoiceDismissed(committed = false)
         }
         return true
     }
+
+    private fun isInCancel(x: Float, y: Float): Boolean =
+        x in cancelBounds[0]..cancelBounds[2] && y in cancelBounds[1]..cancelBounds[3]
+
+    override fun onInitializeAccessibilityNodeInfo(info: AccessibilityNodeInfo) {
+        super.onInitializeAccessibilityNodeInfo(info)
+        info.className = "android.view.View"
+        info.isFocusable = true
+        info.contentDescription = accessibilityDescription()
+    }
+
+    private fun refreshAccessibilityDescription() {
+        contentDescription = accessibilityDescription()
+    }
+
+    private fun accessibilityDescription(): String =
+        "Voice typing. ${statusText()}. Cancel button. Tap the microphone area to finish when listening"
 
     private companion object {
         const val MIC_CENTRE_FRACTION = 0.38f

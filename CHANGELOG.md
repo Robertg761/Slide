@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.0-alpha.5] - 2026-08-08
+
+### Added
+
+- Emoji search from the picker, with recent results, ranked CLDR keyword matches, an empty state,
+  and a keyboard-backed query flow.
+- Cursor movement by swiping across Space and preceding-word deletion by swiping left from
+  Backspace.
+- Basic TalkBack descriptions and announcements for keyboard, suggestion, emoji, and voice-panel
+  actions; larger emoji-panel touch targets.
+
+### Fixed
+
+- Switching to `?123` now recomputes the active key geometry immediately, so the drawn symbols and
+  the hit-test layer cannot remain on QWERTY for one frame or until a later layout pass.
+- Shift, caps lock, and editor-specific Enter actions now have distinct visual states.
+
 ## [0.1.0-alpha.4] - 2026-08-08
 
 ### Changed

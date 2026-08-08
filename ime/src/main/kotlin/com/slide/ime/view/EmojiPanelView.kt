@@ -9,6 +9,7 @@ import android.view.MotionEvent
 import android.view.VelocityTracker
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.OverScroller
 import com.slide.core.emoji.EmojiData
 import com.slide.core.theme.KeyboardTheme
@@ -50,6 +51,9 @@ class EmojiPanelView(context: Context) : View(context) {
 
         /** The "ABC" button was tapped. */
         fun onEmojiPanelClosed()
+
+        /** The search tab was tapped. */
+        fun onEmojiSearchRequested() = Unit
     }
 
     var listener: Listener? = null
@@ -66,6 +70,7 @@ class EmojiPanelView(context: Context) : View(context) {
             field = value
             invalidatePage()
             reset()
+            refreshAccessibilityDescription()
             invalidate()
         }
 
@@ -80,6 +85,7 @@ class EmojiPanelView(context: Context) : View(context) {
         set(value) {
             field = value
             invalidatePage()
+            refreshAccessibilityDescription()
             invalidate()
         }
 
@@ -89,6 +95,7 @@ class EmojiPanelView(context: Context) : View(context) {
             invalidatePage()
             // Redrawing while the user is looking at another tab is harmless; yanking the grid out
             // from under a scroll on the recents tab is not, so the offset is left alone.
+            refreshAccessibilityDescription()
             invalidate()
         }
 
@@ -96,6 +103,7 @@ class EmojiPanelView(context: Context) : View(context) {
         set(value) {
             field = value
             invalidatePage()
+            refreshAccessibilityDescription()
             invalidate()
         }
 
@@ -180,6 +188,12 @@ class EmojiPanelView(context: Context) : View(context) {
         }
     }
 
+    init {
+        isFocusable = true
+        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
+        refreshAccessibilityDescription()
+    }
+
     // region Layout
 
     private fun tabHeight() = dp(TAB_HEIGHT_DP)
@@ -191,8 +205,10 @@ class EmojiPanelView(context: Context) : View(context) {
 
     private fun cellSize(): Float = width / columns().toFloat()
 
-    /** Tab count is the recents tab plus one per category. */
-    private fun tabCount(): Int = (data?.categories?.size ?: 0) + 1
+    /** Tab count is the recents tab, one per category, and a final search tab. */
+    private fun tabCount(): Int = (data?.categories?.size ?: 0) + 2
+
+    private fun searchTab(): Int = tabCount() - 1
 
     /**
      * The emoji shown on the current page, already filtered and toned.
@@ -208,6 +224,7 @@ class EmojiPanelView(context: Context) : View(context) {
         val built = when {
             catalogue == null -> emptyList()
             selectedTab == RECENTS_TAB -> recents
+            selectedTab == searchTab() -> emptyList()
             else -> {
                 val category = selectedTab - 1
                 val indices = renderable.getOrNull(category) ?: catalogue.indicesIn(category)
@@ -226,6 +243,7 @@ class EmojiPanelView(context: Context) : View(context) {
     /** Catalogue index for a position on the current page, or -1 for a recent with no home. */
     private fun entryAt(position: Int): Int {
         val catalogue = data ?: return -1
+        if (selectedTab == searchTab()) return -1
         if (selectedTab != RECENTS_TAB) {
             val category = selectedTab - 1
             val indices = renderable.getOrNull(category) ?: catalogue.indicesIn(category)
@@ -274,7 +292,11 @@ class EmojiPanelView(context: Context) : View(context) {
                 fillPaint.color = keyboardTheme.keyPressedOverlay
                 canvas.drawRect(left, 0f, left + tabWidth, bottom, fillPaint)
             }
-            val icon = if (tab == 0) RECENTS_ICON else tabIcon(catalogue.categories[tab - 1])
+            val icon = when {
+                tab == RECENTS_TAB -> RECENTS_ICON
+                tab == searchTab() -> SEARCH_ICON
+                else -> tabIcon(catalogue.categories[tab - 1])
+            }
             canvas.drawText(icon, left + tabWidth / 2f, baseline, emojiPaint)
 
             if (tab == selectedTab) {
@@ -299,7 +321,7 @@ class EmojiPanelView(context: Context) : View(context) {
     private fun drawGrid(canvas: Canvas) {
         val entries = page()
         if (entries.isEmpty()) {
-            drawEmptyRecents(canvas)
+            drawEmptyPage(canvas)
             return
         }
 
@@ -343,12 +365,13 @@ class EmojiPanelView(context: Context) : View(context) {
         canvas.restore()
     }
 
-    private fun drawEmptyRecents(canvas: Canvas) {
+    private fun drawEmptyPage(canvas: Canvas) {
         labelPaint.color = keyboardTheme.hintText
+        labelPaint.textSize = sp(14f)
         val centre = gridTop() + gridHeight() / 2f
         val metrics = labelPaint.fontMetrics
         canvas.drawText(
-            EMPTY_RECENTS,
+            if (selectedTab == RECENTS_TAB) EMPTY_RECENTS else EMPTY_CATEGORY,
             width / 2f,
             centre - (metrics.ascent + metrics.descent) / 2f,
             labelPaint,
@@ -505,8 +528,9 @@ class EmojiPanelView(context: Context) : View(context) {
                 if (pressedBackspace) {
                     // The first delete lands on press rather than on release, as the delete key
                     // does, so holding it feels like one continuous action.
-                    listener?.onEmojiBackspace()
-                    repeatDelay = FIRST_REPEAT_MS
+                listener?.onEmojiBackspace()
+                announceForAccessibility("Backspace")
+                repeatDelay = FIRST_REPEAT_MS
                     postDelayed(backspaceRepeat, repeatDelay)
                 }
             }
@@ -605,18 +629,31 @@ class EmojiPanelView(context: Context) : View(context) {
         cancelTouch()
 
         when {
+            tab == searchTab() -> {
+                announceForAccessibility("Search emoji")
+                listener?.onEmojiSearchRequested()
+            }
+
             tab in 0 until tabCount() -> {
                 selectedTab = tab
                 invalidatePage()
                 resetScroll()
+                refreshAccessibilityDescription()
+                announceForAccessibility(tabDescription(tab))
                 invalidate()
             }
 
-            back -> listener?.onEmojiPanelClosed()
+            back -> {
+                announceForAccessibility("Back to keyboard")
+                listener?.onEmojiPanelClosed()
+            }
             // The backspace already fired on the way down, and kept firing for as long as it was
             // held, so there is nothing left for it to do here.
             backspace -> Unit
-            position >= 0 -> page().getOrNull(position)?.let { listener?.onEmojiPicked(it) }
+            position >= 0 -> page().getOrNull(position)?.let {
+                announceForAccessibility("Emoji $it")
+                listener?.onEmojiPicked(it)
+            }
         }
     }
 
@@ -707,14 +744,42 @@ class EmojiPanelView(context: Context) : View(context) {
         invalidatePage()
         cancelTouch()
         resetScroll()
+        refreshAccessibilityDescription()
+    }
+
+    override fun onInitializeAccessibilityNodeInfo(info: AccessibilityNodeInfo) {
+        super.onInitializeAccessibilityNodeInfo(info)
+        info.className = "android.view.View"
+        info.isFocusable = true
+        info.contentDescription = accessibilityDescription()
+    }
+
+    private fun refreshAccessibilityDescription() {
+        contentDescription = accessibilityDescription()
+    }
+
+    private fun tabDescription(tab: Int): String = when {
+        tab == RECENTS_TAB -> "Recent emoji"
+        tab == searchTab() -> "Search emoji"
+        else -> "Emoji category ${data?.categories?.getOrNull(tab - 1).orEmpty()}"
+    }
+
+    private fun accessibilityDescription(): String {
+        val pageDescription = when {
+            data == null -> "Emoji picker loading"
+            selectedTab == RECENTS_TAB -> "Recent emoji"
+            selectedTab == searchTab() -> "Emoji search"
+            else -> tabDescription(selectedTab)
+        }
+        return "$pageDescription. Search emoji tab. ABC returns to keyboard. Backspace deletes emoji"
     }
 
     private companion object {
-        const val TAB_HEIGHT_DP = 40f
-        const val FOOTER_HEIGHT_DP = 46f
+        const val TAB_HEIGHT_DP = 48f
+        const val FOOTER_HEIGHT_DP = 52f
 
         /** Roughly a thumb's width, which sets how many columns fit. */
-        const val CELL_DP = 46f
+        const val CELL_DP = 48f
         const val MIN_COLUMNS = 6
 
         const val EMOJI_SP = 24f
@@ -739,7 +804,9 @@ class EmojiPanelView(context: Context) : View(context) {
 
         const val BACK_LABEL = "ABC"
         const val EMPTY_RECENTS = "Emoji you pick will show up here"
+        const val EMPTY_CATEGORY = "No emoji available"
         const val RECENTS_ICON = "🕐"
+        const val SEARCH_ICON = "⌕"
 
         /** Keyed by the short category names the build script writes into the asset. */
         val TAB_ICONS = mapOf(

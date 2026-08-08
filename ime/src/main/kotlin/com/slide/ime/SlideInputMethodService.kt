@@ -14,6 +14,7 @@ import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.ExtractedTextRequest
 import android.view.inputmethod.InputConnection
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
@@ -38,6 +39,7 @@ import com.slide.engine.lexicon.LexiconLoader
 import com.slide.engine.suggest.TypingSuggester
 import com.slide.ime.view.EmojiGlyphs
 import com.slide.ime.view.EmojiPanelView
+import com.slide.ime.view.EnterAction
 import com.slide.ime.view.KeyboardFrame
 import com.slide.ime.view.KeyboardView
 import com.slide.ime.view.ShiftState
@@ -80,6 +82,7 @@ class SlideInputMethodService :
     }
 
     private var symbolsShown = false
+    private var searchPreviousSymbols = false
     private var lastShiftTapMs = 0L
     private var lastSpaceCommitMs = 0L
 
@@ -101,6 +104,7 @@ class SlideInputMethodService :
     private var typingSuggester: TypingSuggester? = null
 
     private var emojiData: EmojiData? = null
+    private var recentEmoji: List<String> = emptyList()
 
     /**
      * The word being typed, held as composing text in the editor rather than committed.
@@ -159,7 +163,11 @@ class SlideInputMethodService :
             .launchIn(scope)
 
         settingsRepository.recentEmoji
-            .onEach { emojiPanel?.recents = it }
+            .onEach {
+                recentEmoji = it
+                emojiPanel?.recents = it
+                if (keyboardView?.searchMode == true) refreshEmojiSearch()
+            }
             .launchIn(scope)
 
         // Roughly a megabyte to parse; doing it on the main thread would stall the first frame
@@ -202,6 +210,7 @@ class SlideInputMethodService :
             settings = this@SlideInputMethodService.settings
             keyboardTheme = theme
             keyboardLayout = Layouts.QwertyEn
+            enterAction = EnterAction.RETURN
         }
         val overlay = VoiceOverlayView(this).apply {
             listener = this@SlideInputMethodService
@@ -243,6 +252,7 @@ class SlideInputMethodService :
 
     override fun onStartInputView(info: EditorInfo, restarting: Boolean) {
         super.onStartInputView(info, restarting)
+        exitEmojiSearch(showPicker = false)
         symbolsShown = false
         hideEmojiPanel()
         passwordField = isPasswordField(info)
@@ -253,11 +263,13 @@ class SlideInputMethodService :
         keyboardView?.apply {
             keyboardLayout = Layouts.QwertyEn
             settings = this@SlideInputMethodService.settings
+            enterAction = enterActionFor(info.imeOptions)
         }
         applyTheme(resolveTheme())
         // Candidates from the previous field would be nonsense here, and tapping one would try to
         // rewrite text that belongs to a different editor.
         clearSuggestions()
+        refreshSuggestionEmptyMessage()
         updateShiftFromCursor()
     }
 
@@ -283,6 +295,7 @@ class SlideInputMethodService :
      */
     override fun onWindowHidden() {
         super.onWindowHidden()
+        exitEmojiSearch(showPicker = false)
         hideEmojiPanel()
         hideVoiceOverlay()
         voiceClient.unbind()
@@ -323,6 +336,11 @@ class SlideInputMethodService :
     private fun handleBack(): Boolean = when {
         voiceOverlayShown -> {
             onVoiceDismissed(committed = false)
+            true
+        }
+
+        searchModeShown -> {
+            exitEmojiSearch(showPicker = true)
             true
         }
 
@@ -383,6 +401,11 @@ class SlideInputMethodService :
     }
 
     override fun onKeyCommit(key: Key, text: String) {
+        if (keyboardView?.searchMode == true) {
+            handleSearchKey(key, text)
+            return
+        }
+
         val connection = currentInputConnection ?: return
 
         // Any keypress ends the swiped word: the candidates no longer describe what is in front of
@@ -422,6 +445,49 @@ class SlideInputMethodService :
         commitGestureWord(connection, best.word)
         stripMode = StripMode.Gesture
         suggestionStrip?.setSuggestions(candidates.map { it.word })
+    }
+
+    override fun onCursorMove(steps: Int) {
+        val connection = currentInputConnection ?: return
+        val extracted = connection.getExtractedText(ExtractedTextRequest(), 0)
+        if (extracted != null) {
+            val start = extracted.selectionStart
+            val end = extracted.selectionEnd
+            val target = if (start != end) {
+                if (steps < 0) start else end
+            } else {
+                (start + steps).coerceIn(0, extracted.text?.length ?: start)
+            }
+            connection.setSelection(target, target)
+            abandonComposing()
+            updateShiftFromCursor()
+            keyboardView?.announceForAccessibility("Cursor moved")
+        } else {
+            val direction = if (steps < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT
+            repeat(kotlin.math.abs(steps)) {
+                connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, direction))
+                connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, direction))
+            }
+            abandonComposing()
+        }
+    }
+
+    override fun onDeleteWordGesture() {
+        val connection = currentInputConnection ?: return
+        finishComposing(connection)
+        val selected = connection.getSelectedText(0)
+        if (!selected.isNullOrEmpty()) {
+            connection.commitText("", 1)
+            return
+        }
+
+        val before = connection.getTextBeforeCursor(MAX_WORD_DELETE_CHARS, 0)?.toString().orEmpty()
+        if (before.isEmpty()) return
+        var start = before.length
+        while (start > 0 && before[start - 1].isWhitespace()) start--
+        while (start > 0 && !before[start - 1].isWhitespace()) start--
+        connection.deleteSurroundingText(before.length - start, 0)
+        updateShiftFromCursor()
     }
 
     /**
@@ -500,6 +566,106 @@ class SlideInputMethodService :
         lastGestureCommit = null
         stripMode = StripMode.Empty
     }
+
+    private fun refreshSuggestionEmptyMessage() {
+        suggestionStrip?.setEmptyMessage(
+            when {
+                passwordField -> "Suggestions are off in password fields"
+                !settings.suggestionsEnabled -> "Suggestions are disabled"
+                else -> "Type or swipe for suggestions"
+            },
+        )
+    }
+
+    // region Emoji search keyboard
+
+    private fun handleSearchKey(key: Key, text: String) {
+        val view = keyboardView ?: return
+        var query = view.searchQuery
+        when (key.type) {
+            KeyType.CHARACTER -> query += text.lowercase()
+            KeyType.SPACE -> query += " "
+            KeyType.DELETE -> query = query.dropLastCodePoint()
+            KeyType.ENTER -> {
+                searchResults().firstOrNull()?.let { onSearchEmojiPicked(it) }
+                return
+            }
+            KeyType.SHIFT, KeyType.SYMBOLS, KeyType.ALPHA, KeyType.EMOJI,
+            KeyType.MIC, KeyType.GLOBE, KeyType.SETTINGS -> return
+        }
+        view.searchQuery = query.take(MAX_SEARCH_QUERY_LENGTH)
+        refreshEmojiSearch()
+    }
+
+    private fun String.dropLastCodePoint(): String {
+        if (isEmpty()) return this
+        val end = offsetByCodePoints(length, -1)
+        return substring(0, end)
+    }
+
+    private fun searchResults(): List<String> = keyboardView?.searchResults.orEmpty()
+
+    private fun refreshEmojiSearch() {
+        val view = keyboardView ?: return
+        val catalogue = emojiData ?: run {
+            view.searchResults = emptyList()
+            return
+        }
+        val query = view.searchQuery.trim()
+        view.searchResults = if (query.isEmpty()) {
+            recentEmoji.take(MAX_SEARCH_RESULTS)
+        } else {
+            catalogue.search(query, limit = MAX_SEARCH_RESULTS).map { catalogue.toned(it, settings.emojiSkinTone) }
+        }
+    }
+
+    private fun startEmojiSearch() {
+        hideEmojiPanel()
+        searchPreviousSymbols = symbolsShown
+        keyboardView?.apply {
+            searchQuery = ""
+            searchMode = true
+            searchResults = recentEmoji.take(MAX_SEARCH_RESULTS)
+        }
+        suggestionStrip?.setEmptyMessage("Emoji search is open")
+        clearSuggestions()
+        setBackCallbackRegistered(true)
+    }
+
+    private fun exitEmojiSearch(showPicker: Boolean) {
+        val view = keyboardView ?: return
+        if (!view.searchMode && !showPicker) return
+        view.searchMode = false
+        view.searchQuery = ""
+        view.searchResults = emptyList()
+        symbolsShown = searchPreviousSymbols
+        view.keyboardLayout = if (symbolsShown) Layouts.SymbolsEn else Layouts.QwertyEn
+        if (!symbolsShown) updateShiftFromCursor()
+        refreshSuggestionEmptyMessage()
+        if (showPicker && emojiData != null) {
+            emojiPanel?.reset()
+            emojiPanel?.visibility = View.VISIBLE
+        }
+        setBackCallbackRegistered(if (showPicker) true else emojiPanelShown || voiceOverlayShown)
+    }
+
+    override fun onSearchQueryChanged(query: String) {
+        keyboardView?.searchQuery = query.take(MAX_SEARCH_QUERY_LENGTH)
+        refreshEmojiSearch()
+    }
+
+    override fun onSearchEmojiPicked(emoji: String) {
+        onEmojiPicked(emoji)
+        keyboardView?.announceForAccessibility("Emoji $emoji inserted")
+        keyboardView?.searchQuery = ""
+        refreshEmojiSearch()
+    }
+
+    override fun onSearchClosed() {
+        exitEmojiSearch(showPicker = true)
+    }
+
+    // endregion
 
     // endregion
 
@@ -600,6 +766,7 @@ class SlideInputMethodService :
     // region The emoji picker
 
     private fun showEmojiPanel() {
+        if (keyboardView?.searchMode == true) return
         val panel = emojiPanel ?: return
         if (panel.data == null) return // Still loading, or the asset is missing.
 
@@ -622,6 +789,9 @@ class SlideInputMethodService :
         }
         setBackCallbackRegistered(voiceOverlayShown)
     }
+
+    private val searchModeShown: Boolean
+        get() = keyboardView?.searchMode == true
 
     private val emojiPanelShown: Boolean
         get() = emojiPanel?.visibility == View.VISIBLE
@@ -651,6 +821,11 @@ class SlideInputMethodService :
     override fun onEmojiPanelClosed() {
         performHaptic()
         hideEmojiPanel()
+    }
+
+    override fun onEmojiSearchRequested() {
+        performHaptic()
+        startEmojiSearch()
     }
 
     // endregion
@@ -769,6 +944,7 @@ class SlideInputMethodService :
 
     private fun switchLayer(showSymbols: Boolean) {
         symbolsShown = showSymbols
+        if (showSymbols) setShift(ShiftState.OFF)
         keyboardView?.keyboardLayout = if (showSymbols) Layouts.SymbolsEn else Layouts.QwertyEn
         if (!showSymbols) updateShiftFromCursor()
     }
@@ -1021,6 +1197,17 @@ class SlideInputMethodService :
         }
     }
 
+    private fun enterActionFor(imeOptions: Int): EnterAction = when (
+        imeOptions and EditorInfo.IME_MASK_ACTION
+    ) {
+        EditorInfo.IME_ACTION_GO -> EnterAction.GO
+        EditorInfo.IME_ACTION_SEARCH -> EnterAction.SEARCH
+        EditorInfo.IME_ACTION_SEND -> EnterAction.SEND
+        EditorInfo.IME_ACTION_NEXT -> EnterAction.NEXT
+        EditorInfo.IME_ACTION_DONE -> EnterAction.DONE
+        else -> EnterAction.RETURN
+    }
+
     private fun resolveTheme(): KeyboardTheme {
         val nightMask = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
         val inDarkMode = nightMask == Configuration.UI_MODE_NIGHT_YES
@@ -1051,5 +1238,8 @@ class SlideInputMethodService :
         const val DOUBLE_TAP_WINDOW_MS = 300L
         const val DOUBLE_SPACE_WINDOW_MS = 800L
         const val HAPTIC_DURATION_MS = 12L
+        const val MAX_WORD_DELETE_CHARS = 2048
+        const val MAX_SEARCH_QUERY_LENGTH = 64
+        const val MAX_SEARCH_RESULTS = 6
     }
 }
