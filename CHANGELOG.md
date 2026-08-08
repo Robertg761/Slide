@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.0] - 2026-08-08
+
+### Added
+
+- Emoji search from the picker, with recent results, ranked CLDR keyword matches, and an explicit
+  empty state.
+- Cursor movement by swiping across Space and preceding-word deletion by swiping left from
+  Backspace.
+- Basic TalkBack descriptions and announcements for keyboard, suggestion, emoji, and voice-panel
+  actions, with larger emoji-panel touch targets.
+- Both documented Whisper models are packaged in the published APK for offline voice typing.
+
+### Fixed
+
+- Switching to `?123` now recomputes active key geometry immediately, keeping drawn symbols and
+  hit testing in sync.
+- Shift, caps lock, and editor-specific Enter actions now have distinct visual states.
+- The tagged release workflow now packages the same Whisper models used by local builds.
+
 ## [0.1.0-alpha.6] - 2026-08-08
 
 ### Fixed

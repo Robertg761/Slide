@@ -8,13 +8,13 @@ English-only and fully offline for v1.
 
 ## Downloads and updates
 
-Alpha APKs are published on this repository's [GitHub Releases](../../releases). Download the
-latest prerelease APK, open it on an Android device, and allow the browser or file manager to
+APK releases are published on this repository's [GitHub Releases](../../releases). Download the
+latest release APK, open it on an Android device, and allow the browser or file manager to
 install unknown apps when Android asks. Future APKs signed with the same release key install as
 updates over this one. Slide does not use Google Play.
 
 Update checks are off by default. If enabled in Slide's settings, the app checks public GitHub
-releases (including alphas when selected), verifies the downloaded APK's version and signing
+releases (including alpha prereleases when selected), verifies the downloaded APK's version and signing
 certificate, then opens Android's normal installer for your confirmation.
 
 ## Status
