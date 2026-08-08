@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.0-alpha.6] - 2026-08-08
+
+### Fixed
+
+- The tagged release workflow now downloads and packages both documented Whisper models, so
+  offline voice typing is present in published APKs as it is in local builds.
+
 ## [0.1.0-alpha.5] - 2026-08-08
 
 ### Added

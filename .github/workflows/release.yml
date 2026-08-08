@@ -83,6 +83,11 @@ jobs:
             if [ -z "${!name:-}" ]; then echo "Missing required secret: SLIDE_${name#KEYSTORE_}" >&2; exit 1; fi
           done
 
+      - name: Fetch speech models
+        run: |
+          bash tools/fetch_model.sh base.en-q5_1
+          bash tools/fetch_model.sh small.en-q5_1
+
       - name: Decode signing key
         env:
           KEYSTORE_B64: ${{ secrets.SLIDE_KEYSTORE_B64 }}
