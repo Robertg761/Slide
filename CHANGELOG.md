@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.0-alpha.2] - 2026-08-08
+
+### Added
+
+- Opt-in GitHub update checks, including the alpha channel. Downloaded APKs are checked for a newer version and Slide's signing certificate before Android's installer is opened.
+
 ## [0.1.0-alpha.1] - 2026-08-08
 
 ### Added
@@ -11,4 +17,3 @@
 
 - Voice typing and the default Whisper model selection have not yet been verified on physical hardware.
 - Next-word prediction, a personal dictionary, emoji search, clipboard/text-editing panels, and the accessibility pass are not yet complete.
-

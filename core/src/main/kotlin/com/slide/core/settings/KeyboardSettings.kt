@@ -62,6 +62,10 @@ data class KeyboardSettings(
      * form. One setting for the whole picker, as in Gboard, rather than a choice per emoji.
      */
     val emojiSkinTone: Int = EmojiData.TONE_DEFAULT,
+    /** Explicit opt-in: update checks are the only feature that contacts GitHub. */
+    val updateChecksEnabled: Boolean = false,
+    /** Alpha builds are intentionally opt-in even while Slide itself is pre-1.0. */
+    val includeAlphaUpdates: Boolean = true,
 )
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "slide_settings")
@@ -129,6 +133,8 @@ class SettingsRepository(private val context: Context) {
             prefs[Keys.AUTO_CAPITALIZE] = updated.autoCapitalize
             prefs[Keys.DOUBLE_SPACE_PERIOD] = updated.doubleSpacePeriod
             prefs[Keys.EMOJI_SKIN_TONE] = updated.emojiSkinTone
+            prefs[Keys.UPDATE_CHECKS] = updated.updateChecksEnabled
+            prefs[Keys.INCLUDE_ALPHA_UPDATES] = updated.includeAlphaUpdates
         }
     }
 
@@ -154,6 +160,8 @@ class SettingsRepository(private val context: Context) {
             autoCapitalize = this[Keys.AUTO_CAPITALIZE] ?: defaults.autoCapitalize,
             doubleSpacePeriod = this[Keys.DOUBLE_SPACE_PERIOD] ?: defaults.doubleSpacePeriod,
             emojiSkinTone = this[Keys.EMOJI_SKIN_TONE] ?: defaults.emojiSkinTone,
+            updateChecksEnabled = this[Keys.UPDATE_CHECKS] ?: defaults.updateChecksEnabled,
+            includeAlphaUpdates = this[Keys.INCLUDE_ALPHA_UPDATES] ?: defaults.includeAlphaUpdates,
         )
     }
 
@@ -177,6 +185,8 @@ class SettingsRepository(private val context: Context) {
         val AUTO_CAPITALIZE = booleanPreferencesKey("auto_capitalize")
         val DOUBLE_SPACE_PERIOD = booleanPreferencesKey("double_space_period")
         val EMOJI_SKIN_TONE = intPreferencesKey("emoji_skin_tone")
+        val UPDATE_CHECKS = booleanPreferencesKey("update_checks_enabled")
+        val INCLUDE_ALPHA_UPDATES = booleanPreferencesKey("include_alpha_updates")
         val RECENT_EMOJI = stringPreferencesKey("recent_emoji")
     }
 

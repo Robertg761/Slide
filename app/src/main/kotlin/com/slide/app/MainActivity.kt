@@ -27,6 +27,7 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -96,6 +97,8 @@ private fun SetupScreen(repository: SettingsRepository) {
 
     var enabled by remember { mutableStateOf(isKeyboardEnabled(context)) }
     var selected by remember { mutableStateOf(isKeyboardSelected(context)) }
+    var updateMessage by remember { mutableStateOf<String?>(null) }
+    var availableUpdate by remember { mutableStateOf<UpdateInfo?>(null) }
 
     // Both checks change outside the app, so re-read them every time we come back to the foreground.
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -241,6 +244,18 @@ private fun SetupScreen(repository: SettingsRepository) {
 
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Updates", style = MaterialTheme.typography.titleMedium)
+                    Text("GitHub is contacted only when you check. Android always confirms installation.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    SettingSwitch("Check GitHub for updates", settings.updateChecksEnabled) { value -> scope.launch { repository.update { it.copy(updateChecksEnabled = value) } } }
+                    if (settings.updateChecksEnabled) {
+                        SettingSwitch("Include alpha prereleases", settings.includeAlphaUpdates) { value -> scope.launch { repository.update { it.copy(includeAlphaUpdates = value) } } }
+                        Button(onClick = { scope.launch { runCatching { UpdateManager.check(context, settings.includeAlphaUpdates) }.onSuccess { availableUpdate = it; updateMessage = if (it == null) "You already have the newest selected release." else null }.onFailure { updateMessage = "Could not check for updates: ${it.message ?: "network error"}" } } }) { Text("Check now") }
+                    }
+                }
+            }
+
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Try it", style = MaterialTheme.typography.titleMedium)
                     var text by remember { mutableStateOf("") }
                     OutlinedTextField(
@@ -261,6 +276,8 @@ private fun SetupScreen(repository: SettingsRepository) {
             }
         }
     }
+    availableUpdate?.let { update -> AlertDialog(onDismissRequest = { availableUpdate = null }, title = { Text("Slide ${update.version} is available") }, text = { Text(update.notes.ifBlank { "A newer signed Slide release is available." }) }, confirmButton = { Button(onClick = { scope.launch { runCatching { UpdateManager.downloadAndInstall(context, update) }.onFailure { updateMessage = "Update download failed: ${it.message}" }; availableUpdate = null } }) { Text("Download and install") } }, dismissButton = { Button(onClick = { availableUpdate = null }) { Text("Not now") } }) }
+    updateMessage?.let { message -> AlertDialog(onDismissRequest = { updateMessage = null }, title = { Text("Updates") }, text = { Text(message) }, confirmButton = { Button(onClick = { updateMessage = null }) { Text("OK") } }) }
 }
 
 @Composable

@@ -13,6 +13,10 @@ latest prerelease APK, open it on an Android device, and allow the browser or fi
 install unknown apps when Android asks. Future APKs signed with the same release key install as
 updates over this one. Slide does not use Google Play.
 
+Update checks are off by default. If enabled in Slide's settings, the app checks public GitHub
+releases (including alphas when selected), verifies the downloaded APK's version and signing
+certificate, then opens Android's normal installer for your confirmation.
+
 ## Status
 
 Typing, themes and gesture decoding are verified on a Galaxy S24 Ultra (Android 16). Voice input
@@ -164,8 +168,9 @@ packaged model. That output is what decides `WhisperModel.Default`.
 
 ## Privacy
 
-Nothing leaves the device. There is no network permission in the keyboard, speech is recognised
-locally, and audio is held in memory only for as long as it takes to transcribe. Password and
+Nothing leaves the device during typing: speech is recognised locally, and audio is held in memory
+only for as long as it takes to transcribe. The optional update check contacts GitHub only when the
+user enables it and asks to check. Password and
 incognito fields are excluded from any learning.
 
 ## Licence and provenance
