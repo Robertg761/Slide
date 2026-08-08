@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.0-alpha.4] - 2026-08-08
+
+### Changed
+
+- Enlarged and optically balanced the keyboard action icons, replaced the microphone placeholder with a clearer microphone, and made long-press Backspace begin repeating sooner.
+
 ## [0.1.0-alpha.3] - 2026-08-08
 
 ### Changed

@@ -146,7 +146,7 @@ class SuggestionStripView(context: Context) : View(context) {
         canvas.drawLine(boundary, inset, boundary, height - inset, dividerPaint)
 
         textPaint.color = keyboardTheme.suggestionText
-        MicGlyph.draw(canvas, textPaint, centerX, centerY, height * MIC_GLYPH_FRACTION)
+        MicGlyph.draw(canvas, textPaint, centerX, centerY, height * 0.34f)
     }
 
     /** Width reserved for the microphone button at the right edge. */

@@ -249,6 +249,11 @@ class KeyboardView @JvmOverloads constructor(
             return
         }
 
+        if (key.type in setOf(KeyType.SHIFT, KeyType.DELETE, KeyType.ENTER, KeyType.EMOJI)) {
+            drawActionIcon(canvas, key.type, placed)
+            return
+        }
+
         labelPaint.color = textColorFor(key)
         labelPaint.textSize = if (key.type == KeyType.CHARACTER) sp(22f) else sp(15f)
         val metrics = labelPaint.fontMetrics
@@ -260,6 +265,34 @@ class KeyboardView @JvmOverloads constructor(
             hintPaint.color = keyboardTheme.hintText
             canvas.drawText(hint, placed.right - keyGapH - dp(8f), placed.top + keyGapV + dp(13f), hintPaint)
         }
+    }
+
+    /** Larger geometric icons stay crisp and visually centred at every keyboard height. */
+    private fun drawActionIcon(canvas: Canvas, type: KeyType, placed: PlacedKey) {
+        val oldStyle = labelPaint.style
+        val oldStroke = labelPaint.strokeWidth
+        labelPaint.color = textColorFor(placed.key)
+        labelPaint.style = Paint.Style.STROKE
+        labelPaint.strokeWidth = dp(2.1f)
+        labelPaint.strokeCap = Paint.Cap.ROUND
+        labelPaint.strokeJoin = Paint.Join.ROUND
+        val r = minOf(placed.width, placed.height) * 0.29f
+        val x = placed.centerX; val y = placed.centerY
+        when (type) {
+            KeyType.SHIFT -> {
+                val p = Path().apply { moveTo(x, y-r); lineTo(x-r*.78f, y-r*.1f); lineTo(x-r*.38f, y-r*.1f); lineTo(x-r*.38f, y+r); lineTo(x+r*.38f, y+r); lineTo(x+r*.38f, y-r*.1f); lineTo(x+r*.78f, y-r*.1f); close() }
+                canvas.drawPath(p, labelPaint)
+                if (shiftState == ShiftState.LOCKED) canvas.drawCircle(x, y-r*.42f, dp(1.8f), labelPaint)
+            }
+            KeyType.DELETE -> {
+                val p = Path().apply { moveTo(x-r, y); lineTo(x-r*.42f, y-r*.62f); lineTo(x+r, y-r*.62f); lineTo(x+r, y+r*.62f); lineTo(x-r*.42f, y+r*.62f); close() }
+                canvas.drawPath(p, labelPaint); canvas.drawLine(x-r*.02f, y-r*.25f, x+r*.45f, y+r*.25f, labelPaint); canvas.drawLine(x+r*.45f, y-r*.25f, x-r*.02f, y+r*.25f, labelPaint)
+            }
+            KeyType.ENTER -> { canvas.drawLine(x-r, y, x+r*.65f, y, labelPaint); canvas.drawLine(x-r, y, x-r*.38f, y-r*.38f, labelPaint); canvas.drawLine(x-r, y, x-r*.38f, y+r*.38f, labelPaint); canvas.drawLine(x+r*.65f, y, x+r*.65f, y-r*.68f, labelPaint) }
+            KeyType.EMOJI -> { canvas.drawCircle(x, y, r*.78f, labelPaint); canvas.drawCircle(x-r*.28f, y-r*.16f, dp(1.3f), labelPaint); canvas.drawCircle(x+r*.28f, y-r*.16f, dp(1.3f), labelPaint); canvas.drawArc(x-r*.4f, y-r*.1f, x+r*.4f, y+r*.42f, 15f, 150f, false, labelPaint) }
+            else -> Unit
+        }
+        labelPaint.style = oldStyle; labelPaint.strokeWidth = oldStroke
     }
 
     private fun drawSpaceLabel(canvas: Canvas, placed: PlacedKey) {
@@ -542,7 +575,8 @@ class KeyboardView @JvmOverloads constructor(
         const val TRAIL_POINTS = 48
         const val MIN_GESTURE_POINTS = 4
         const val GESTURE_SLOP_FACTOR = 1.4f
-        const val REPEAT_INITIAL_DELAY_MS = 400L
+        // Gboard-like: the first repeat arrives quickly after the initial delete, then ramps.
+        const val REPEAT_INITIAL_DELAY_MS = 280L
         const val REPEAT_MIN_DELAY_MS = 45L
         const val REPEAT_ACCELERATION = 0.85f
     }
