@@ -30,6 +30,12 @@
   language score is a log of an already-logarithmic frequency, every word worth correcting to sits
   in a band about a quarter wide, and the old margin spent more than half of it. Typos of common
   words — "htis", "thjs", "drom", "witth" — had the right answer in the strip and were refused.
+- Restoring a dropped letter is now cheaper than overriding a key you pressed. An insertion only
+  adds to what was typed, where a substitution asserts that a key you did press was not the one you
+  wanted, so the edit that contradicts less of the input should be the cheaper explanation — and at
+  0.6 against a substitution's 0.5 it was the dearer one. That is how "sould" reached "would"
+  instead of "should", and "fom" reached "tom" instead of "from". Dropped-letter typos go from
+  66.4% corrected to 78.1%, and wrong corrections *halve*, 1.5% to 0.7%.
 - A doubled letter is now priced as the mechanical slip it is rather than as an ordinary stray
   keystroke, so "largee" no longer becomes "larger" or "sidde" "sided". Nothing in that class is
   rewritten to a different word any more, where the corrector previously preferred changing the

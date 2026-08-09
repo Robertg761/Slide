@@ -13,7 +13,12 @@ import com.slide.engine.lexicon.Lexicon
  */
 object ContextualCases {
 
-    data class Case(val typo: String, val intended: String, val previous: String)
+    data class Case(
+        val typo: String,
+        val intended: String,
+        val previous: String,
+        val kind: TypoCorpus.Kind,
+    )
 
     private val TOKEN = Regex("[a-z']+")
 
@@ -40,11 +45,18 @@ object ContextualCases {
                 // A typo that is itself a word is protected by a different rule entirely.
                 if (lexicon.contains(typo)) continue
 
-                out += Case(typo, word, previous)
+                out += Case(typo, word, previous, kindFor(n))
                 break
             }
         }
         return out
+    }
+
+    private fun kindFor(salt: Int): TypoCorpus.Kind = when (salt % 4) {
+        0 -> TypoCorpus.Kind.TRANSPOSITION
+        1 -> TypoCorpus.Kind.SUBSTITUTION
+        2 -> TypoCorpus.Kind.DOUBLED
+        else -> TypoCorpus.Kind.DROPPED
     }
 
     /** One single-edit typo, its kind rotating with the sentence so all four are represented. */

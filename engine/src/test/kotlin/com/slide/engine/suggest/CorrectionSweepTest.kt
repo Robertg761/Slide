@@ -93,6 +93,49 @@ class CorrectionSweepTest {
     }
 
     /**
+     * Insertion against substitution, the two edits that compete to explain the same typo.
+     *
+     * Reported per kind because the average hides the trade: every step that makes a dropped letter
+     * cheaper to restore takes accuracy from mis-hit keys, and the corpus weights the two equally
+     * where real typing does not.
+     */
+    @Test
+    fun `sweep insertion cost`() {
+        val contextual = ContextualCases.build(lexicon)
+        for (insertion in listOf(0.60f, 0.55f, 0.50f, 0.45f, 0.40f, 0.35f, 0.30f)) {
+            val suggester = TypingSuggester(
+                lexicon,
+                SuggesterConfig(insertionCost = insertion),
+                com.slide.engine.TestBigrams.instance,
+            )
+            var right = 0
+            var wrong = 0
+            val byKind = HashMap<TypoCorpus.Kind, IntArray>()
+            for (case in contextual) {
+                val applied =
+                    suggester.suggest(case.typo, keys, previousWord = case.previous).autocorrection
+                val slot = byKind.getOrPut(case.kind) { IntArray(2) }
+                slot[1]++
+                when {
+                    applied == null -> Unit
+                    applied.equals(case.intended, ignoreCase = true) -> { right++; slot[0]++ }
+                    else -> wrong++
+                }
+            }
+            val n = contextual.size.toDouble()
+            val perKind = TypoCorpus.Kind.entries.joinToString("  ") { kind ->
+                val slot = byKind[kind] ?: IntArray(2)
+                "%s %.0f%%".format(kind.name.take(5), 100.0 * slot[0] / maxOf(1, slot[1]))
+            }
+            println(
+                "  insertion %.2f  right %5.1f%%  wrong %4.1f%%   ".format(
+                    insertion, right / n * 100, wrong / n * 100,
+                ) + perKind,
+            )
+        }
+    }
+
+    /**
      * How hard to lean on the sentence, measured on held-out sentences rather than isolated typos.
      *
      * Too low and the model cannot overturn a frequency difference, which is the whole job. Too

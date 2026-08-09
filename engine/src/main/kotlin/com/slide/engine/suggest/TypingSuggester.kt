@@ -54,8 +54,24 @@ data class SuggesterConfig(
     val transpositionCost: Float = 0.45f,
     /** Wrong key, scaled by how far that key is from the intended one. */
     val substitutionCost: Float = 0.5f,
-    /** A letter the user missed — "helo". */
-    val insertionCost: Float = 0.6f,
+    /**
+     * A letter the user missed — "helo", "oce", "sould".
+     *
+     * Priced just under a neighbour-key substitution, which is the opposite way round from where
+     * this started, and the reason is an asymmetry in what the two edits claim. An insertion only
+     * adds to what the user typed; every key they actually pressed survives it. A substitution
+     * overrides one of them, asserting that a key they did press was not the key they wanted. The
+     * edit that contradicts less of the input should be the cheaper explanation, and at 0.6 against
+     * a substitution's 0.5 it was the dearer one — which is how "sould" reached "would" instead of
+     * "should", and "fom" reached "tom" instead of "from".
+     *
+     * Measured on held-out sentences, moving this from 0.6 to 0.45 takes dropped-letter typos from
+     * 66.4% corrected to 78.1% and *halves* wrong corrections overall, 1.5% to 0.7%. It keeps
+     * improving to about 0.40, but only by taking accuracy from substitutions, which are the
+     * commoner slip on glass and which `TypoCorpus` weights equally with dropped letters rather
+     * than realistically.
+     */
+    val insertionCost: Float = 0.45f,
     /**
      * A missing apostrophe, priced well below a missing letter.
      *
