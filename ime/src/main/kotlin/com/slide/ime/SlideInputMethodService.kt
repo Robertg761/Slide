@@ -35,8 +35,10 @@ import com.slide.core.theme.KeyboardTheme
 import com.slide.core.theme.Themes
 import com.slide.engine.gesture.GestureDecoder
 import com.slide.engine.gesture.GesturePoint
+import com.slide.engine.lexicon.BigramLoader
 import com.slide.engine.lexicon.LexiconLoader
 import com.slide.engine.suggest.TypingSuggester
+import com.slide.ime.text.PrecedingWord
 import com.slide.ime.view.EmojiGlyphs
 import com.slide.ime.view.EmojiPanelView
 import com.slide.ime.view.EnterAction
@@ -207,11 +209,21 @@ class SlideInputMethodService :
         // Roughly a megabyte to parse; doing it on the main thread would stall the first frame
         // of the keyboard, which is the one moment the user is definitely watching.
         scope.launch {
-            val lexicon = withContext(Dispatchers.IO) { LexiconLoader.load(applicationContext) }
+            val (lexicon, bigrams) = withContext(Dispatchers.IO) {
+                val words = LexiconLoader.load(applicationContext)
+                // The model is keyed by lexicon index, so it is worthless without the lexicon and
+                // is not worth reading if that failed. A null model is survivable on its own: the
+                // corrector falls back to spelling alone.
+                words to words?.let { BigramLoader.load(applicationContext, it) }
+            }
             if (lexicon != null) {
                 gestureDecoder = GestureDecoder(lexicon)
-                typingSuggester = TypingSuggester(lexicon)
-                Log.i(TAG, "Decoder and suggester ready with ${lexicon.size} words")
+                typingSuggester = TypingSuggester(lexicon, bigrams = bigrams)
+                Log.i(
+                    TAG,
+                    "Decoder and suggester ready with ${lexicon.size} words" +
+                        (bigrams?.let { ", ${it.pairCount} bigrams" } ?: ", no context model"),
+                )
             }
         }
 
@@ -1047,12 +1059,20 @@ class SlideInputMethodService :
             typed = composing.toString(),
             keys = keys,
             blockOffensive = settings.blockOffensiveWords,
+            previousWord = precedingWord(),
         )
         pendingAutocorrection = result.autocorrection
             .takeIf { settings.autocorrectEnabled && !recomposed }
 
         stripMode = StripMode.Typing
         suggestionStrip?.setSuggestions(result.words.map { it.word })
+    }
+
+    /** The word before the one being typed, for the corrector to weigh candidates against. */
+    private fun precedingWord(): String? {
+        val connection = currentInputConnection ?: return null
+        val before = connection.getTextBeforeCursor(MAX_CONTEXT_CHARS, 0)?.toString() ?: return null
+        return PrecedingWord.of(before)
     }
 
     /**
@@ -1393,6 +1413,9 @@ class SlideInputMethodService :
 
         /** Text read either side of the cursor when reopening a word. */
         const val MAX_REOPEN_CHARS = 48
+
+        /** Enough to reach back over the word in progress and the one before it. */
+        const val MAX_CONTEXT_CHARS = 64
 
         /** Below this, a word has too many neighbours for the strip to be worth anything. */
         const val MIN_REOPEN_LENGTH = 2

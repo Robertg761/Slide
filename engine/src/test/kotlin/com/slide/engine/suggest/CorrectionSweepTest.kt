@@ -91,4 +91,40 @@ class CorrectionSweepTest {
             println("  maxCost     %.2f  right %5.1f%%  wrong %4.1f%%".format(cost, right * 100, wrong * 100))
         }
     }
+
+    /**
+     * How hard to lean on the sentence, measured on held-out sentences rather than isolated typos.
+     *
+     * Too low and the model cannot overturn a frequency difference, which is the whole job. Too
+     * high and it starts overturning the spelling evidence as well, promoting a word that fits the
+     * context over one that fits the keys.
+     */
+    @Test
+    fun `sweep context weight`() {
+        val cases = ContextualCases.build(lexicon)
+        println("${cases.size} typos in held-out sentences")
+        for (weight in listOf(0f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.8f, 1.0f, 1.5f)) {
+            val suggester = TypingSuggester(
+                lexicon,
+                SuggesterConfig(contextWeight = weight),
+                com.slide.engine.TestBigrams.instance,
+            )
+            var right = 0
+            var wrong = 0
+            for (case in cases) {
+                val applied =
+                    suggester.suggest(case.typo, keys, previousWord = case.previous).autocorrection
+                when {
+                    applied == null -> Unit
+                    applied.equals(case.intended, ignoreCase = true) -> right++
+                    else -> wrong++
+                }
+            }
+            val n = cases.size.toDouble()
+            println(
+                "  contextWeight %.1f  right %5.1f%%  wrong %4.1f%%"
+                    .format(weight, right / n * 100, wrong / n * 100),
+            )
+        }
+    }
 }

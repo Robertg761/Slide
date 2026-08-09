@@ -4,6 +4,13 @@
 
 ### Added
 
+- Autocorrect reads the sentence. A bigram language model, built from Tatoeba's English sentence
+  corpus and shipped as a 1.3 MB asset, weighs each candidate by how well it follows the word
+  before it. Measured on held-out sentences the model was never trained on, this takes correction
+  of single-edit typos from 81.6% to 90.4% while slightly *reducing* wrong corrections: the cases
+  it resolves — "at ocne" to "once", "my hroat" to "throat", "without efort" to "effort" — are
+  exactly the ambiguous ones a wrong correction used to come from. Words the model has never seen
+  in sequence are left exactly where spelling alone put them, so its gaps cost nothing.
 - A second symbols page behind `=\<`, carrying the slash, equals sign, brackets, angle brackets,
   pipe, caret, and currency symbols. The key previously asked for the page it was already on, so
   nothing happened when it was pressed.

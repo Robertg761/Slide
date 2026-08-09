@@ -1,6 +1,7 @@
 package com.slide.engine.suggest
 
 import com.slide.engine.gesture.GestureKeyMap
+import com.slide.engine.lexicon.Bigrams
 import com.slide.engine.lexicon.Lexicon
 import kotlin.math.hypot
 import kotlin.math.ln
@@ -138,6 +139,27 @@ data class SuggesterConfig(
 
     /** Longer than this and the input is not a word being typed. */
     val maxWordLength: Int = 28,
+
+    /**
+     * Weight on how well a candidate follows the preceding word.
+     *
+     * Added to a candidate's score, never subtracted, so a pair the model has never seen leaves
+     * that candidate exactly where spelling alone put it. Only what the model positively knows can
+     * move anything, which is what makes it safe to consult a model with large gaps in it.
+     *
+     * Sized against the language score, which spans 0 to [languageWeight]. At 0.6 a confidently
+     * predicted word outweighs a substantial frequency difference, which is what lets "at ocne"
+     * reach "once", while never overturning the spelling evidence, since a correction has to be
+     * reachable in one edit to be a candidate at all.
+     *
+     * `CorrectionSweepTest` keeps improving past this — 91.9% at 1.5, against 90.4% here — and the
+     * lower value is a deliberate choice rather than the measured optimum. The held-out sentences
+     * share a register with the ones the model was trained on, so a high weight is partly rewarded
+     * for recognising a corpus rather than a language, and the further it is trusted the more a
+     * deliberate non-word that happens to fit the sentence is at risk. Revisit against text from
+     * somewhere other than Tatoeba, not against a larger sweep of the same.
+     */
+    val contextWeight: Float = 0.6f,
 )
 
 /**
@@ -156,7 +178,12 @@ data class SuggesterConfig(
 class TypingSuggester(
     private val lexicon: Lexicon,
     private val config: SuggesterConfig = SuggesterConfig(),
+    /** Null when the asset is missing, which reduces this to spelling-only correction. */
+    private val bigrams: Bigrams? = null,
 ) {
+
+    /** Lexicon index of the word before the one being typed, or -1. Set per [suggest] call. */
+    private var contextIndex = -1
 
     /** Reusable buffer for generated spellings, one longer than the input to fit an insertion. */
     private var buffer = CharArray(config.maxWordLength + 1)
@@ -169,10 +196,16 @@ class TypingSuggester(
     /** Correction candidates for the current call: lexicon index to its cheapest edit cost. */
     private val corrections = HashMap<Int, Float>()
 
+    /**
+     * @param previousWord the word immediately before the one being typed, if there is one and the
+     *   cursor has not moved away from it. Supplying it is what lets the sentence break a tie that
+     *   spelling and frequency cannot; omitting it costs accuracy but is never wrong.
+     */
     fun suggest(
         typed: String,
         keys: GestureKeyMap,
         blockOffensive: Boolean = true,
+        previousWord: String? = null,
     ): TypingSuggestions {
         if (typed.isEmpty() || typed.length > config.maxWordLength) return TypingSuggestions.None
         val lower = typed.lowercase()
@@ -180,6 +213,7 @@ class TypingSuggester(
 
         ensureNeighbours(keys)
         corrections.clear()
+        contextIndex = contextIndexFor(previousWord)
 
         // Whether the dictionary knows the word and whether we are willing to show it are separate
         // questions. A blocked word is still a word, and correcting a deliberately typed obscenity
@@ -409,8 +443,32 @@ class TypingSuggester(
         return result
     }
 
-    private fun languageScore(index: Int): Float =
-        config.languageWeight * ln(1f + lexicon.frequencyAt(index)) / LN_MAX_FREQUENCY
+    /**
+     * How likely this word is, before any evidence about what was typed.
+     *
+     * Frequency in general, plus how well it follows the preceding word when the model has an
+     * opinion. The two are added rather than interpolated because the context term is one-sided:
+     * see [SuggesterConfig.contextWeight].
+     */
+    private fun languageScore(index: Int): Float {
+        val unigram = config.languageWeight * ln(1f + lexicon.frequencyAt(index)) / LN_MAX_FREQUENCY
+        val model = bigrams ?: return unigram
+        if (contextIndex < 0) return unigram
+        return unigram + config.contextWeight * model.score(contextIndex, index)
+    }
+
+    /**
+     * Resolves the preceding word to a lexicon index.
+     *
+     * A word the lexicon does not know has no recorded successors either, so there is nothing to
+     * look up and the corrector falls back to spelling alone for that keystroke.
+     */
+    private fun contextIndexFor(previousWord: String?): Int {
+        if (bigrams == null || previousWord.isNullOrEmpty()) return -1
+        val cleaned = previousWord.lowercase().trim('\'')
+        if (cleaned.isEmpty() || !cleaned.all { it in 'a'..'z' || it == '\'' }) return -1
+        return lexicon.indexOf(cleaned)
+    }
 
     // endregion
 

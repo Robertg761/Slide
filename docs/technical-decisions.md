@@ -67,8 +67,21 @@ already frequency-weighted, and license-clean. The `aosp-dictionaries` project m
 HeliBoard has current builds. We'll convert them to our own format rather than adopting AOSP's
 binary dictionary format.
 
-**Bigrams**: AOSP dictionaries carry some bigram data; we can augment from an open corpus
-(OpenSubtitles, Wikipedia dumps) for English. Adaptive personal n-grams accumulate locally on top.
+**Bigrams**: the AOSP combined wordlist turns out to carry none at all, despite the format
+supporting them — the shipped `en_wordlist.combined` is words and frequencies only. English bigrams
+are therefore built from [Tatoeba](https://tatoeba.org)'s sentence export (CC BY 2.0 FR): everyday
+conversational writing, which is a far closer match to what people type into a phone than books or
+an encyclopaedia, and permissive enough to redistribute a derived model. About 12M in-lexicon
+adjacencies reduce to 400k pairs over 24k contexts in a 1.3MB asset, keyed by lexicon index.
+
+The context term is added to a candidate's score and never subtracted, so a pair the model has not
+seen leaves that candidate exactly where spelling put it. Only what the model positively knows can
+move anything, which is what makes it safe to consult a model with large gaps — and every model of
+this size is mostly gaps. Measured on held-out sentences, it takes autocorrect from 81.6% to 90.4%
+of single-edit typos while slightly *reducing* wrong corrections, since the cases it resolves are
+exactly the ambiguous ones that a wrong correction used to come from.
+
+Adaptive personal n-grams accumulate locally on top; not built yet.
 
 **Do not** copy anything from Gboard itself — no dictionaries, no assets, no code.
 

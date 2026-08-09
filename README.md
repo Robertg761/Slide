@@ -125,6 +125,25 @@ python3 tools/build_lexicon.py /tmp/aosp_en.txt engine/src/main/assets/lexicon_e
 ./gradlew :engine:testDebugUnitTest
 ```
 
+**The bigram model** is what lets autocorrect read the sentence rather than guess from spelling —
+"at ocne" reaches "once" because the corpus knows what follows "at". It is generated from
+Tatoeba's English sentence export and committed alongside the lexicon, which it is keyed against
+by index, so it must be rebuilt whenever the lexicon is:
+
+```bash
+curl -sL -o /tmp/tatoeba.tsv.bz2 https://downloads.tatoeba.org/exports/per_language/eng/eng_sentences.tsv.bz2
+bunzip2 -kf /tmp/tatoeba.tsv.bz2
+python3 tools/build_bigrams.py /tmp/tatoeba.tsv \
+    engine/src/main/assets/lexicon_en.bin \
+    engine/src/main/assets/bigrams_en.bin \
+    engine/src/test/resources/heldout_en.txt
+./gradlew :engine:testDebugUnitTest
+```
+
+A tenth of the corpus is held back by sentence id and written to `heldout_en.txt`, which the model
+is never trained on. `ContextualCorrectionTest` measures against those sentences, so the numbers it
+reports are not the model marking its own homework.
+
 **The emoji catalogue** is generated from Unicode's `emoji-test.txt` and CLDR's English
 annotations, and is likewise committed. The script downloads its own sources:
 
@@ -180,6 +199,8 @@ incognito fields are excluded from any learning.
 ## Licence and provenance
 
 Slide clones Gboard's *functionality*, not its implementation. No Gboard code, binaries,
-dictionaries, or assets are used. Dictionaries come from the Apache-2.0 AOSP wordlists; emoji
-data and search keywords come from Unicode and CLDR under the Unicode licence; Whisper weights
-and `whisper.cpp` are MIT. Emoji are drawn with the system font, so no glyphs are redistributed.
+dictionaries, or assets are used. Dictionaries come from the Apache-2.0 AOSP wordlists; the bigram
+model is derived from [Tatoeba](https://tatoeba.org) sentence data, used and redistributed under
+CC BY 2.0 FR; emoji data and search keywords come from Unicode and CLDR under the Unicode licence;
+Whisper weights and `whisper.cpp` are MIT. Emoji are drawn with the system font, so no glyphs are
+redistributed.

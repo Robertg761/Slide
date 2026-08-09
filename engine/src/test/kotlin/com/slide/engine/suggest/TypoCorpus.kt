@@ -27,6 +27,9 @@ object TypoCorpus {
         'n' to "bhjm", 'm' to "njk",
     )
 
+    /** A key adjacent to [letter] on QWERTY, for building a mis-hit. */
+    fun neighbourOf(letter: Char): Char? = neighbours[letter]?.firstOrNull()
+
     enum class Kind { TRANSPOSITION, SUBSTITUTION, DOUBLED, DROPPED }
 
     data class Case(val typo: String, val intended: String, val kind: Kind)
