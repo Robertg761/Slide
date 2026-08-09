@@ -3,6 +3,7 @@ package com.slide.engine.suggest
 import com.slide.engine.gesture.GestureKeyMap
 import com.slide.engine.lexicon.Bigrams
 import com.slide.engine.lexicon.Lexicon
+import com.slide.engine.lexicon.UserDictionary
 import kotlin.math.hypot
 import kotlin.math.ln
 
@@ -196,6 +197,8 @@ class TypingSuggester(
     private val config: SuggesterConfig = SuggesterConfig(),
     /** Null when the asset is missing, which reduces this to spelling-only correction. */
     private val bigrams: Bigrams? = null,
+    /** The words this person uses that the shipped dictionary does not have. */
+    private val userDictionary: UserDictionary? = null,
 ) {
 
     /** Lexicon index of the word before the one being typed, or -1. Set per [suggest] call. */
@@ -211,6 +214,9 @@ class TypingSuggester(
 
     /** Correction candidates for the current call: lexicon index to its cheapest edit cost. */
     private val corrections = HashMap<Int, Float>()
+
+    /** Whether the shipped dictionary already has this word, and so whether learning it is idle. */
+    fun knows(word: String): Boolean = lexicon.indexOf(word.lowercase()) >= 0
 
     /**
      * @param previousWord the word immediately before the one being typed, if there is one and the
@@ -241,8 +247,20 @@ class TypingSuggester(
         if (lower.length >= config.minCorrectionLength) collectCorrections(lower, blockOffensive)
 
         val ranked = rank(shown, completions, properNounsUnmarked = typed.none(Char::isUpperCase))
-        val autocorrection = chooseAutocorrection(lower, isKnownWord = exact >= 0, ranked = ranked)
-        return TypingSuggestions(present(typed, ranked, autocorrection), autocorrection)
+
+        // A word this person has deliberately used before is a word, whatever the shipped
+        // dictionary thinks. This is the whole point of learning: without it their own name, and
+        // everyone else's, is rewritten every single time it is typed.
+        val learned = userDictionary?.isTrusted(lower) == true
+        val autocorrection = chooseAutocorrection(
+            lower,
+            isKnownWord = exact >= 0 || learned,
+            ranked = ranked,
+        )
+        return TypingSuggestions(
+            present(typed, ranked, autocorrection, learnedCompletions(lower)),
+            autocorrection,
+        )
     }
 
     // region Candidate generation
@@ -438,6 +456,7 @@ class TypingSuggester(
         typed: String,
         ranked: List<WordSuggestion>,
         autocorrection: String?,
+        learned: List<String>,
     ): List<WordSuggestion> {
         val literal = WordSuggestion(typed, 0f, WordSuggestion.Kind.Typed)
         val result = ArrayList<WordSuggestion>(config.maxResults)
@@ -451,12 +470,28 @@ class TypingSuggester(
             result.add(literal)
         }
 
+        // Learned words come next, ahead of the corpus. Someone who has typed a name twice is far
+        // likelier to be typing it again than to be misspelling whatever the corpus offers, and a
+        // completion the user taught the keyboard themselves is the one they will trust.
+        for (word in learned) {
+            if (result.size >= config.maxResults) break
+            if (result.any { it.word.equals(word, ignoreCase = true) }) continue
+            result.add(WordSuggestion(word, 0f, WordSuggestion.Kind.Completion))
+        }
+
         for (suggestion in ranked) {
             if (result.size >= config.maxResults) break
             if (result.any { it.word.equals(suggestion.word, ignoreCase = true) }) continue
             result.add(suggestion)
         }
         return result
+    }
+
+    /** Words the user has taught the keyboard that continue what they are typing. */
+    private fun learnedCompletions(lower: String): List<String> {
+        val dictionary = userDictionary ?: return emptyList()
+        if (lower.length < config.minCompletionLength) return emptyList()
+        return dictionary.completions(lower, config.maxResults)
     }
 
     /**

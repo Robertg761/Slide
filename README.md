@@ -196,6 +196,13 @@ only for as long as it takes to transcribe. The optional update check contacts G
 user enables it when Slide opens. Password and
 incognito fields are excluded from any learning.
 
+Slide learns the words you use that its dictionary does not have, so it stops rewriting your own
+name back at you. That list lives in `files/learned_words.txt` in the app's private storage, as
+plain text you can read or delete, and is excluded from cloud backup and device transfer alike —
+the words a person uses that most people do not are the most revealing thing here, and they should
+not leave the phone just because the phone was backed up. Hold a word in the suggestion strip to
+teach it or to take it back.
+
 ## Licence and provenance
 
 Slide clones Gboard's *functionality*, not its implementation. No Gboard code, binaries,

@@ -93,9 +93,9 @@ A 1:1 inventory of Gboard's feature surface, used as the master checklist for Sl
 | D5 | Auto-capitalise sentence starts | V1 | S | |
 | D6 | Double-space → period + space | V1 | S | |
 | D7 | Auto-space after punctuation | V1 | S | |
-| D8 | Personal dictionary (add/remove words) | V1 | M | Long-press a suggestion to learn/forget. |
+| D8 | Personal dictionary (add/remove words) | V1 | M | **Built.** Hold a candidate in the strip to learn or forget it. |
 | D9 | Text shortcuts / expansion (`omw` → `on my way`) | V2 | S | |
-| D10 | Learn from what you type | V1 | M | Local adaptive unigram/bigram store. |
+| D10 | Learn from what you type | V1 | M | **Built** for unigrams: a word committed deliberately twice, or rescued once from an autocorrect, is never rewritten again. Adaptive *bigrams* are still outstanding. |
 | D11 | Contact name suggestions | V2 | M | Needs `READ_CONTACTS`; make optional. |
 | D12 | Spell check + red squiggle underline | V2 | M | Via `InputConnection` spans. |
 | D13 | Tap a misspelled word → correction menu | V2 | M | |

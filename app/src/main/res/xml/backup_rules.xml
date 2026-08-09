@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Auto-backup rules for Android 11 and below.
+
+  The learned-words file is excluded. It is a list of the words this person uses that most people
+  do not — names, places, jargon, the odd medical term — and it is the one thing Slide holds that
+  would be genuinely revealing off the device. Everything else about Slide is on-device by design,
+  and a dictionary quietly synced to a cloud backup would make that claim untrue.
+-->
+<full-backup-content>
+    <exclude domain="file" path="learned_words.txt" />
+    <exclude domain="file" path="learned_words.txt.tmp" />
+</full-backup-content>

@@ -21,6 +21,7 @@ import android.window.OnBackInvokedDispatcher
 import android.widget.LinearLayout
 import android.widget.LinearLayout.LayoutParams.MATCH_PARENT
 import android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+import android.widget.Toast
 import com.slide.asr.VoiceInput
 import com.slide.asr.VoiceInputClient
 import com.slide.asr.WhisperModel
@@ -37,6 +38,8 @@ import com.slide.engine.gesture.GestureDecoder
 import com.slide.engine.gesture.GesturePoint
 import com.slide.engine.lexicon.BigramLoader
 import com.slide.engine.lexicon.LexiconLoader
+import com.slide.engine.lexicon.UserDictionary
+import com.slide.engine.lexicon.UserDictionaryStore
 import com.slide.engine.suggest.TypingSuggester
 import com.slide.ime.text.PrecedingWord
 import com.slide.ime.view.EmojiGlyphs
@@ -109,6 +112,19 @@ class SlideInputMethodService :
 
     /** Shares the lexicon with the decoder; null until it loads, for the same reason. */
     private var typingSuggester: TypingSuggester? = null
+
+    /**
+     * The words this person uses that the shipped dictionary does not have.
+     *
+     * Created up front rather than with the lexicon, because it is the one dictionary that is
+     * useful before anything has loaded and must never be missed a word because a load was slow.
+     */
+    private val userDictionary = UserDictionary()
+
+    private val userDictionaryStore by lazy { UserDictionaryStore(applicationContext) }
+
+    /** Set when something has been learned since the last save. */
+    private var learnedSinceSave = false
 
     private var emojiData: EmojiData? = null
     private var recentEmoji: List<String> = emptyList()
@@ -206,6 +222,10 @@ class SlideInputMethodService :
             }
             .launchIn(scope)
 
+        scope.launch {
+            withContext(Dispatchers.IO) { userDictionaryStore.load(userDictionary) }
+        }
+
         // Roughly a megabyte to parse; doing it on the main thread would stall the first frame
         // of the keyboard, which is the one moment the user is definitely watching.
         scope.launch {
@@ -218,7 +238,11 @@ class SlideInputMethodService :
             }
             if (lexicon != null) {
                 gestureDecoder = GestureDecoder(lexicon, bigrams = bigrams)
-                typingSuggester = TypingSuggester(lexicon, bigrams = bigrams)
+                typingSuggester = TypingSuggester(
+                    lexicon,
+                    bigrams = bigrams,
+                    userDictionary = userDictionary,
+                )
                 Log.i(
                     TAG,
                     "Decoder and suggester ready with ${lexicon.size} words" +
@@ -353,6 +377,7 @@ class SlideInputMethodService :
         hideEmojiPanel()
         hideVoiceOverlay()
         voiceClient.unbind()
+        saveLearnedWords()
     }
 
     /**
@@ -595,6 +620,50 @@ class SlideInputMethodService :
             StripMode.Typing -> pickTypedSuggestion(word)
             StripMode.Empty -> Unit
         }
+    }
+
+    /**
+     * Holding a candidate teaches the keyboard a word, or takes one back.
+     *
+     * The escape hatch that makes learning safe to do automatically. A word learned by mistake —
+     * the same typo made twice — is otherwise defended for ever, and the moment the user notices
+     * is the moment it is sitting in front of them in the strip.
+     *
+     * Which way it goes is not a choice the user has to make: a word already learned can only
+     * sensibly be forgotten, and one that is not can only be learned. Anything the shipped
+     * dictionary already knows is neither.
+     */
+    override fun onSuggestionHeld(index: Int, word: String) {
+        performHaptic()
+        val suggester = typingSuggester ?: return
+        if (word.isEmpty() || suggester.knows(word)) {
+            announce("$word is already in the dictionary")
+            return
+        }
+
+        if (userDictionary.countOf(word) > 0) {
+            userDictionary.forget(word)
+            announce("Forgot $word")
+        } else {
+            if (incognito) return
+            userDictionary.learn(word, weight = TRUSTED_AT_ONCE)
+            announce("Learned $word")
+        }
+        learnedSinceSave = true
+        saveLearnedWords()
+        // The strip was built against the old dictionary, so what it offers may have just changed.
+        if (composing.isNotEmpty()) updateTypingSuggestions()
+    }
+
+    /**
+     * Says something the user needs to know, without a window of our own to say it in.
+     *
+     * An IME has no UI outside the input view, and the input view is entirely spoken for. A toast
+     * is the one channel that does not steal space from the keys.
+     */
+    private fun announce(message: String) {
+        keyboardView?.announceForAccessibility(message)
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     }
 
     private fun pickGestureAlternative(index: Int, word: String) {
@@ -1074,6 +1143,41 @@ class SlideInputMethodService :
         suggestionStrip?.setSuggestions(result.words.map { it.word })
     }
 
+    /**
+     * Remembers a word the user committed on purpose.
+     *
+     * Three things never reach this. A field that asked not to be learned from — [incognito] covers
+     * password fields too. A word the shipped dictionary already has, which would only crowd out
+     * the ones it does not. And anything the user did not clearly choose: a word merely typed once
+     * arrives here with a weight of one and is not defended until it happens again, because a
+     * dictionary that learns typos on sight would defend them for ever.
+     *
+     * @param weight see [UserDictionary.learn]. Undoing an autocorrect is worth enough on its own,
+     *   being the one moment the user is told what the keyboard thinks and says no.
+     */
+    private fun learnWord(word: String, weight: Int = 1) {
+        if (incognito) return
+        val suggester = typingSuggester ?: return
+        if (word.isEmpty() || suggester.knows(word)) return
+        if (!word.all { it.isLetter() || it == '\'' }) return
+
+        userDictionary.learn(word, weight)
+        learnedSinceSave = true
+    }
+
+    /**
+     * Writes the learned words out, at a moment when nothing is being typed.
+     *
+     * Saving on every word would put a file write on the keypress path for a file that only has to
+     * survive the process, and the keyboard leaving the screen is both frequent enough to lose
+     * very little and quiet enough to cost nothing.
+     */
+    private fun saveLearnedWords() {
+        if (!learnedSinceSave) return
+        learnedSinceSave = false
+        scope.launch { withContext(Dispatchers.IO) { userDictionaryStore.save(userDictionary) } }
+    }
+
     /** The word before the one being typed, for the corrector to weigh candidates against. */
     private fun precedingWord(): String? =
         textBehindCursor()?.let(PrecedingWord::of)
@@ -1103,6 +1207,11 @@ class SlideInputMethodService :
             connection.setComposingText(cased, 1)
             lastAutocorrect = Autocorrect(original = typed, applied = cased)
             corrected = true
+        } else if (!recomposed) {
+            // Settled exactly as typed, with the keyboard offering no objection. That is the
+            // ordinary way a word the dictionary has never heard of gets into the language.
+            // Reopened words are excluded: the user went back to look at one, not to write it.
+            learnWord(typed)
         }
 
         connection.finishComposingText()
@@ -1158,6 +1267,11 @@ class SlideInputMethodService :
         connection.commitText(undo.original + separator, 1)
         connection.endBatchEdit()
 
+        // The clearest signal a keyboard ever gets. The user was shown what it thought they meant
+        // and said no, in the one gesture that means exactly that and nothing else. A word rescued
+        // this way is trusted from now on rather than waiting to be typed again.
+        learnWord(undo.original, weight = TRUSTED_AT_ONCE)
+
         updateShiftFromCursor()
         return true
     }
@@ -1195,6 +1309,12 @@ class SlideInputMethodService :
         // The dictionary is lowercase. A word reopened mid-sentence was written with whatever
         // capitalisation the user chose, and swapping it for a correction must not quietly undo it.
         val replacement = if (recomposed) matchCase(composing.toString(), word) else word
+
+        // Reaching past the keyboard's own first choice to pick out what they wrote is a deliberate
+        // choice, and means the same thing as undoing a correction.
+        if (word.equals(composing.toString(), ignoreCase = true)) {
+            learnWord(word, weight = TRUSTED_AT_ONCE)
+        }
 
         connection.beginBatchEdit()
         connection.setComposingText(replacement, 1)
@@ -1426,6 +1546,14 @@ class SlideInputMethodService :
 
         /** Enough to reach back over the word in progress and the one before it. */
         const val MAX_CONTEXT_CHARS = 64
+
+        /**
+         * Weight enough to trust a word on the spot.
+         *
+         * Reserved for the two gestures that can only mean "this is a word": undoing a correction,
+         * and reaching past the keyboard's first choice to pick out what was actually typed.
+         */
+        const val TRUSTED_AT_ONCE = 2
 
         /** Below this, a word has too many neighbours for the strip to be worth anything. */
         const val MIN_REOPEN_LENGTH = 2

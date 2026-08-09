@@ -4,6 +4,13 @@
 
 ### Added
 
+- Slide learns your words. A word committed deliberately twice — or rescued once from an
+  autocorrect, which is the clearest signal a keyboard ever gets — stops being corrected away, and
+  starts being offered as a completion. This is the gap that made a keyboard feel like it was
+  fighting you: names, slang and jargon were rewritten every single time and never suggested once.
+  Hold a candidate in the suggestion strip to teach a word or take one back. Nothing is learned in
+  password or incognito fields, the list lives in the app's private storage as plain text you can
+  read or delete, and it is excluded from cloud backup and device transfer.
 - Swipe reads the sentence too. The same model weighs each decoded candidate by how well it
   follows the word before it, which lifts top-1 accuracy on traced held-out sentences from 93.8% to
   96.8% — nearly halving the error rate. It is the only thing that can separate words tracing an
