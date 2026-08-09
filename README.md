@@ -31,7 +31,8 @@ is written and compiles but has **not yet run on hardware** — see *Not yet ver
 - Nine themes plus Material You dynamic colour, light/dark following the system
 - Key preview popups, key borders, number row, haptics, keypress sound
 - Password and incognito field detection (no learning in those fields)
-- A personal dictionary that learns the words you use and stops correcting them away
+- A personal dictionary that learns the words and phrases you use and stops correcting them away
+- Next-word prediction in the strip, from the corpus and from your own repeated phrases
 - **Gesture typing** — SHARK²-derived decoder over a 160k-word lexicon, 95.8% top-1 and 100%
   top-5 on the isolated test corpus at 0.21 ms mean decode. In a sentence, where the bigram model
   can break ties the path cannot, 96.8% top-1 against 93.8% without it
@@ -66,9 +67,6 @@ is written and compiles but has **not yet run on hardware** — see *Not yet ver
   font-scale, landscape, and latency verification.
 
 **Not yet built**
-- Next-word *prediction* in the strip. The bigram model exists and is wired into correction and
-  gesture decoding; what is missing is offering a word before anything has been typed.
-- Adaptive bigrams. The personal dictionary learns words, not yet the pairs they appear in.
 - Clipboard and text-editing panels
 - Remaining appearance settings, setup-wizard polish, and full accessibility/adaptive-layout QA
 
@@ -201,8 +199,9 @@ user enables it when Slide opens. Password and
 incognito fields are excluded from any learning.
 
 Slide learns the words you use that its dictionary does not have, so it stops rewriting your own
-name back at you. That list lives in `files/learned_words.txt` in the app's private storage, as
-plain text you can read or delete, and is excluded from cloud backup and device transfer alike —
+name back at you, and the phrases you repeat, so it can offer them. Those live in
+`files/learned_words.txt` and `files/learned_pairs.txt` in the app's private storage, as plain text
+you can read or delete, and are excluded from cloud backup and device transfer alike —
 the words a person uses that most people do not are the most revealing thing here, and they should
 not leave the phone just because the phone was backed up. Hold a word in the suggestion strip to
 teach it or to take it back.

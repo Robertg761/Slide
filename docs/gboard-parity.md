@@ -89,7 +89,7 @@ A 1:1 inventory of Gboard's feature surface, used as the master checklist for Sl
 | D1 | Suggestion strip (3 candidates) | V1 | M | **Built.** Carries swipe and typed candidates. |
 | D2 | Autocorrect on space/punctuation | V1 | L | **Built.** Composing text + single-edit candidates over the key-proximity model. |
 | D3 | Undo autocorrect (backspace right after) | V1 | S | **Built.** Verified against the field's own text before reverting. |
-| D4 | Contextual correction from a bigram LM | V1 | L | **Built.** Tatoeba-derived asset, 400k pairs. Held-out typo correction 81.6% -> 90.4%. Next-word *prediction* into the strip is still outstanding. |
+| D4 | Contextual correction and next-word prediction | V1 | L | **Built.** Tatoeba-derived asset, 393k pairs. Held-out typo correction 84.4% -> 92.2%; swipe top-1 93.8% -> 96.8%. The strip offers the next word between words, right 26% of the time from the corpus alone. |
 | D5 | Auto-capitalise sentence starts | V1 | S | |
 | D6 | Double-space → period + space | V1 | S | |
 | D7 | Auto-space after punctuation | V1 | S | |

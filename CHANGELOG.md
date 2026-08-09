@@ -4,6 +4,11 @@
 
 ### Added
 
+- The strip offers the next word between words, where it used to sit empty. Continuations come
+  from the corpus and from your own repeated phrases, with yours first — measured against held-out
+  text, the next word is one tap away about a quarter of the time from the corpus alone. It stays
+  quiet when it has nothing confident to say, because three guessed words cost a glance every time
+  they appear.
 - Corrections use where your finger actually landed, not just which key it registered. A touch
   that caught the right-hand edge of "s" is strong evidence for "d"; that d is next to s is equally
   true of every "s" ever typed. On simulated typing where mis-hits emerge from the geometry rather
@@ -30,7 +35,7 @@
 - Autocorrect reads the sentence. A bigram language model, built from Tatoeba's English sentence
   corpus and shipped as a 1.3 MB asset, weighs each candidate by how well it follows the word
   before it. Measured on held-out sentences the model was never trained on, this takes correction
-  of single-edit typos from 81.6% to 90.4% while slightly *reducing* wrong corrections: the cases
+  of single-edit typos from 84.4% to 92.2% while barely moving wrong corrections: the cases
   it resolves — "at ocne" to "once", "my hroat" to "throat", "without efort" to "effort" — are
   exactly the ambiguous ones a wrong correction used to come from. Words the model has never seen
   in sequence are left exactly where spelling alone put them, so its gaps cost nothing.

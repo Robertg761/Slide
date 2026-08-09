@@ -57,6 +57,46 @@ class Bigrams(
     fun hasContext(previous: Int): Boolean =
         previous >= 0 && binarySearch(contexts, 0, contexts.size, previous) >= 0
 
+    /**
+     * The likeliest words to follow [previous], best first, at most [limit] of them.
+     *
+     * Unlike [score], which answers a question about a candidate the corrector already has, this
+     * one is asked when there is no candidate at all — nothing has been typed yet — so it has to
+     * produce the words rather than rank them.
+     *
+     * A context's successors are stored ascending by index rather than by score, so this is a scan
+     * of the run. That is the right trade: the run is rarely more than a few dozen long, and
+     * ordering the file by score would cost the delta encoding that makes it a megabyte instead of
+     * three.
+     */
+    fun topSuccessors(previous: Int, limit: Int): IntArray {
+        if (previous < 0 || limit <= 0) return EMPTY
+        val context = binarySearch(contexts, 0, contexts.size, previous)
+        if (context < 0) return EMPTY
+
+        val from = offsets[context]
+        val to = offsets[context + 1]
+
+        val best = IntArray(limit)
+        val bestScores = IntArray(limit)
+        var count = 0
+
+        for (slot in from until to) {
+            val score = scores[slot].toInt() and 0xFF
+            var at = minOf(count, limit - 1)
+            if (count == limit && score <= bestScores[at]) continue
+            while (at > 0 && score > bestScores[at - 1]) {
+                best[at] = best[at - 1]
+                bestScores[at] = bestScores[at - 1]
+                at--
+            }
+            best[at] = successors[slot]
+            bestScores[at] = score
+            if (count < limit) count++
+        }
+        return best.copyOf(count)
+    }
+
     private fun binarySearch(values: IntArray, from: Int, to: Int, target: Int): Int {
         var low = from
         var high = to - 1
@@ -70,5 +110,9 @@ class Bigrams(
             }
         }
         return -1
+    }
+
+    private companion object {
+        val EMPTY = IntArray(0)
     }
 }

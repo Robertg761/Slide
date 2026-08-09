@@ -68,6 +68,25 @@ PROBABILITY_FLOOR = 1e-4
 # Sentences whose id ends in this digit are never trained on. See the module docstring.
 HELDOUT_DIGIT = 7
 
+# Tatoeba's stock characters and settings, excluded from every pair they appear in.
+#
+# These are not facts about English. Tatoeba uses Tom and Mary the way a maths textbook uses Alice
+# and Bob, and Boston as its stock city, and it shows in the counts: "tom" is the third commonest
+# token in the entire corpus at 2.9% — ahead of "I", "a" and "you" — "mary" is fifteenth at 1.0%,
+# and "boston" outnumbers "london" twenty-one to one.
+#
+# Left in, that distortion reaches the user. The strip offered "thank tom", and a dropped letter in
+# "from" was corrected to "tom", because a model built on this corpus believes "tom" follows almost
+# anything. Note that removing them slightly *lowers* the measured correction rate, since the
+# held-out sentences are from the same corpus and carry the same skew. That is the measurement
+# losing its artefact, not the model losing accuracy.
+#
+# Only the pairs are dropped, not the sentences: everything else in a sentence about Tom is
+# ordinary English and worth counting. The cost is that the genuine words "tom" (a male cat),
+# "mary" and "boston" stop being predicted, which is a small price for not threading a textbook's
+# stage names through someone's messages.
+PLACEHOLDER_NAMES = frozenset({"tom", "mary", "boston"})
+
 
 def read_lexicon(path: Path) -> list[str]:
     """Decodes the front-coded word list, so bigrams can be keyed by the same indices."""
@@ -121,15 +140,24 @@ def count_pairs(corpus: list[str], index_of: dict[str, int]) -> dict[int, dict[i
     """
     pairs: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     kept = 0
+    dropped = 0
     for text in corpus:
         previous = -1
         for token in TOKEN_RE.findall(text.lower()):
-            current = index_of.get(token.strip("'"), -1)
+            word = token.strip("'")
+            if word in PLACEHOLDER_NAMES:
+                # Breaks the chain rather than skipping the token, so the words either side of a
+                # placeholder are not counted as adjacent to each other either. They were not.
+                dropped += 1
+                previous = -1
+                continue
+            current = index_of.get(word, -1)
             if previous >= 0 and current >= 0:
                 pairs[previous][current] += 1
                 kept += 1
             previous = current
     print(f"  counted       {kept:,} in-lexicon adjacencies")
+    print(f"  placeholders  {dropped:,} occurrences excluded ({', '.join(sorted(PLACEHOLDER_NAMES))})")
     return pairs
 
 

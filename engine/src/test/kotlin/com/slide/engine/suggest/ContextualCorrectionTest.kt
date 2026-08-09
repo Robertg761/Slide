@@ -55,7 +55,7 @@ class ContextualCorrectionTest {
         println("  spelling only : %.1f%% right, %.1f%% wrong".format(baseRight * 100, baseWrong * 100))
         println("  with context  : %.1f%% right, %.1f%% wrong".format(contextRight * 100, contextWrong * 100))
 
-        // Measured at 84.4% -> 92.4%. The floor is a fraction of that, because the point is to
+        // Measured at 84.4% -> 92.2%. The floor is a fraction of that, because the point is to
         // catch the model being disconnected or built wrong, not to pin the exact gain.
         assertTrue(
             "context did not help: %.1f%% -> %.1f%%".format(baseRight * 100, contextRight * 100),

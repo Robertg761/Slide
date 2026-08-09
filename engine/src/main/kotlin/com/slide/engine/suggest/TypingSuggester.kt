@@ -170,7 +170,7 @@ data class SuggesterConfig(
      * reach "once", while never overturning the spelling evidence, since a correction has to be
      * reachable in one edit to be a candidate at all.
      *
-     * `CorrectionSweepTest` keeps improving past this — 91.9% at 1.5, against 90.4% here — and the
+     * `CorrectionSweepTest` keeps improving past this — around a point and a half more at 1.5 — and the
      * lower value is a deliberate choice rather than the measured optimum. The held-out sentences
      * share a register with the ones the model was trained on, so a high weight is partly rewarded
      * for recognising a corpus rather than a language, and the further it is trusted the more a
@@ -287,6 +287,51 @@ class TypingSuggester(
 
     /** Whether the shipped dictionary already has this word, and so whether learning it is idle. */
     fun knows(word: String): Boolean = lexicon.indexOf(word.lowercase()) >= 0
+
+    /**
+     * The likeliest words to come next, given the word just written and nothing else.
+     *
+     * A different question from [suggest], which ranks candidates for something already typed.
+     * Here there is no input to rank — the strip would otherwise be empty — so the answer comes
+     * from what usually follows, and from what this person usually writes.
+     *
+     * Empty when there is nothing worth saying. An empty strip is a perfectly good answer and much
+     * better than three words guessed at: the value of a prediction is that it saves typing, and
+     * one nobody wanted costs a glance every time it appears.
+     */
+    fun predict(
+        previousWord: String?,
+        blockOffensive: Boolean = true,
+        limit: Int = config.maxResults,
+    ): List<String> {
+        if (previousWord.isNullOrEmpty() || limit <= 0) return emptyList()
+
+        val ranked = LinkedHashMap<String, Float>()
+
+        // This person's own habits first, and outright rather than by score: a phrase somebody
+        // writes over and over is a better guess at their next word than the corpus average, which
+        // is the entire reason for keeping it.
+        userBigrams?.successorsOf(previousWord)?.forEach { (word, _) ->
+            val strength = userBigrams.score(previousWord, word)
+            if (strength > 0f) ranked[word] = PERSONAL_PREDICTION_FLOOR + strength
+        }
+
+        val model = bigrams
+        val context = contextIndexFor(previousWord)
+        if (model != null && context >= 0) {
+            for (index in model.topSuccessors(context, limit * 2)) {
+                if (blockOffensive && lexicon.isOffensive(index)) continue
+                val word = lexicon.wordAt(index)
+                if (ranked.containsKey(word.lowercase())) continue
+                ranked[word] = model.score(context, index)
+            }
+        }
+
+        return ranked.entries
+            .sortedByDescending { it.value }
+            .take(limit)
+            .map { it.key }
+    }
 
     /**
      * @param previousWord the word immediately before the one being typed, if there is one and the
@@ -733,6 +778,15 @@ class TypingSuggester(
     }
 
     private companion object {
+        /**
+         * Guarantees a personal prediction outranks any corpus one.
+         *
+         * Both channels score 0 to 1, and a phrase this person repeats is a better guess at their
+         * next word than English's average is, however confident the corpus happens to be about
+         * some other continuation.
+         */
+        const val PERSONAL_PREDICTION_FLOOR = 1f
+
         const val ALPHABET = 26
         const val MIN_CANDIDATE_LENGTH = 2
         val LN_MAX_FREQUENCY = ln(256f)

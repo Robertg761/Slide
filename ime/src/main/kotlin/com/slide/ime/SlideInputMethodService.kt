@@ -361,6 +361,7 @@ class SlideInputMethodService :
         clearSuggestions()
         refreshSuggestionEmptyMessage()
         updateShiftFromCursor()
+        updatePredictions()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -509,7 +510,7 @@ class SlideInputMethodService :
         // Any keypress ends the swiped word: the candidates no longer describe what is in front of
         // the cursor, so leaving them up would offer a replacement for text that has moved on. A
         // typing strip is the opposite -- it is about to be rebuilt from the new keystroke.
-        if (stripMode == StripMode.Gesture) clearSuggestions()
+        if (stripMode == StripMode.Gesture || stripMode == StripMode.Prediction) clearSuggestions()
 
         // An autocorrection can only be taken back by the very next key press, and only by
         // backspace. Anything else the user does means they have accepted it.
@@ -637,6 +638,7 @@ class SlideInputMethodService :
         when (stripMode) {
             StripMode.Gesture -> pickGestureAlternative(index, word)
             StripMode.Typing -> pickTypedSuggestion(word)
+            StripMode.Prediction -> commitPrediction(word)
             StripMode.Empty -> Unit
         }
     }
@@ -1067,6 +1069,7 @@ class SlideInputMethodService :
             lastSpaceCommitMs = now
         }
         updateShiftFromCursor()
+        updatePredictions()
     }
 
     /** True when the text is "<letter><space>", the only case where double-space should punctuate. */
@@ -1409,6 +1412,63 @@ class SlideInputMethodService :
         lastSpaceCommitMs = 0L
         clearSuggestions()
         updateShiftFromCursor()
+        // Picking a suggestion appends a space, so the word is finished and the next one is open.
+        if (appendSpace) updatePredictions()
+    }
+
+    /**
+     * Offers what usually comes next, when nothing has been typed to correct.
+     *
+     * The strip is otherwise empty between words, which is most of the time someone spends looking
+     * at it. Predictions are only shown where they are actually useful — with a word behind the
+     * cursor and nothing in front of it — and they are silently absent when the models have nothing
+     * confident to say, because three guessed words cost a glance every time they appear.
+     */
+    private fun updatePredictions() {
+        if (composing.isNotEmpty()) return
+        if (!suggestionsAvailable()) return
+        if (searchModeShown || emojiPanelShown || voiceOverlayShown) return
+
+        val suggester = typingSuggester ?: return
+        val predictions = suggester.predict(
+            previousWord = precedingWordForSwipe(),
+            blockOffensive = settings.blockOffensiveWords,
+        )
+        if (predictions.isEmpty()) {
+            clearSuggestions()
+            return
+        }
+
+        stripMode = StripMode.Prediction
+        suggestionStrip?.setSuggestions(predictions)
+    }
+
+    /**
+     * Commits a predicted word, with the spacing a typed one would have had.
+     *
+     * The whole value of a prediction is the keystrokes it saves, so it has to arrive finished —
+     * separated from what came before and ready for the next word — rather than needing a space
+     * pressed after it.
+     */
+    private fun commitPrediction(word: String) {
+        val connection = currentInputConnection ?: return
+        // Read before the commit; afterwards the preceding word is the one just put down.
+        val previous = precedingWordForSwipe()
+        val before = connection.getTextBeforeCursor(1, 0)
+        val needsSpace = !before.isNullOrEmpty() && isWordCharacter(before[0])
+
+        connection.beginBatchEdit()
+        connection.commitText(if (needsSpace) " $word " else "$word ", 1)
+        connection.endBatchEdit()
+
+        // Taking a prediction is a deliberate choice of what comes next, and worth learning from
+        // exactly as typing it would have been.
+        learnPair(previous, word)
+        lastAutocorrect = null
+        lastSpaceCommitMs = 0L
+        clearSuggestions()
+        updateShiftFromCursor()
+        updatePredictions()
     }
 
     /**
@@ -1507,7 +1567,7 @@ class SlideInputMethodService :
     private data class Autocorrect(val original: String, val applied: String)
 
     /** What the suggestion strip is showing, and so what a tap on it should do. */
-    private enum class StripMode { Empty, Gesture, Typing }
+    private enum class StripMode { Empty, Gesture, Typing, Prediction }
 
     // endregion
 

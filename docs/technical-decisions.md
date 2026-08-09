@@ -77,9 +77,16 @@ adjacencies reduce to 400k pairs over 24k contexts in a 1.3MB asset, keyed by le
 The context term is added to a candidate's score and never subtracted, so a pair the model has not
 seen leaves that candidate exactly where spelling put it. Only what the model positively knows can
 move anything, which is what makes it safe to consult a model with large gaps — and every model of
-this size is mostly gaps. Measured on held-out sentences, it takes autocorrect from 81.6% to 90.4%
-of single-edit typos while slightly *reducing* wrong corrections, since the cases it resolves are
-exactly the ambiguous ones that a wrong correction used to come from.
+this size is mostly gaps. Measured on held-out sentences, it takes autocorrect from 84.4% to 92.2%
+of single-edit typos, and swipe decoding from 93.8% to 96.8% top-1 — the latter being the only
+channel that can separate words tracing an identical path.
+
+A corpus brings its own distortions, and one here was large enough to reach the user. Tatoeba uses
+Tom and Mary as stock characters and Boston as its stock city, to the point that "tom" is the third
+commonest token in the whole corpus, ahead of "I" and "you". Left in, the strip offered "thank tom"
+and "fom" was corrected to "tom". Pairs containing them are excluded at build time. Doing so very
+slightly lowers the measured correction rate, because the held-out sentences carry the same skew —
+that is the measurement losing an artefact rather than the model losing accuracy.
 
 Adaptive personal n-grams accumulate locally on top, as words and as pairs. The pair model is
 string-keyed rather than index-keyed, because half its value is in pairs containing words no
