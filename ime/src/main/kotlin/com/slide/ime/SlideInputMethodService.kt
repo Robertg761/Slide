@@ -217,7 +217,7 @@ class SlideInputMethodService :
                 words to words?.let { BigramLoader.load(applicationContext, it) }
             }
             if (lexicon != null) {
-                gestureDecoder = GestureDecoder(lexicon)
+                gestureDecoder = GestureDecoder(lexicon, bigrams = bigrams)
                 typingSuggester = TypingSuggester(lexicon, bigrams = bigrams)
                 Log.i(
                     TAG,
@@ -494,10 +494,16 @@ class SlideInputMethodService :
         val connection = currentInputConnection ?: return
         val keys = keyboardView?.gestureKeyMap() ?: return
 
-        // A swipe ends the typed word as surely as a space does.
+        // A swipe ends the typed word as surely as a space does. It also settles what the swiped
+        // word will be predicted from, so the context is read after this rather than before.
         finishComposing(connection)
 
-        val candidates = decoder.decode(points, keys, blockOffensive = settings.blockOffensiveWords)
+        val candidates = decoder.decode(
+            points = points,
+            keys = keys,
+            blockOffensive = settings.blockOffensiveWords,
+            previousWord = precedingWordForSwipe(),
+        )
         val best = candidates.firstOrNull() ?: return
 
         commitGestureWord(connection, best.word)
@@ -1069,11 +1075,15 @@ class SlideInputMethodService :
     }
 
     /** The word before the one being typed, for the corrector to weigh candidates against. */
-    private fun precedingWord(): String? {
-        val connection = currentInputConnection ?: return null
-        val before = connection.getTextBeforeCursor(MAX_CONTEXT_CHARS, 0)?.toString() ?: return null
-        return PrecedingWord.of(before)
-    }
+    private fun precedingWord(): String? =
+        textBehindCursor()?.let(PrecedingWord::of)
+
+    /** The word before a swipe, which has no fragment in front of the cursor to step over. */
+    private fun precedingWordForSwipe(): String? =
+        textBehindCursor()?.let(PrecedingWord::beforeNewWord)
+
+    private fun textBehindCursor(): String? =
+        currentInputConnection?.getTextBeforeCursor(MAX_CONTEXT_CHARS, 0)?.toString()
 
     /**
      * Settles the word in progress, applying a pending autocorrection on the way out.

@@ -60,6 +60,28 @@ class PrecedingWordTest {
         assertEquals("it's", PrecedingWord.of("it's rainin"))
     }
 
+    /**
+     * A swipe commits a whole word, so there is no fragment in front of the cursor to step over.
+     * Stepping over one anyway would hand the decoder the word before last.
+     */
+    @Test
+    fun `before a swipe, takes the word the cursor sits after`() {
+        assertEquals("like", PrecedingWord.beforeNewWord("I like"))
+        assertEquals("like", PrecedingWord.beforeNewWord("I like "))
+        assertEquals("don't", PrecedingWord.beforeNewWord("I don't "))
+        assertNull(PrecedingWord.beforeNewWord(""))
+        assertNull(PrecedingWord.beforeNewWord("I went home. "))
+    }
+
+    /** The two differ exactly where they should: one skips a word in progress, the other does not. */
+    @Test
+    fun `the typing and swipe lookups disagree only about the trailing word`() {
+        assertEquals("I", PrecedingWord.of("I like"))
+        assertEquals("like", PrecedingWord.beforeNewWord("I like"))
+        // With nothing in progress they agree, because there is nothing to skip.
+        assertEquals(PrecedingWord.of("I like "), PrecedingWord.beforeNewWord("I like "))
+    }
+
     @Test
     fun `handles a window that starts mid-word`() {
         // getTextBeforeCursor returns a fixed number of characters, so the earliest word in the

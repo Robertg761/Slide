@@ -1,5 +1,6 @@
 package com.slide.engine.gesture
 
+import com.slide.engine.lexicon.Bigrams
 import com.slide.engine.lexicon.Lexicon
 import kotlin.math.hypot
 import kotlin.math.ln
@@ -49,6 +50,23 @@ data class DecoderConfig(
      * "swipe" loses to a commoner neighbour like "stripe".
      */
     val languageWeight: Float = 3.0f,
+    /**
+     * Weight on how well a candidate follows the preceding word.
+     *
+     * This is the only channel that can separate words the path genuinely cannot. "typing" and
+     * "topping" trace an identical straight run along the top row, because y and o both lie
+     * between t and p; no amount of geometry will ever tell them apart, and frequency alone
+     * always returns the same answer whichever the user meant. The sentence can.
+     *
+     * Added, never subtracted, so a pair the model has not seen leaves that candidate exactly
+     * where the geometry put it. Sized against [languageWeight], on whose scale it sits.
+     *
+     * Unlike the corrector's equivalent this one has a real optimum rather than a plateau that
+     * keeps climbing: `ContextualDecodeTest`'s corpus gives 93.8% top-1 at zero, 96.8% here, 96.8%
+     * at 2.0, and falls away above that as the sentence starts overruling a clear trace. 1.5 sits
+     * on the near side of the peak.
+     */
+    val contextWeight: Float = 1.5f,
     /** Words scored per swipe. Pruning normally yields far fewer; this is a latency backstop. */
     val maxScored: Int = 3000,
     /** Candidates returned to the caller. */
@@ -77,7 +95,12 @@ data class DecoderConfig(
 class GestureDecoder(
     private val lexicon: Lexicon,
     private val config: DecoderConfig = DecoderConfig(),
+    /** Null when the asset is missing, which reduces this to geometry and frequency. */
+    private val bigrams: Bigrams? = null,
 ) {
+
+    /** Lexicon index of the word before the swipe, or -1. Set per [decode] call. */
+    private var contextIndex = -1
 
     /** Sample indices at which the trace passed near each letter, ascending. Reused per decode. */
     private val nearIndices = arrayOfNulls<IntArray>(ALPHABET)
@@ -96,12 +119,17 @@ class GestureDecoder(
      * @param blockOffensive drop words the wordlist flags as offensive, mirroring Gboard's
      *   "Block offensive words" setting. They stay typeable by hand; they are only withheld from
      *   suggestions the user did not ask for.
+     * @param previousWord the word before the swipe, if there is one. Supplying it is the only way
+     *   to separate candidates that trace the same path; omitting it costs accuracy but is never
+     *   wrong.
      */
     fun decode(
         points: List<GesturePoint>,
         keys: GestureKeyMap,
         blockOffensive: Boolean = true,
+        previousWord: String? = null,
     ): List<GestureCandidate> {
+        contextIndex = contextIndexFor(previousWord)
         if (points.size < config.minimumPoints) return emptyList()
 
         val trace = SampledTrace.of(points, config.sampleCount)
@@ -275,7 +303,21 @@ class GestureDecoder(
         val frequency = lexicon.frequencyAt(wordIndex)
         val languageTerm = config.languageWeight * ln(1f + frequency) / LN_MAX_FREQUENCY
 
-        return locationTerm + shapeTerm + endpointTerm + languageTerm
+        val contextTerm = if (bigrams != null && contextIndex >= 0) {
+            config.contextWeight * bigrams.score(contextIndex, wordIndex)
+        } else {
+            0f
+        }
+
+        return locationTerm + shapeTerm + endpointTerm + languageTerm + contextTerm
+    }
+
+    /** Resolves the preceding word to a lexicon index; -1 when there is nothing to look up. */
+    private fun contextIndexFor(previousWord: String?): Int {
+        if (bigrams == null || previousWord.isNullOrEmpty()) return -1
+        val cleaned = previousWord.lowercase().trim('\'')
+        if (cleaned.isEmpty() || !cleaned.all { it in 'a'..'z' || it == '\'' }) return -1
+        return lexicon.indexOf(cleaned)
     }
 
     /**

@@ -4,6 +4,12 @@
 
 ### Added
 
+- Swipe reads the sentence too. The same model weighs each decoded candidate by how well it
+  follows the word before it, which lifts top-1 accuracy on traced held-out sentences from 93.8% to
+  96.8% — nearly halving the error rate. It is the only thing that can separate words tracing an
+  identical path: "typing" and "topping" are the same gesture, because y and o both lie between t
+  and p, and no amount of geometry will ever tell them apart. Of 65 such cases in the sample, 40
+  now resolve.
 - Autocorrect reads the sentence. A bigram language model, built from Tatoeba's English sentence
   corpus and shipped as a 1.3 MB asset, weighs each candidate by how well it follows the word
   before it. Measured on held-out sentences the model was never trained on, this takes correction
