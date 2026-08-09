@@ -81,8 +81,12 @@ this size is mostly gaps. Measured on held-out sentences, it takes autocorrect f
 of single-edit typos while slightly *reducing* wrong corrections, since the cases it resolves are
 exactly the ambiguous ones that a wrong correction used to come from.
 
-Adaptive personal n-grams accumulate locally on top; the personal dictionary learns words, not yet
-the pairs they appear in.
+Adaptive personal n-grams accumulate locally on top, as words and as pairs. The pair model is
+string-keyed rather than index-keyed, because half its value is in pairs containing words no
+lexicon has. Its threshold is the one number here settled by measurement rather than by reasoning:
+acting on a pair seen once cost roughly twice as many wrong corrections as it bought right ones on
+held-out text, so nothing counts below several sightings. The benefit it exists for — a habit no
+corpus contains — is not measurable against a corpus, and is demonstrated on the mechanism instead.
 
 **The touch model**: corrections are priced by where the finger actually landed rather than by
 which keys are adjacent. The static version — cost proportional to the distance between two key

@@ -15,6 +15,9 @@ class UserDictionaryTest {
 
     private val dictionary = UserDictionary()
 
+    private fun store(words: File = File(folder.root, "learned.txt")) =
+        UserDictionaryStore(words, File(folder.root, "pairs.txt"))
+
     // region Learning
 
     /**
@@ -108,7 +111,7 @@ class UserDictionaryTest {
 
     @Test
     fun `survives a round trip through the file`() {
-        val store = UserDictionaryStore(File(folder.root, "learned.txt"))
+        val store = store()
         dictionary.learn("kubectl", weight = 5)
         dictionary.learn("robertg", weight = 2)
         dictionary.learn("seenonce")
@@ -131,7 +134,7 @@ class UserDictionaryTest {
         file.writeText("kubectl\t5\ngarbage-with-no-count\n\tnope\nrobertg\tnotanumber\nfine\t3\n")
 
         val restored = UserDictionary()
-        UserDictionaryStore(file).load(restored)
+        store(file).load(restored)
 
         assertEquals(5, restored.countOf("kubectl"))
         assertEquals(3, restored.countOf("fine"))
@@ -141,8 +144,40 @@ class UserDictionaryTest {
     @Test
     fun `loading a file that is not there leaves an empty dictionary`() {
         val restored = UserDictionary()
-        UserDictionaryStore(File(folder.root, "absent.txt")).load(restored)
+        store(File(folder.root, "absent.txt")).load(restored)
         assertEquals(0, restored.size)
+    }
+
+    @Test
+    fun `pairs survive a round trip through their own file`() {
+        val store = store()
+        val pairs = UserBigrams()
+        repeat(5) { pairs.learn("kubectl", "apply") }
+        pairs.learn("sam", "whitmore")
+        store.save(pairs)
+
+        val restored = UserBigrams()
+        store.load(restored)
+
+        assertEquals(5, restored.successorsOf("kubectl")["apply"])
+        assertEquals(1, restored.successorsOf("sam")["whitmore"])
+    }
+
+    @Test
+    fun `a corrupt pair file does not stop the words loading`() {
+        val words = File(folder.root, "learned.txt")
+        val pairFile = File(folder.root, "pairs.txt")
+        words.writeText("kubectl\t5\n")
+        pairFile.writeText("only-two\tfields\nkubectl\tapply\tnotanumber\ngood\tpair\t4\n")
+
+        val restoredWords = UserDictionary()
+        val restoredPairs = UserBigrams()
+        store(words).load(restoredWords)
+        store(words).load(restoredPairs)
+
+        assertEquals(5, restoredWords.countOf("kubectl"))
+        assertEquals(4, restoredPairs.successorsOf("good")["pair"])
+        assertEquals(1, restoredPairs.size)
     }
 
     // endregion

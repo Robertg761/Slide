@@ -38,6 +38,7 @@ import com.slide.engine.gesture.GestureDecoder
 import com.slide.engine.gesture.GesturePoint
 import com.slide.engine.lexicon.BigramLoader
 import com.slide.engine.lexicon.LexiconLoader
+import com.slide.engine.lexicon.UserBigrams
 import com.slide.engine.lexicon.UserDictionary
 import com.slide.engine.lexicon.UserDictionaryStore
 import com.slide.engine.suggest.TypingSuggester
@@ -120,6 +121,9 @@ class SlideInputMethodService :
      * useful before anything has loaded and must never be missed a word because a load was slow.
      */
     private val userDictionary = UserDictionary()
+
+    /** The word pairs this person writes, learned alongside the words themselves. */
+    private val userBigrams = UserBigrams()
 
     private val userDictionaryStore by lazy { UserDictionaryStore(applicationContext) }
 
@@ -232,7 +236,10 @@ class SlideInputMethodService :
             .launchIn(scope)
 
         scope.launch {
-            withContext(Dispatchers.IO) { userDictionaryStore.load(userDictionary) }
+            withContext(Dispatchers.IO) {
+                userDictionaryStore.load(userDictionary)
+                userDictionaryStore.load(userBigrams)
+            }
         }
 
         // Roughly a megabyte to parse; doing it on the main thread would stall the first frame
@@ -251,6 +258,7 @@ class SlideInputMethodService :
                     lexicon,
                     bigrams = bigrams,
                     userDictionary = userDictionary,
+                    userBigrams = userBigrams,
                 )
                 Log.i(
                     TAG,
@@ -600,6 +608,8 @@ class SlideInputMethodService :
     private fun commitGestureWord(connection: InputConnection, word: String) {
         val before = connection.getTextBeforeCursor(1, 0)
         val needsSpace = !before.isNullOrEmpty() && before[0].let { it.isLetterOrDigit() || it in ".,!?;:'\")" }
+
+        learnPair(precedingWordForSwipe(), word)
 
         val shifted = shiftState()
         val text = (if (needsSpace) " " else "") + applyShift(word, shifted)
@@ -1207,6 +1217,21 @@ class SlideInputMethodService :
     }
 
     /**
+     * Remembers that this person wrote [word] after [previous].
+     *
+     * Unlike a word, a pair needs no threshold before it counts for anything: it only ever adds a
+     * small, saturating bonus, so a one-off juxtaposition cannot outweigh what the corpus knows,
+     * and there is nothing here for a typo to be defended by. What it does do is notice, quickly,
+     * that this person keeps writing "kubectl apply" or "Sam Whitmore".
+     */
+    private fun learnPair(previous: String?, word: String) {
+        if (incognito) return
+        if (previous.isNullOrEmpty() || word.isEmpty()) return
+        userBigrams.learn(previous, word)
+        learnedSinceSave = true
+    }
+
+    /**
      * Writes the learned words out, at a moment when nothing is being typed.
      *
      * Saving on every word would put a file write on the keypress path for a file that only has to
@@ -1216,7 +1241,12 @@ class SlideInputMethodService :
     private fun saveLearnedWords() {
         if (!learnedSinceSave) return
         learnedSinceSave = false
-        scope.launch { withContext(Dispatchers.IO) { userDictionaryStore.save(userDictionary) } }
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                userDictionaryStore.save(userDictionary)
+                userDictionaryStore.save(userBigrams)
+            }
+        }
     }
 
     /** The word before the one being typed, for the corrector to weigh candidates against. */
@@ -1254,6 +1284,11 @@ class SlideInputMethodService :
             // Reopened words are excluded: the user went back to look at one, not to write it.
             learnWord(typed)
         }
+
+        // Whatever actually landed in the text is what followed the previous word, whether that is
+        // what was typed or what it was corrected to. Read before the region is settled, so the
+        // word in progress is still there to be stepped over.
+        learnPair(precedingWord(), if (corrected) lastAutocorrect?.applied.orEmpty() else typed)
 
         connection.finishComposingText()
         composing.setLength(0)

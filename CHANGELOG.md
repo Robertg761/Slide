@@ -9,6 +9,11 @@
   true of every "s" ever typed. On simulated typing where mis-hits emerge from the geometry rather
   than being written in, this corrects 5.7 more points of them at ordinary accuracy and slightly
   fewer wrongly. Words typed accurately are untouched.
+- Slide learns your phrases as well as your words. The pairs you actually write — "kubectl apply",
+  a friend's first name and surname — weigh candidates alongside the corpus model, in the context
+  they were learned in and nowhere else. A pair has to recur several times before it counts for
+  anything: measured on held-out text, acting on a pair seen once cost about twice as many wrong
+  corrections as it bought right ones.
 - Slide learns your words. A word committed deliberately twice — or rescued once from an
   autocorrect, which is the clearest signal a keyboard ever gets — stops being corrected away, and
   starts being offered as a completion. This is the gap that made a keyboard feel like it was

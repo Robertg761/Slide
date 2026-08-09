@@ -16,9 +16,12 @@ import java.io.IOException
  * Writes go to a temporary file and are renamed into place, so a process killed mid-save loses the
  * newest word rather than the whole dictionary.
  */
-class UserDictionaryStore(private val file: File) {
+class UserDictionaryStore(private val file: File, private val pairFile: File) {
 
-    constructor(context: Context) : this(File(context.filesDir, FILE_NAME))
+    constructor(context: Context) : this(
+        File(context.filesDir, FILE_NAME),
+        File(context.filesDir, PAIR_FILE_NAME),
+    )
 
     fun load(into: UserDictionary) {
         if (!file.exists()) return
@@ -38,32 +41,73 @@ class UserDictionaryStore(private val file: File) {
     }
 
     fun save(from: UserDictionary) {
+        writeAtomically(file) { writer ->
+            for ((word, count) in from.entries()) {
+                writer.write(word)
+                writer.write("\t")
+                writer.write(count.toString())
+                writer.newLine()
+            }
+        }
+    }
+
+    fun load(into: UserBigrams) {
+        if (!pairFile.exists()) return
         try {
-            val temporary = File(file.parentFile, "$FILE_NAME.tmp")
-            temporary.bufferedWriter().use { writer ->
-                for ((word, count) in from.entries()) {
-                    writer.write(word)
-                    writer.write("\t")
-                    writer.write(count.toString())
-                    writer.newLine()
-                }
+            val restored = pairFile.readLines().mapNotNull { line ->
+                val parts = line.split('\t')
+                if (parts.size != 3) return@mapNotNull null
+                val count = parts[2].toIntOrNull() ?: return@mapNotNull null
+                Triple(parts[0], parts[1], count)
             }
-            if (!temporary.renameTo(file)) {
-                temporary.delete()
-                Log.w(TAG, "Could not move the learned words into place")
-            }
+            into.restore(restored)
+            Log.i(TAG, "Restored ${restored.size} learned pairs")
         } catch (e: IOException) {
-            Log.w(TAG, "Could not save the learned words", e)
+            Log.w(TAG, "Could not read the learned pairs; starting empty", e)
+        }
+    }
+
+    fun save(from: UserBigrams) {
+        writeAtomically(pairFile) { writer ->
+            for ((previous, next, count) in from.entries()) {
+                writer.write(previous)
+                writer.write("\t")
+                writer.write(next)
+                writer.write("\t")
+                writer.write(count.toString())
+                writer.newLine()
+            }
         }
     }
 
     /** Deletes everything learned, for the settings screen's benefit. */
     fun delete() {
         file.delete()
+        pairFile.delete()
+    }
+
+    /**
+     * Writes through a temporary file and renames it into place.
+     *
+     * A process killed mid-save then loses the newest word rather than the whole dictionary, which
+     * for a file that only ever grows is the difference between a hiccup and starting again.
+     */
+    private fun writeAtomically(target: File, body: (java.io.BufferedWriter) -> Unit) {
+        try {
+            val temporary = File(target.parentFile, "${target.name}.tmp")
+            temporary.bufferedWriter().use(body)
+            if (!temporary.renameTo(target)) {
+                temporary.delete()
+                Log.w(TAG, "Could not move ${target.name} into place")
+            }
+        } catch (e: IOException) {
+            Log.w(TAG, "Could not save ${target.name}", e)
+        }
     }
 
     private companion object {
         const val TAG = "SlideUserDict"
         const val FILE_NAME = "learned_words.txt"
+        const val PAIR_FILE_NAME = "learned_pairs.txt"
     }
 }

@@ -3,6 +3,7 @@ package com.slide.engine.suggest
 import com.slide.engine.gesture.GestureKeyMap
 import com.slide.engine.lexicon.Bigrams
 import com.slide.engine.lexicon.Lexicon
+import com.slide.engine.lexicon.UserBigrams
 import com.slide.engine.lexicon.UserDictionary
 import kotlin.math.hypot
 import kotlin.math.ln
@@ -177,6 +178,25 @@ data class SuggesterConfig(
      * somewhere other than Tatoeba, not against a larger sweep of the same.
      */
     val contextWeight: Float = 0.6f,
+
+    /**
+     * Weight on how well a candidate follows the preceding word *for this person specifically*.
+     *
+     * Sized a little above [contextWeight] on purpose. It fires far more rarely — most pairs
+     * anyone types have never been typed by them before — but when it does fire it is evidence
+     * about the actual writer rather than about English in aggregate, and that is worth more per
+     * observation. The saturating count behind it (see `UserBigrams.score`) is what stops a habit
+     * repeated a hundred times from overwhelming the spelling evidence entirely.
+     *
+     * Measured on generic held-out text this value barely matters: anywhere from 0.2 to 1.2 gives
+     * the same result to within a tenth of a point, because the pairs that recur in unrelated
+     * sentences are ordinary English ones the corpus model already covers. What that measurement
+     * *did* settle is the threshold in `UserBigrams`, where counting a pair seen once was actively
+     * harmful. This weight governs the case the corpus cannot see — a habit the corpus has never
+     * heard of — and should be revisited against real repetitive text rather than against more of
+     * the same corpus.
+     */
+    val personalContextWeight: Float = 0.8f,
 )
 
 /**
@@ -199,7 +219,21 @@ class TypingSuggester(
     private val bigrams: Bigrams? = null,
     /** The words this person uses that the shipped dictionary does not have. */
     private val userDictionary: UserDictionary? = null,
+    /** The word pairs this person writes, as opposed to the ones English writes on average. */
+    private val userBigrams: UserBigrams? = null,
 ) {
+
+    /**
+     * This person's own successors to the current context, resolved to lexicon indices once per
+     * call rather than looked up per candidate.
+     *
+     * There are only ever a handful, and turning each into an index costs one binary search, where
+     * turning every candidate back into a string to look it up would allocate hundreds of strings
+     * on the keypress path.
+     */
+    private var personalIndices = IntArray(0)
+    private var personalScores = FloatArray(0)
+    private var personalCount = 0
 
     /** Lexicon index of the word before the one being typed, or -1. Set per [suggest] call. */
     private var contextIndex = -1
@@ -278,6 +312,7 @@ class TypingSuggester(
         ensureNeighbours(keys)
         corrections.clear()
         contextIndex = contextIndexFor(previousWord)
+        buildPersonalContext(previousWord)
         // A short array would read past its end on the last character, and a stale one would price
         // this word by where the last one was typed. Either is worse than not knowing.
         this.touchPoints = touchPoints?.takeIf { it.size >= typed.length * 2 }
@@ -566,10 +601,51 @@ class TypingSuggester(
      * see [SuggesterConfig.contextWeight].
      */
     private fun languageScore(index: Int): Float {
-        val unigram = config.languageWeight * ln(1f + lexicon.frequencyAt(index)) / LN_MAX_FREQUENCY
-        val model = bigrams ?: return unigram
-        if (contextIndex < 0) return unigram
-        return unigram + config.contextWeight * model.score(contextIndex, index)
+        var score = config.languageWeight * ln(1f + lexicon.frequencyAt(index)) / LN_MAX_FREQUENCY
+
+        val model = bigrams
+        if (model != null && contextIndex >= 0) {
+            score += config.contextWeight * model.score(contextIndex, index)
+        }
+
+        // What this person writes, on top of what English writes. Added rather than blended, for
+        // the same reason as the corpus term: personal data is mostly absent, and a model that is
+        // mostly absent must only ever be able to promote.
+        for (slot in 0 until personalCount) {
+            if (personalIndices[slot] == index) {
+                score += config.personalContextWeight * personalScores[slot]
+                break
+            }
+        }
+        return score
+    }
+
+    /**
+     * Resolves this person's successors to the current context into lexicon indices.
+     *
+     * Successors that are not in the lexicon are dropped here rather than kept: they cannot be
+     * ranked against corpus candidates, having no index to be scored at. They still reach the user
+     * through [learnedCompletions], which works in strings.
+     */
+    private fun buildPersonalContext(previousWord: String?) {
+        personalCount = 0
+        val model = userBigrams ?: return
+        if (previousWord.isNullOrEmpty()) return
+
+        val successors = model.successorsOf(previousWord)
+        if (successors.isEmpty()) return
+
+        if (personalIndices.size < successors.size) {
+            personalIndices = IntArray(successors.size)
+            personalScores = FloatArray(successors.size)
+        }
+        for ((word, _) in successors) {
+            val index = lexicon.indexOf(word)
+            if (index < 0) continue
+            personalIndices[personalCount] = index
+            personalScores[personalCount] = model.score(previousWord, word)
+            personalCount++
+        }
     }
 
     /**

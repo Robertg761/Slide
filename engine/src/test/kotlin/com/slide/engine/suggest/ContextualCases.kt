@@ -22,9 +22,17 @@ object ContextualCases {
 
     private val TOKEN = Regex("[a-z']+")
 
-    fun build(lexicon: Lexicon): List<Case> {
+    /**
+     * @param sentences which held-out sentences to build from. Defaults to all of them; the
+     *   adaptive tests pass a slice, so that what a personal model was trained on and what it is
+     *   measured against cannot overlap.
+     */
+    fun build(
+        lexicon: Lexicon,
+        sentences: List<String> = HeldOutSentences.instance,
+    ): List<Case> {
         val out = ArrayList<Case>()
-        for ((n, sentence) in HeldOutSentences.instance.withIndex()) {
+        for ((n, sentence) in sentences.withIndex()) {
             val tokens = TOKEN.findAll(sentence.lowercase()).map { it.value }.toList()
             if (tokens.size < 3) continue
 
