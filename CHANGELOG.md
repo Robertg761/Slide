@@ -12,6 +12,15 @@
 
 ### Changed
 
+- Autocorrect now fires on 85% of single-edit typos, up from 77%, with wrong corrections falling
+  from 1.5% to 1.2%. The confidence margin was measured on a scale it did not fit: because the
+  language score is a log of an already-logarithmic frequency, every word worth correcting to sits
+  in a band about a quarter wide, and the old margin spent more than half of it. Typos of common
+  words — "htis", "thjs", "drom", "witth" — had the right answer in the strip and were refused.
+- A doubled letter is now priced as the mechanical slip it is rather than as an ordinary stray
+  keystroke, so "largee" no longer becomes "larger" or "sidde" "sided". Nothing in that class is
+  rewritten to a different word any more, where the corrector previously preferred changing the
+  word to un-doubling the key.
 - Backspace deletes on touch-down instead of on release, and its auto-repeat reaches full speed in
   about a third of the time it used to.
 - The navigation-bar strip below the keys is painted in the keyboard's own background colour, so

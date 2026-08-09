@@ -63,8 +63,18 @@ data class SuggesterConfig(
      * "don't", whereas dropping a letter from "font" gives half a dozen.
      */
     val apostropheCost: Float = 0.3f,
-    /** A letter the user hit twice or by accident — "helllo". */
+    /** A letter the user hit by accident. */
     val deletionCost: Float = 0.6f,
+
+    /**
+     * A letter that repeats the one beside it — "helllo", "largee", "partt".
+     *
+     * The same price as a transposition, and for the same reason: both are purely mechanical slips
+     * with an unambiguous reading, where an ordinary deletion is neither. At the general deletion
+     * price a doubled letter loses to a neighbour-key substitution of the final letter, which is
+     * how "largee" became "larger" rather than "large", and "sidde" became "sided".
+     */
+    val doubledLetterCost: Float = 0.45f,
 
     /** Charged to any completion, plus [completionCostPerChar] for each letter still to come. */
     val completionCost: Float = 0.4f,
@@ -104,8 +114,18 @@ data class SuggesterConfig(
      * A wrong autocorrect is far more annoying than a missed one — it destroys something the user
      * did type, at the moment they have stopped looking. Where the keyboard is unsure, it does
      * nothing and leaves the alternative one tap away in the strip.
+     *
+     * Read this against the scale it is measured on, which is not obvious. The language score is
+     * `ln(1 + frequency) / ln(256)`, so although it spans 0 to 1 in principle, every word common
+     * enough to be worth correcting *to* sits between roughly 0.75 and 1.0. A margin is therefore
+     * spending from a usable range of about a quarter, and requiring 0.15 of it meant demanding the
+     * intended word be some 2.3 times commoner than the runner-up. Typos of common words have
+     * common words as their runners-up — "htis" offers "this" and "hits" — so the rule almost never
+     * cleared, and the effect was a keyboard that visibly knew the right answer and declined to use
+     * it. `CorrectionSweepTest` measures the trade: from 0.15 down to 0.08 costs one new wrong
+     * correction for every six it fixes, and below 0.08 that exchange collapses to about two to one.
      */
-    val autocorrectMargin: Float = 0.15f,
+    val autocorrectMargin: Float = 0.08f,
     /**
      * If the typed text is the start of an ordinary word this common, it is treated as unfinished
      * rather than misspelled.
@@ -238,7 +258,10 @@ class TypingSuggester(
                 for (i in 0 until length) {
                     if (i != skipped) buffer[out++] = lower[i]
                 }
-                offerCorrection(length - 1, config.deletionCost, blockOffensive)
+                val repeats = (skipped > 0 && lower[skipped] == lower[skipped - 1]) ||
+                    (skipped < length - 1 && lower[skipped] == lower[skipped + 1])
+                val cost = if (repeats) config.doubledLetterCost else config.deletionCost
+                offerCorrection(length - 1, cost, blockOffensive)
             }
         }
 
