@@ -31,8 +31,10 @@ is written and compiles but has **not yet run on hardware** — see *Not yet ver
 - Nine themes plus Material You dynamic colour, light/dark following the system
 - Key preview popups, key borders, number row, haptics, keypress sound
 - Password and incognito field detection (no learning in those fields)
+- A personal dictionary that learns the words you use and stops correcting them away
 - **Gesture typing** — SHARK²-derived decoder over a 160k-word lexicon, 95.8% top-1 and 100%
-  top-5 on the test corpus at 0.21 ms mean decode
+  top-5 on the isolated test corpus at 0.21 ms mean decode. In a sentence, where the bigram model
+  can break ties the path cannot, 96.8% top-1 against 93.8% without it
 - Suggestion strip showing the decoder's top three candidates, one tap to correct a miss
 - Offensive-word filtering for suggestions (on by default, as in Gboard)
 
@@ -64,7 +66,9 @@ is written and compiles but has **not yet run on hardware** — see *Not yet ver
   font-scale, landscape, and latency verification.
 
 **Not yet built**
-- Next-word prediction (needs a bigram language-model asset) and a personal dictionary
+- Next-word *prediction* in the strip. The bigram model exists and is wired into correction and
+  gesture decoding; what is missing is offering a word before anything has been typed.
+- Adaptive bigrams. The personal dictionary learns words, not yet the pairs they appear in.
 - Clipboard and text-editing panels
 - Remaining appearance settings, setup-wizard polish, and full accessibility/adaptive-layout QA
 
