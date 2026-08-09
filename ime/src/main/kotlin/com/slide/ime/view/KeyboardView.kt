@@ -46,8 +46,16 @@ class KeyboardView @JvmOverloads constructor(
         /** Fired the moment a key is touched — drives haptics and sound, not text. */
         fun onKeyDown(key: Key)
 
-        /** Fired when a key press resolves into input. */
-        fun onKeyCommit(key: Key, text: String)
+        /**
+         * Fired when a key press resolves into input.
+         *
+         * [touchX] and [touchY] are where the finger first landed, in this view's pixels, or NaN
+         * when the input did not come from a key press the user aimed — an auto-repeat, or a
+         * character chosen from a long-press popup. The corrector uses it to price a mis-hit by
+         * how close the finger came to the key it was reaching for, rather than by how far apart
+         * two keys happen to be.
+         */
+        fun onKeyCommit(key: Key, text: String, touchX: Float = Float.NaN, touchY: Float = Float.NaN)
 
         /** Fired when a swipe completes. The decoder consumes this; see docs/technical-decisions.md. */
         fun onGestureComplete(points: List<GesturePoint>)
@@ -194,6 +202,8 @@ class KeyboardView @JvmOverloads constructor(
         var lastX: Float = downX,
         var longPressFired: Boolean = false,
         var repeatFired: Boolean = false,
+        /** Repeatable keys act on touch-down, so the release must not act a second time. */
+        var committedOnDown: Boolean = false,
         var cursorMove: Boolean = false,
         var deleteWordGesture: Boolean = false,
     )
@@ -592,7 +602,25 @@ class KeyboardView @JvmOverloads constructor(
 
             MotionEvent.ACTION_MOVE -> {
                 for (index in 0 until event.pointerCount) {
-                    handlePointerMove(event.getPointerId(index), event.getX(index), event.getY(index))
+                    val pointerId = event.getPointerId(index)
+                    // Android batches the samples it took between frames into one MOVE event and
+                    // exposes all but the newest through the history. Reading only the newest
+                    // throws away most of a fast swipe: what reaches the decoder is then a coarse
+                    // polyline whose straight segments cut corners the finger actually rounded,
+                    // which both prunes away the intended word and flatters its neighbours.
+                    // Replayed for a pointer that could still become a gesture as well as one that
+                    // already is, so the run-up between touch-down and the slop threshold is not
+                    // the one stretch of the swipe that gets thrown away.
+                    if (gesturePointerId == pointerId || (settings.gestureTypingEnabled && pointers.size == 1)) {
+                        for (h in 0 until event.historySize) {
+                            handlePointerMove(
+                                pointerId,
+                                event.getHistoricalX(index, h),
+                                event.getHistoricalY(index, h),
+                            )
+                        }
+                    }
+                    handlePointerMove(pointerId, event.getX(index), event.getY(index))
                 }
             }
 
@@ -608,12 +636,21 @@ class KeyboardView @JvmOverloads constructor(
 
     private fun handlePointerDown(pointerId: Int, x: Float, y: Float) {
         val placed = KeyGeometry.hitTest(placedKeys, x, y) ?: return
-        pointers[pointerId] = Pointer(placed, x, y, System.currentTimeMillis())
+        val pointer = Pointer(placed, x, y, System.currentTimeMillis())
+        pointers[pointerId] = pointer
         cursorRemainderPx = 0f
 
         listener?.onKeyDown(placed.key)
         showPreviewFor(placed)
         scheduleLongPress(pointerId, placed)
+
+        // A repeatable key — backspace — acts the moment it is touched rather than on release.
+        // Waiting for the lift puts the whole press duration between the tap and the character
+        // disappearing, which is what makes deleting feel sluggish however fast the repeat is.
+        if (placed.key.repeatable) {
+            pointer.committedOnDown = true
+            listener?.onKeyCommit(placed.key, placed.key.outputText)
+        }
         scheduleRepeat(pointerId, placed)
         invalidate()
     }
@@ -695,6 +732,9 @@ class KeyboardView @JvmOverloads constructor(
                 cancelPendingLongPress()
                 cancelRepeat()
                 pointer.placed = nowOver
+                // Sliding off is how a mis-hit gets corrected, so the key landed on still has to
+                // commit on release even though the key left behind already acted on touch-down.
+                pointer.committedOnDown = false
                 showPreviewFor(nowOver)
                 invalidate()
             }
@@ -720,7 +760,7 @@ class KeyboardView @JvmOverloads constructor(
 
         if (gesturePointerId == pointerId) {
             appendGesturePoint(x, y)
-            finishGesture()
+            finishGesture(pointer)
             invalidate()
             return
         }
@@ -735,11 +775,17 @@ class KeyboardView @JvmOverloads constructor(
             }
         }
 
-        // A press that already acted — an auto-repeat that fired, or an alternates popup dismissed
-        // without a selection — must not commit the key a second time on release.
-        if (!pointer.longPressFired && !pointer.repeatFired) {
+        // A press that already acted — a repeatable key handled on touch-down, an auto-repeat that
+        // fired, or an alternates popup dismissed without a selection — must not commit the key a
+        // second time on release.
+        if (!pointer.longPressFired && !pointer.repeatFired && !pointer.committedOnDown) {
             announceForAccessibility(accessibilityLabel(pointer.placed.key))
-            listener?.onKeyCommit(pointer.placed.key, outputFor(pointer.placed.key))
+            listener?.onKeyCommit(
+                pointer.placed.key,
+                outputFor(pointer.placed.key),
+                pointer.downX,
+                pointer.downY,
+            )
         }
         invalidate()
     }
@@ -838,10 +884,38 @@ class KeyboardView @JvmOverloads constructor(
         gesturePoints += GesturePoint(x, y, System.currentTimeMillis() - gestureStartTime)
     }
 
-    private fun finishGesture() {
+    /**
+     * Ends a swipe, or falls back to the key it started on when there is nothing to decode.
+     *
+     * A path this short is a press that wandered — the finger crossed the slop threshold and lifted
+     * again. Treating it as a failed gesture discards it, which silently eats a keystroke the user
+     * did make; the thresholds here mirror the decoder's own so that anything it would refuse
+     * becomes a keypress rather than nothing at all.
+     */
+    private fun finishGesture(pointer: Pointer) {
         val points = ArrayList(gesturePoints)
         abandonGesture()
-        if (points.size >= MIN_GESTURE_POINTS) listener?.onGestureComplete(points)
+
+        val decodable = points.size >= MIN_GESTURE_POINTS &&
+            pathLength(points) >= pointer.placed.width * MIN_GESTURE_PATH_FACTOR
+        if (decodable) {
+            listener?.onGestureComplete(points)
+        } else {
+            listener?.onKeyCommit(
+                pointer.placed.key,
+                outputFor(pointer.placed.key),
+                pointer.downX,
+                pointer.downY,
+            )
+        }
+    }
+
+    private fun pathLength(points: List<GesturePoint>): Float {
+        var total = 0f
+        for (i in 1 until points.size) {
+            total += hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y)
+        }
+        return total
     }
 
     private fun abandonGesture() {
@@ -893,6 +967,7 @@ class KeyboardView @JvmOverloads constructor(
         KeyType.SPACE -> "Space"
         KeyType.ENTER -> enterAction.name.lowercase().replaceFirstChar(Char::uppercaseChar)
         KeyType.SYMBOLS -> "Symbols"
+        KeyType.SYMBOLS_ALT -> "More symbols"
         KeyType.ALPHA -> "Letters"
         KeyType.EMOJI -> "Emoji"
         KeyType.MIC -> "Voice typing"
@@ -902,12 +977,29 @@ class KeyboardView @JvmOverloads constructor(
 
     private companion object {
         const val TRAIL_POINTS = 48
-        const val MIN_GESTURE_POINTS = 4
+
+        /**
+         * The least a swipe must be to be worth decoding, mirroring `DecoderConfig`'s own floors.
+         *
+         * Anything below either of these is refused by the decoder anyway, and a swipe the decoder
+         * refuses commits nothing at all — so the view has to recognise the same cases and treat
+         * them as the keypress they really were.
+         */
+        const val MIN_GESTURE_POINTS = 6
+        const val MIN_GESTURE_PATH_FACTOR = 0.9f
         const val GESTURE_SLOP_FACTOR = 1.4f
         const val MAX_SEARCH_RESULTS = 6
-        // Gboard-like: the first repeat arrives quickly after the initial delete, then ramps.
-        const val REPEAT_INITIAL_DELAY_MS = 280L
-        const val REPEAT_MIN_DELAY_MS = 45L
-        const val REPEAT_ACCELERATION = 0.85f
+        /**
+         * Auto-repeat pacing for backspace.
+         *
+         * The first delete has already happened on touch-down, so this is the pause before the key
+         * starts running, and it has to be long enough that an ordinary tap never repeats. From
+         * there it ramps hard: holding backspace is nearly always an intent to clear a whole
+         * phrase, and the old ramp needed a dozen deletes and over a second and a half to reach
+         * full speed, which is most of a short sentence spent waiting.
+         */
+        const val REPEAT_INITIAL_DELAY_MS = 300L
+        const val REPEAT_MIN_DELAY_MS = 25L
+        const val REPEAT_ACCELERATION = 0.66f
     }
 }

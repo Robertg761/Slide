@@ -100,6 +100,7 @@ private fun SetupScreen(repository: SettingsRepository) {
     var selected by remember { mutableStateOf(isKeyboardSelected(context)) }
     var updateMessage by remember { mutableStateOf<String?>(null) }
     var availableUpdate by remember { mutableStateOf<UpdateInfo?>(null) }
+    var downloading by remember { mutableStateOf(false) }
 
     LaunchedEffect(settings.updateChecksEnabled, settings.includeAlphaUpdates) {
         if (settings.updateChecksEnabled) {
@@ -284,7 +285,51 @@ private fun SetupScreen(repository: SettingsRepository) {
             }
         }
     }
-    availableUpdate?.let { update -> AlertDialog(onDismissRequest = { availableUpdate = null }, title = { Text("Slide ${update.version} is available") }, text = { Text(update.notes.ifBlank { "A newer signed Slide release is available." }) }, confirmButton = { Button(onClick = { scope.launch { runCatching { UpdateManager.downloadAndInstall(context, update) }.onFailure { updateMessage = "Update download failed: ${it.message}" }; availableUpdate = null } }) { Text("Download and install") } }, dismissButton = { Button(onClick = { availableUpdate = null }) { Text("Not now") } }) }
+    availableUpdate?.let { update ->
+        AlertDialog(
+            onDismissRequest = { if (!downloading) availableUpdate = null },
+            title = { Text("Slide ${update.version} is available") },
+            text = {
+                Text(
+                    if (downloading) {
+                        "Downloading Slide ${update.version}. Slide is large — this can take a " +
+                            "minute. Android will ask you to confirm the installation."
+                    } else {
+                        update.notes.ifBlank { "A newer signed Slide release is available." }
+                    },
+                )
+            },
+            confirmButton = {
+                Button(
+                    enabled = !downloading,
+                    onClick = {
+                        scope.launch {
+                            downloading = true
+                            runCatching { UpdateManager.downloadAndInstall(context, update) }
+                                .onSuccess { outcome ->
+                                    availableUpdate = null
+                                    if (outcome == InstallOutcome.NeedsPermission) {
+                                        updateMessage = "Allow Slide to install apps, then tap " +
+                                            "Check now again to finish updating."
+                                    }
+                                }
+                                .onFailure {
+                                    availableUpdate = null
+                                    updateMessage = "Update download failed: " +
+                                        (it.message ?: "unknown error") +
+                                        "\n\nYou can also download the APK from the Slide releases " +
+                                        "page on GitHub and install it by hand."
+                                }
+                            downloading = false
+                        }
+                    },
+                ) { Text(if (downloading) "Downloading…" else "Download and install") }
+            },
+            dismissButton = {
+                Button(enabled = !downloading, onClick = { availableUpdate = null }) { Text("Not now") }
+            },
+        )
+    }
     updateMessage?.let { message -> AlertDialog(onDismissRequest = { updateMessage = null }, title = { Text("Updates") }, text = { Text(message) }, confirmButton = { Button(onClick = { updateMessage = null }) { Text("OK") } }) }
 }
 

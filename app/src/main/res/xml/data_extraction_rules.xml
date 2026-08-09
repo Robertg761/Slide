@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Backup and device-transfer rules for Android 12 and above.
+
+  The learned words and learned pairs are excluded from both. See backup_rules.xml for why; the
+  reasoning applies as much to a transfer to a new phone as to a cloud backup, since neither is a
+  place the user asked their personal vocabulary to go.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="learned_words.txt" />
+        <exclude domain="file" path="learned_words.txt.tmp" />
+        <exclude domain="file" path="learned_pairs.txt" />
+        <exclude domain="file" path="learned_pairs.txt.tmp" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="learned_words.txt" />
+        <exclude domain="file" path="learned_words.txt.tmp" />
+        <exclude domain="file" path="learned_pairs.txt" />
+        <exclude domain="file" path="learned_pairs.txt.tmp" />
+    </device-transfer>
+</data-extraction-rules>

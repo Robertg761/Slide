@@ -4,9 +4,12 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Typeface
+import android.os.Handler
+import android.os.Looper
 import android.util.TypedValue
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.accessibility.AccessibilityNodeInfo
 import com.slide.core.theme.KeyboardTheme
 import com.slide.core.theme.Themes
@@ -26,6 +29,12 @@ class SuggestionStripView(context: Context) : View(context) {
     interface Listener {
         /** [index] is the position in the list passed to [setSuggestions], 0 being the best. */
         fun onSuggestionPicked(index: Int, word: String)
+
+        /**
+         * A candidate was held down: the gesture for teaching the keyboard a word, or for taking
+         * one back. Default no-op so existing embedders are unaffected.
+         */
+        fun onSuggestionHeld(index: Int, word: String) = Unit
 
         /** The microphone button was tapped. */
         fun onVoiceRequested()
@@ -48,6 +57,12 @@ class SuggestionStripView(context: Context) : View(context) {
     private var pressedIndex = -1
     private var micPressed = false
     private var emptyMessage = "Type or swipe for suggestions"
+
+    private val handler = Handler(Looper.getMainLooper())
+    private var longPressRunnable: Runnable? = null
+
+    /** Set once a hold has fired, so releasing does not also pick the candidate. */
+    private var longPressFired = false
 
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
@@ -187,6 +202,8 @@ class SuggestionStripView(context: Context) : View(context) {
             MotionEvent.ACTION_DOWN -> {
                 micPressed = isOverMic(event.x)
                 pressedIndex = if (micPressed) -1 else indexAt(event.x)
+                longPressFired = false
+                if (pressedIndex >= 0) scheduleLongPress(pressedIndex)
                 invalidate()
                 return micPressed || pressedIndex >= 0
             }
@@ -198,7 +215,10 @@ class SuggestionStripView(context: Context) : View(context) {
                 val stillOnWord = pressedIndex >= 0 && indexAt(event.x) == pressedIndex && inBounds
                 if (micPressed != stillOnMic || (pressedIndex >= 0 && !stillOnWord)) {
                     micPressed = stillOnMic
-                    if (!stillOnWord) pressedIndex = -1
+                    if (!stillOnWord) {
+                        pressedIndex = -1
+                        cancelPendingLongPress()
+                    }
                     invalidate()
                 }
             }
@@ -206,14 +226,16 @@ class SuggestionStripView(context: Context) : View(context) {
             MotionEvent.ACTION_UP -> {
                 val index = pressedIndex
                 val mic = micPressed
+                val held = longPressFired
                 pressedIndex = -1
                 micPressed = false
+                cancelPendingLongPress()
                 invalidate()
 
                 if (mic) {
                     announceForAccessibility("Voice typing")
                     listener?.onVoiceRequested()
-                } else if (index in words.indices) {
+                } else if (index in words.indices && !held) {
                     announceForAccessibility("Suggestion ${words[index]}")
                     listener?.onSuggestionPicked(index, words[index])
                 }
@@ -223,10 +245,34 @@ class SuggestionStripView(context: Context) : View(context) {
             MotionEvent.ACTION_CANCEL -> {
                 pressedIndex = -1
                 micPressed = false
+                cancelPendingLongPress()
                 invalidate()
             }
         }
         return true
+    }
+
+    private fun scheduleLongPress(index: Int) {
+        cancelPendingLongPress()
+        val runnable = Runnable {
+            if (index !in words.indices) return@Runnable
+            longPressFired = true
+            pressedIndex = -1
+            invalidate()
+            listener?.onSuggestionHeld(index, words[index])
+        }
+        longPressRunnable = runnable
+        handler.postDelayed(runnable, ViewConfiguration.getLongPressTimeout().toLong())
+    }
+
+    private fun cancelPendingLongPress() {
+        longPressRunnable?.let(handler::removeCallbacks)
+        longPressRunnable = null
+    }
+
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        cancelPendingLongPress()
     }
 
     private fun isOverMic(x: Float): Boolean = x >= width - micWidth()

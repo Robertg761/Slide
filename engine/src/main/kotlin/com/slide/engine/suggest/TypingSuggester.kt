@@ -1,7 +1,10 @@
 package com.slide.engine.suggest
 
 import com.slide.engine.gesture.GestureKeyMap
+import com.slide.engine.lexicon.Bigrams
 import com.slide.engine.lexicon.Lexicon
+import com.slide.engine.lexicon.UserBigrams
+import com.slide.engine.lexicon.UserDictionary
 import kotlin.math.hypot
 import kotlin.math.ln
 
@@ -53,8 +56,24 @@ data class SuggesterConfig(
     val transpositionCost: Float = 0.45f,
     /** Wrong key, scaled by how far that key is from the intended one. */
     val substitutionCost: Float = 0.5f,
-    /** A letter the user missed — "helo". */
-    val insertionCost: Float = 0.6f,
+    /**
+     * A letter the user missed — "helo", "oce", "sould".
+     *
+     * Priced just under a neighbour-key substitution, which is the opposite way round from where
+     * this started, and the reason is an asymmetry in what the two edits claim. An insertion only
+     * adds to what the user typed; every key they actually pressed survives it. A substitution
+     * overrides one of them, asserting that a key they did press was not the key they wanted. The
+     * edit that contradicts less of the input should be the cheaper explanation, and at 0.6 against
+     * a substitution's 0.5 it was the dearer one — which is how "sould" reached "would" instead of
+     * "should", and "fom" reached "tom" instead of "from".
+     *
+     * Measured on held-out sentences, moving this from 0.6 to 0.45 takes dropped-letter typos from
+     * 66.4% corrected to 78.1% and *halves* wrong corrections overall, 1.5% to 0.7%. It keeps
+     * improving to about 0.40, but only by taking accuracy from substitutions, which are the
+     * commoner slip on glass and which `TypoCorpus` weights equally with dropped letters rather
+     * than realistically.
+     */
+    val insertionCost: Float = 0.45f,
     /**
      * A missing apostrophe, priced well below a missing letter.
      *
@@ -63,8 +82,18 @@ data class SuggesterConfig(
      * "don't", whereas dropping a letter from "font" gives half a dozen.
      */
     val apostropheCost: Float = 0.3f,
-    /** A letter the user hit twice or by accident — "helllo". */
+    /** A letter the user hit by accident. */
     val deletionCost: Float = 0.6f,
+
+    /**
+     * A letter that repeats the one beside it — "helllo", "largee", "partt".
+     *
+     * The same price as a transposition, and for the same reason: both are purely mechanical slips
+     * with an unambiguous reading, where an ordinary deletion is neither. At the general deletion
+     * price a doubled letter loses to a neighbour-key substitution of the final letter, which is
+     * how "largee" became "larger" rather than "large", and "sidde" became "sided".
+     */
+    val doubledLetterCost: Float = 0.45f,
 
     /** Charged to any completion, plus [completionCostPerChar] for each letter still to come. */
     val completionCost: Float = 0.4f,
@@ -104,8 +133,18 @@ data class SuggesterConfig(
      * A wrong autocorrect is far more annoying than a missed one — it destroys something the user
      * did type, at the moment they have stopped looking. Where the keyboard is unsure, it does
      * nothing and leaves the alternative one tap away in the strip.
+     *
+     * Read this against the scale it is measured on, which is not obvious. The language score is
+     * `ln(1 + frequency) / ln(256)`, so although it spans 0 to 1 in principle, every word common
+     * enough to be worth correcting *to* sits between roughly 0.75 and 1.0. A margin is therefore
+     * spending from a usable range of about a quarter, and requiring 0.15 of it meant demanding the
+     * intended word be some 2.3 times commoner than the runner-up. Typos of common words have
+     * common words as their runners-up — "htis" offers "this" and "hits" — so the rule almost never
+     * cleared, and the effect was a keyboard that visibly knew the right answer and declined to use
+     * it. `CorrectionSweepTest` measures the trade: from 0.15 down to 0.08 costs one new wrong
+     * correction for every six it fixes, and below 0.08 that exchange collapses to about two to one.
      */
-    val autocorrectMargin: Float = 0.15f,
+    val autocorrectMargin: Float = 0.08f,
     /**
      * If the typed text is the start of an ordinary word this common, it is treated as unfinished
      * rather than misspelled.
@@ -118,6 +157,46 @@ data class SuggesterConfig(
 
     /** Longer than this and the input is not a word being typed. */
     val maxWordLength: Int = 28,
+
+    /**
+     * Weight on how well a candidate follows the preceding word.
+     *
+     * Added to a candidate's score, never subtracted, so a pair the model has never seen leaves
+     * that candidate exactly where spelling alone put it. Only what the model positively knows can
+     * move anything, which is what makes it safe to consult a model with large gaps in it.
+     *
+     * Sized against the language score, which spans 0 to [languageWeight]. At 0.6 a confidently
+     * predicted word outweighs a substantial frequency difference, which is what lets "at ocne"
+     * reach "once", while never overturning the spelling evidence, since a correction has to be
+     * reachable in one edit to be a candidate at all.
+     *
+     * `CorrectionSweepTest` keeps improving past this — around a point and a half more at 1.5 — and the
+     * lower value is a deliberate choice rather than the measured optimum. The held-out sentences
+     * share a register with the ones the model was trained on, so a high weight is partly rewarded
+     * for recognising a corpus rather than a language, and the further it is trusted the more a
+     * deliberate non-word that happens to fit the sentence is at risk. Revisit against text from
+     * somewhere other than Tatoeba, not against a larger sweep of the same.
+     */
+    val contextWeight: Float = 0.6f,
+
+    /**
+     * Weight on how well a candidate follows the preceding word *for this person specifically*.
+     *
+     * Sized a little above [contextWeight] on purpose. It fires far more rarely — most pairs
+     * anyone types have never been typed by them before — but when it does fire it is evidence
+     * about the actual writer rather than about English in aggregate, and that is worth more per
+     * observation. The saturating count behind it (see `UserBigrams.score`) is what stops a habit
+     * repeated a hundred times from overwhelming the spelling evidence entirely.
+     *
+     * Measured on generic held-out text this value barely matters: anywhere from 0.2 to 1.2 gives
+     * the same result to within a tenth of a point, because the pairs that recur in unrelated
+     * sentences are ordinary English ones the corpus model already covers. What that measurement
+     * *did* settle is the threshold in `UserBigrams`, where counting a pair seen once was actively
+     * harmful. This weight governs the case the corpus cannot see — a habit the corpus has never
+     * heard of — and should be revisited against real repetitive text rather than against more of
+     * the same corpus.
+     */
+    val personalContextWeight: Float = 0.8f,
 )
 
 /**
@@ -136,7 +215,28 @@ data class SuggesterConfig(
 class TypingSuggester(
     private val lexicon: Lexicon,
     private val config: SuggesterConfig = SuggesterConfig(),
+    /** Null when the asset is missing, which reduces this to spelling-only correction. */
+    private val bigrams: Bigrams? = null,
+    /** The words this person uses that the shipped dictionary does not have. */
+    private val userDictionary: UserDictionary? = null,
+    /** The word pairs this person writes, as opposed to the ones English writes on average. */
+    private val userBigrams: UserBigrams? = null,
 ) {
+
+    /**
+     * This person's own successors to the current context, resolved to lexicon indices once per
+     * call rather than looked up per candidate.
+     *
+     * There are only ever a handful, and turning each into an index costs one binary search, where
+     * turning every candidate back into a string to look it up would allocate hundreds of strings
+     * on the keypress path.
+     */
+    private var personalIndices = IntArray(0)
+    private var personalScores = FloatArray(0)
+    private var personalCount = 0
+
+    /** Lexicon index of the word before the one being typed, or -1. Set per [suggest] call. */
+    private var contextIndex = -1
 
     /** Reusable buffer for generated spellings, one longer than the input to fit an insertion. */
     private var buffer = CharArray(config.maxWordLength + 1)
@@ -149,10 +249,106 @@ class TypingSuggester(
     /** Correction candidates for the current call: lexicon index to its cheapest edit cost. */
     private val corrections = HashMap<Int, Float>()
 
+    /**
+     * Where each character of the current input was touched, as x,y pairs. Null when unknown.
+     *
+     * Held for the duration of one [suggest] call, alongside [contextIndex], rather than threaded
+     * through every private method that needs it.
+     */
+    private var touchPoints: FloatArray? = null
+
+    /** The keyboard the current call is measuring against, for turning pixels into key widths. */
+    private var touchKeys: GestureKeyMap? = null
+
+    /** The touch behind character [position], or null if the caller did not record one. */
+    private fun touchAt(position: Int): Pair<Float, Float>? {
+        val points = touchPoints ?: return null
+        val x = points[position * 2]
+        val y = points[position * 2 + 1]
+        // Not every character arrives from a key press: an alternate chosen from a long-press
+        // popup, or a letter restored by an undo, has no touch of its own.
+        if (x.isNaN() || y.isNaN()) return null
+        return x to y
+    }
+
+    /**
+     * How far a point is from a letter's key, in key widths and heights.
+     *
+     * Scaled per axis, so "one key away" is 1.0 whether the keys are square or tall, exactly as in
+     * the static neighbour table this stands in for.
+     */
+    private fun normalisedDistance(letter: Char, x: Float, y: Float): Float? {
+        val keys = touchKeys ?: return null
+        if (!keys.has(letter)) return null
+        val dx = (keys.centerX(letter) - x) / keys.keyWidth
+        val dy = (keys.centerY(letter) - y) / keys.keyHeight
+        return hypot(dx, dy)
+    }
+
+    /** Whether the shipped dictionary already has this word, and so whether learning it is idle. */
+    fun knows(word: String): Boolean = lexicon.indexOf(word.lowercase()) >= 0
+
+    /**
+     * The likeliest words to come next, given the word just written and nothing else.
+     *
+     * A different question from [suggest], which ranks candidates for something already typed.
+     * Here there is no input to rank — the strip would otherwise be empty — so the answer comes
+     * from what usually follows, and from what this person usually writes.
+     *
+     * Empty when there is nothing worth saying. An empty strip is a perfectly good answer and much
+     * better than three words guessed at: the value of a prediction is that it saves typing, and
+     * one nobody wanted costs a glance every time it appears.
+     */
+    fun predict(
+        previousWord: String?,
+        blockOffensive: Boolean = true,
+        limit: Int = config.maxResults,
+    ): List<String> {
+        if (previousWord.isNullOrEmpty() || limit <= 0) return emptyList()
+
+        val ranked = LinkedHashMap<String, Float>()
+
+        // This person's own habits first, and outright rather than by score: a phrase somebody
+        // writes over and over is a better guess at their next word than the corpus average, which
+        // is the entire reason for keeping it.
+        userBigrams?.successorsOf(previousWord)?.forEach { (word, _) ->
+            val strength = userBigrams.score(previousWord, word)
+            if (strength > 0f) ranked[word] = PERSONAL_PREDICTION_FLOOR + strength
+        }
+
+        val model = bigrams
+        val context = contextIndexFor(previousWord)
+        if (model != null && context >= 0) {
+            for (index in model.topSuccessors(context, limit * 2)) {
+                if (blockOffensive && lexicon.isOffensive(index)) continue
+                val word = lexicon.wordAt(index)
+                if (ranked.containsKey(word.lowercase())) continue
+                ranked[word] = model.score(context, index)
+            }
+        }
+
+        return ranked.entries
+            .sortedByDescending { it.value }
+            .take(limit)
+            .map { it.key }
+    }
+
+    /**
+     * @param previousWord the word immediately before the one being typed, if there is one and the
+     *   cursor has not moved away from it. Supplying it is what lets the sentence break a tie that
+     *   spelling and frequency cannot; omitting it costs accuracy but is never wrong.
+     * @param touchPoints where each character was actually touched, as x,y pairs in the same view
+     *   pixels as [keys], with NaN for characters that came from somewhere other than a key press.
+     *   Two floats per character of [typed]; anything else is ignored. Without it a mis-hit is
+     *   priced by how far apart two keys are, which is the same for every press of that key; with
+     *   it, by how close the finger came to the key it was reaching for.
+     */
     fun suggest(
         typed: String,
         keys: GestureKeyMap,
         blockOffensive: Boolean = true,
+        previousWord: String? = null,
+        touchPoints: FloatArray? = null,
     ): TypingSuggestions {
         if (typed.isEmpty() || typed.length > config.maxWordLength) return TypingSuggestions.None
         val lower = typed.lowercase()
@@ -160,6 +356,12 @@ class TypingSuggester(
 
         ensureNeighbours(keys)
         corrections.clear()
+        contextIndex = contextIndexFor(previousWord)
+        buildPersonalContext(previousWord)
+        // A short array would read past its end on the last character, and a stale one would price
+        // this word by where the last one was typed. Either is worse than not knowing.
+        this.touchPoints = touchPoints?.takeIf { it.size >= typed.length * 2 }
+        this.touchKeys = keys
 
         // Whether the dictionary knows the word and whether we are willing to show it are separate
         // questions. A blocked word is still a word, and correcting a deliberately typed obscenity
@@ -171,8 +373,20 @@ class TypingSuggester(
         if (lower.length >= config.minCorrectionLength) collectCorrections(lower, blockOffensive)
 
         val ranked = rank(shown, completions, properNounsUnmarked = typed.none(Char::isUpperCase))
-        val autocorrection = chooseAutocorrection(lower, isKnownWord = exact >= 0, ranked = ranked)
-        return TypingSuggestions(present(typed, ranked, autocorrection), autocorrection)
+
+        // A word this person has deliberately used before is a word, whatever the shipped
+        // dictionary thinks. This is the whole point of learning: without it their own name, and
+        // everyone else's, is rewritten every single time it is typed.
+        val learned = userDictionary?.isTrusted(lower) == true
+        val autocorrection = chooseAutocorrection(
+            lower,
+            isKnownWord = exact >= 0 || learned,
+            ranked = ranked,
+        )
+        return TypingSuggestions(
+            present(typed, ranked, autocorrection, learnedCompletions(lower)),
+            autocorrection,
+        )
     }
 
     // region Candidate generation
@@ -212,10 +426,28 @@ class TypingSuggester(
             val letter = lower[position]
             val slot = letter - 'a'
             if (slot !in 0 until ALPHABET) continue
-            val letters = neighbourLetters[slot] ?: continue
-            val distances = neighbourDistance[slot]!!
 
             lower.toCharArray(buffer)
+
+            // Where the finger actually landed, when the caller knows. A touch that caught the
+            // right-hand edge of "s" is far better evidence for "d" than the fact that d is next
+            // to s, which is equally true of every "s" ever typed.
+            val touch = touchAt(position)
+            if (touch != null) {
+                val (x, y) = touch
+                for (i in 0 until ALPHABET) {
+                    if (i == slot) continue
+                    val candidate = 'a' + i
+                    val distance = normalisedDistance(candidate, x, y) ?: continue
+                    if (distance > config.neighbourRadius) continue
+                    buffer[position] = candidate
+                    offerCorrection(length, config.substitutionCost * distance, blockOffensive)
+                }
+                continue
+            }
+
+            val letters = neighbourLetters[slot] ?: continue
+            val distances = neighbourDistance[slot]!!
             for (i in letters.indices) {
                 buffer[position] = letters[i]
                 offerCorrection(length, config.substitutionCost * distances[i], blockOffensive)
@@ -238,7 +470,10 @@ class TypingSuggester(
                 for (i in 0 until length) {
                     if (i != skipped) buffer[out++] = lower[i]
                 }
-                offerCorrection(length - 1, config.deletionCost, blockOffensive)
+                val repeats = (skipped > 0 && lower[skipped] == lower[skipped - 1]) ||
+                    (skipped < length - 1 && lower[skipped] == lower[skipped + 1])
+                val cost = if (repeats) config.doubledLetterCost else config.deletionCost
+                offerCorrection(length - 1, cost, blockOffensive)
             }
         }
 
@@ -365,6 +600,7 @@ class TypingSuggester(
         typed: String,
         ranked: List<WordSuggestion>,
         autocorrection: String?,
+        learned: List<String>,
     ): List<WordSuggestion> {
         val literal = WordSuggestion(typed, 0f, WordSuggestion.Kind.Typed)
         val result = ArrayList<WordSuggestion>(config.maxResults)
@@ -378,6 +614,15 @@ class TypingSuggester(
             result.add(literal)
         }
 
+        // Learned words come next, ahead of the corpus. Someone who has typed a name twice is far
+        // likelier to be typing it again than to be misspelling whatever the corpus offers, and a
+        // completion the user taught the keyboard themselves is the one they will trust.
+        for (word in learned) {
+            if (result.size >= config.maxResults) break
+            if (result.any { it.word.equals(word, ignoreCase = true) }) continue
+            result.add(WordSuggestion(word, 0f, WordSuggestion.Kind.Completion))
+        }
+
         for (suggestion in ranked) {
             if (result.size >= config.maxResults) break
             if (result.any { it.word.equals(suggestion.word, ignoreCase = true) }) continue
@@ -386,8 +631,80 @@ class TypingSuggester(
         return result
     }
 
-    private fun languageScore(index: Int): Float =
-        config.languageWeight * ln(1f + lexicon.frequencyAt(index)) / LN_MAX_FREQUENCY
+    /** Words the user has taught the keyboard that continue what they are typing. */
+    private fun learnedCompletions(lower: String): List<String> {
+        val dictionary = userDictionary ?: return emptyList()
+        if (lower.length < config.minCompletionLength) return emptyList()
+        return dictionary.completions(lower, config.maxResults)
+    }
+
+    /**
+     * How likely this word is, before any evidence about what was typed.
+     *
+     * Frequency in general, plus how well it follows the preceding word when the model has an
+     * opinion. The two are added rather than interpolated because the context term is one-sided:
+     * see [SuggesterConfig.contextWeight].
+     */
+    private fun languageScore(index: Int): Float {
+        var score = config.languageWeight * ln(1f + lexicon.frequencyAt(index)) / LN_MAX_FREQUENCY
+
+        val model = bigrams
+        if (model != null && contextIndex >= 0) {
+            score += config.contextWeight * model.score(contextIndex, index)
+        }
+
+        // What this person writes, on top of what English writes. Added rather than blended, for
+        // the same reason as the corpus term: personal data is mostly absent, and a model that is
+        // mostly absent must only ever be able to promote.
+        for (slot in 0 until personalCount) {
+            if (personalIndices[slot] == index) {
+                score += config.personalContextWeight * personalScores[slot]
+                break
+            }
+        }
+        return score
+    }
+
+    /**
+     * Resolves this person's successors to the current context into lexicon indices.
+     *
+     * Successors that are not in the lexicon are dropped here rather than kept: they cannot be
+     * ranked against corpus candidates, having no index to be scored at. They still reach the user
+     * through [learnedCompletions], which works in strings.
+     */
+    private fun buildPersonalContext(previousWord: String?) {
+        personalCount = 0
+        val model = userBigrams ?: return
+        if (previousWord.isNullOrEmpty()) return
+
+        val successors = model.successorsOf(previousWord)
+        if (successors.isEmpty()) return
+
+        if (personalIndices.size < successors.size) {
+            personalIndices = IntArray(successors.size)
+            personalScores = FloatArray(successors.size)
+        }
+        for ((word, _) in successors) {
+            val index = lexicon.indexOf(word)
+            if (index < 0) continue
+            personalIndices[personalCount] = index
+            personalScores[personalCount] = model.score(previousWord, word)
+            personalCount++
+        }
+    }
+
+    /**
+     * Resolves the preceding word to a lexicon index.
+     *
+     * A word the lexicon does not know has no recorded successors either, so there is nothing to
+     * look up and the corrector falls back to spelling alone for that keystroke.
+     */
+    private fun contextIndexFor(previousWord: String?): Int {
+        if (bigrams == null || previousWord.isNullOrEmpty()) return -1
+        val cleaned = previousWord.lowercase().trim('\'')
+        if (cleaned.isEmpty() || !cleaned.all { it in 'a'..'z' || it == '\'' }) return -1
+        return lexicon.indexOf(cleaned)
+    }
 
     // endregion
 
@@ -461,6 +778,15 @@ class TypingSuggester(
     }
 
     private companion object {
+        /**
+         * Guarantees a personal prediction outranks any corpus one.
+         *
+         * Both channels score 0 to 1, and a phrase this person repeats is a better guess at their
+         * next word than English's average is, however confident the corpus happens to be about
+         * some other continuation.
+         */
+        const val PERSONAL_PREDICTION_FLOOR = 1f
+
         const val ALPHABET = 26
         const val MIN_CANDIDATE_LENGTH = 2
         val LN_MAX_FREQUENCY = ln(256f)

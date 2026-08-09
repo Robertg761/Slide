@@ -58,8 +58,15 @@ enum class KeyType {
     DELETE,
     SPACE,
     ENTER,
-    /** Switch to the symbols layer. */
+    /** Switch to the first symbols layer (`?123`). */
     SYMBOLS,
+    /**
+     * Switch to the second symbols layer (`=\<`).
+     *
+     * Distinct from [SYMBOLS] because the two keys are otherwise indistinguishable to the service,
+     * and a key that asks for the layer already on screen is a key that does nothing.
+     */
+    SYMBOLS_ALT,
     /** Switch back to the letters layer. */
     ALPHA,
     EMOJI,

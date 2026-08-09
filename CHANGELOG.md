@@ -1,5 +1,86 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- The strip offers the next word between words, where it used to sit empty. Continuations come
+  from the corpus and from your own repeated phrases, with yours first — measured against held-out
+  text, the next word is one tap away about a quarter of the time from the corpus alone. It stays
+  quiet when it has nothing confident to say, because three guessed words cost a glance every time
+  they appear.
+- Corrections use where your finger actually landed, not just which key it registered. A touch
+  that caught the right-hand edge of "s" is strong evidence for "d"; that d is next to s is equally
+  true of every "s" ever typed. On simulated typing where mis-hits emerge from the geometry rather
+  than being written in, this corrects 5.7 more points of them at ordinary accuracy and slightly
+  fewer wrongly. Words typed accurately are untouched.
+- Slide learns your phrases as well as your words. The pairs you actually write — "kubectl apply",
+  a friend's first name and surname — weigh candidates alongside the corpus model, in the context
+  they were learned in and nowhere else. A pair has to recur several times before it counts for
+  anything: measured on held-out text, acting on a pair seen once cost about twice as many wrong
+  corrections as it bought right ones.
+- Slide learns your words. A word committed deliberately twice — or rescued once from an
+  autocorrect, which is the clearest signal a keyboard ever gets — stops being corrected away, and
+  starts being offered as a completion. This is the gap that made a keyboard feel like it was
+  fighting you: names, slang and jargon were rewritten every single time and never suggested once.
+  Hold a candidate in the suggestion strip to teach a word or take one back. Nothing is learned in
+  password or incognito fields, the list lives in the app's private storage as plain text you can
+  read or delete, and it is excluded from cloud backup and device transfer.
+- Swipe reads the sentence too. The same model weighs each decoded candidate by how well it
+  follows the word before it, which lifts top-1 accuracy on traced held-out sentences from 93.8% to
+  96.8% — nearly halving the error rate. It is the only thing that can separate words tracing an
+  identical path: "typing" and "topping" are the same gesture, because y and o both lie between t
+  and p, and no amount of geometry will ever tell them apart. Of 65 such cases in the sample, 40
+  now resolve.
+- Autocorrect reads the sentence. A bigram language model, built from Tatoeba's English sentence
+  corpus and shipped as a 1.3 MB asset, weighs each candidate by how well it follows the word
+  before it. Measured on held-out sentences the model was never trained on, this takes correction
+  of single-edit typos from 84.4% to 92.2% while barely moving wrong corrections: the cases
+  it resolves — "at ocne" to "once", "my hroat" to "throat", "without efort" to "effort" — are
+  exactly the ambiguous ones a wrong correction used to come from. Words the model has never seen
+  in sequence are left exactly where spelling alone put them, so its gaps cost nothing.
+- A second symbols page behind `=\<`, carrying the slash, equals sign, brackets, angle brackets,
+  pipe, caret, and currency symbols. The key previously asked for the page it was already on, so
+  nothing happened when it was pressed.
+- Tapping into a word that is already typed reopens it, so the suggestion strip offers replacements
+  for it. Fixing a wrong swipe or a missed correction no longer means deleting back to it.
+
+### Changed
+
+- Autocorrect now fires on 85% of single-edit typos, up from 77%, with wrong corrections falling
+  from 1.5% to 1.2%. The confidence margin was measured on a scale it did not fit: because the
+  language score is a log of an already-logarithmic frequency, every word worth correcting to sits
+  in a band about a quarter wide, and the old margin spent more than half of it. Typos of common
+  words — "htis", "thjs", "drom", "witth" — had the right answer in the strip and were refused.
+- Restoring a dropped letter is now cheaper than overriding a key you pressed. An insertion only
+  adds to what was typed, where a substitution asserts that a key you did press was not the one you
+  wanted, so the edit that contradicts less of the input should be the cheaper explanation — and at
+  0.6 against a substitution's 0.5 it was the dearer one. That is how "sould" reached "would"
+  instead of "should", and "fom" reached "tom" instead of "from". Dropped-letter typos go from
+  66.4% corrected to 78.1%, and wrong corrections *halve*, 1.5% to 0.7%.
+- A doubled letter is now priced as the mechanical slip it is rather than as an ordinary stray
+  keystroke, so "largee" no longer becomes "larger" or "sidde" "sided". Nothing in that class is
+  rewritten to a different word any more, where the corrector previously preferred changing the
+  word to un-doubling the key.
+- Backspace deletes on touch-down instead of on release, and its auto-repeat reaches full speed in
+  about a third of the time it used to.
+- The navigation-bar strip below the keys is painted in the keyboard's own background colour, so
+  the keyboard meets the bottom of the screen without a black band and a visible seam.
+- Swipes are reconstructed from every touch sample Android batches into a move event rather than
+  only the newest, which gives the decoder the path the finger actually took on a fast swipe.
+- A swipe too short for the decoder to read now types the key it started on instead of committing
+  nothing.
+
+### Fixed
+
+- Updates: the downloader checks the HTTP status, the byte count, and the file's magic number, and
+  only moves a download into place once it is whole — a truncated APK used to be kept under its
+  final name and fail verification on every subsequent attempt. If the signing certificates cannot
+  be read out of the archive, the update is no longer refused as unreadable; Android enforces the
+  signature on install either way.
+- Updates: `getPackageArchiveInfo` and `getPackageInfo` no longer call API 33-only overloads on a
+  minSdk 26 app, which would have thrown `NoSuchMethodError` on Android 8 through 12.
+
 ## [0.2.0] - 2026-08-08
 
 ### Added

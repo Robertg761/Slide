@@ -31,8 +31,11 @@ is written and compiles but has **not yet run on hardware** — see *Not yet ver
 - Nine themes plus Material You dynamic colour, light/dark following the system
 - Key preview popups, key borders, number row, haptics, keypress sound
 - Password and incognito field detection (no learning in those fields)
+- A personal dictionary that learns the words and phrases you use and stops correcting them away
+- Next-word prediction in the strip, from the corpus and from your own repeated phrases
 - **Gesture typing** — SHARK²-derived decoder over a 160k-word lexicon, 95.8% top-1 and 100%
-  top-5 on the test corpus at 0.21 ms mean decode
+  top-5 on the isolated test corpus at 0.21 ms mean decode. In a sentence, where the bigram model
+  can break ties the path cannot, 96.8% top-1 against 93.8% without it
 - Suggestion strip showing the decoder's top three candidates, one tap to correct a miss
 - Offensive-word filtering for suggestions (on by default, as in Gboard)
 
@@ -64,7 +67,6 @@ is written and compiles but has **not yet run on hardware** — see *Not yet ver
   font-scale, landscape, and latency verification.
 
 **Not yet built**
-- Next-word prediction (needs a bigram language-model asset) and a personal dictionary
 - Clipboard and text-editing panels
 - Remaining appearance settings, setup-wizard polish, and full accessibility/adaptive-layout QA
 
@@ -125,6 +127,25 @@ python3 tools/build_lexicon.py /tmp/aosp_en.txt engine/src/main/assets/lexicon_e
 ./gradlew :engine:testDebugUnitTest
 ```
 
+**The bigram model** is what lets autocorrect read the sentence rather than guess from spelling —
+"at ocne" reaches "once" because the corpus knows what follows "at". It is generated from
+Tatoeba's English sentence export and committed alongside the lexicon, which it is keyed against
+by index, so it must be rebuilt whenever the lexicon is:
+
+```bash
+curl -sL -o /tmp/tatoeba.tsv.bz2 https://downloads.tatoeba.org/exports/per_language/eng/eng_sentences.tsv.bz2
+bunzip2 -kf /tmp/tatoeba.tsv.bz2
+python3 tools/build_bigrams.py /tmp/tatoeba.tsv \
+    engine/src/main/assets/lexicon_en.bin \
+    engine/src/main/assets/bigrams_en.bin \
+    engine/src/test/resources/heldout_en.txt
+./gradlew :engine:testDebugUnitTest
+```
+
+A tenth of the corpus is held back by sentence id and written to `heldout_en.txt`, which the model
+is never trained on. `ContextualCorrectionTest` measures against those sentences, so the numbers it
+reports are not the model marking its own homework.
+
 **The emoji catalogue** is generated from Unicode's `emoji-test.txt` and CLDR's English
 annotations, and is likewise committed. The script downloads its own sources:
 
@@ -177,9 +198,19 @@ only for as long as it takes to transcribe. The optional update check contacts G
 user enables it when Slide opens. Password and
 incognito fields are excluded from any learning.
 
+Slide learns the words you use that its dictionary does not have, so it stops rewriting your own
+name back at you, and the phrases you repeat, so it can offer them. Those live in
+`files/learned_words.txt` and `files/learned_pairs.txt` in the app's private storage, as plain text
+you can read or delete, and are excluded from cloud backup and device transfer alike —
+the words a person uses that most people do not are the most revealing thing here, and they should
+not leave the phone just because the phone was backed up. Hold a word in the suggestion strip to
+teach it or to take it back.
+
 ## Licence and provenance
 
 Slide clones Gboard's *functionality*, not its implementation. No Gboard code, binaries,
-dictionaries, or assets are used. Dictionaries come from the Apache-2.0 AOSP wordlists; emoji
-data and search keywords come from Unicode and CLDR under the Unicode licence; Whisper weights
-and `whisper.cpp` are MIT. Emoji are drawn with the system font, so no glyphs are redistributed.
+dictionaries, or assets are used. Dictionaries come from the Apache-2.0 AOSP wordlists; the bigram
+model is derived from [Tatoeba](https://tatoeba.org) sentence data, used and redistributed under
+CC BY 2.0 FR; emoji data and search keywords come from Unicode and CLDR under the Unicode licence;
+Whisper weights and `whisper.cpp` are MIT. Emoji are drawn with the system font, so no glyphs are
+redistributed.
