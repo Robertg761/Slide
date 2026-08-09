@@ -528,9 +528,9 @@ class EmojiPanelView(context: Context) : View(context) {
                 if (pressedBackspace) {
                     // The first delete lands on press rather than on release, as the delete key
                     // does, so holding it feels like one continuous action.
-                listener?.onEmojiBackspace()
-                announceForAccessibility("Backspace")
-                repeatDelay = FIRST_REPEAT_MS
+                    listener?.onEmojiBackspace()
+                    announceForAccessibility("Backspace")
+                    repeatDelay = FIRST_REPEAT_MS
                     postDelayed(backspaceRepeat, repeatDelay)
                 }
             }

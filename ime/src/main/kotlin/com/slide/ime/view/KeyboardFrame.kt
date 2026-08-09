@@ -3,6 +3,7 @@ package com.slide.ime.view
 import android.content.Context
 import android.view.WindowInsets
 import android.widget.FrameLayout
+import androidx.annotation.ColorInt
 import androidx.core.view.WindowInsetsCompat
 
 /**
@@ -19,10 +20,28 @@ import androidx.core.view.WindowInsetsCompat
  * It also reserves the navigation bar below all of them, so the picker's footer clears the gesture
  * pill for the same reason the bottom key row does. That belongs here rather than in [KeyboardView]
  * because it is a property of the window's bottom edge, not of the keys.
+ *
+ * The reserved strip is painted in the keyboard's own background colour. It is space no child draws
+ * into, so left alone it shows the bare window behind it — a black band under a dark grey keyboard,
+ * with a visible seam along the bottom key row.
  */
 class KeyboardFrame(context: Context) : FrameLayout(context) {
 
     private var navigationInset = 0
+
+    /**
+     * The keyboard background, painted behind the keys and across the navigation-bar strip.
+     *
+     * Set by the service whenever the theme resolves, which is also what keeps it right across a
+     * light/dark switch while the keyboard is on screen.
+     */
+    @ColorInt
+    var themeBackground: Int = 0
+        set(value) {
+            if (field == value) return
+            field = value
+            setBackgroundColor(value)
+        }
 
     override fun onApplyWindowInsets(insets: WindowInsets): WindowInsets {
         val compat = WindowInsetsCompat.toWindowInsetsCompat(insets, this)

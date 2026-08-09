@@ -69,6 +69,8 @@ class SlideInputMethodService :
     private var suggestionStrip: SuggestionStripView? = null
     private var voiceOverlay: VoiceOverlayView? = null
     private var emojiPanel: EmojiPanelView? = null
+    private var keyboardFrame: KeyboardFrame? = null
+    private var inputRoot: View? = null
     private var settings = KeyboardSettings()
 
     /**
@@ -81,8 +83,11 @@ class SlideInputMethodService :
         VoiceInputClient(this).also { it.listener = this }
     }
 
-    private var symbolsShown = false
-    private var searchPreviousSymbols = false
+    /** Which of the three key layers is on screen. */
+    private enum class Layer { ALPHA, SYMBOLS, SYMBOLS_ALT }
+
+    private var layer = Layer.ALPHA
+    private var searchPreviousLayer = Layer.ALPHA
     private var lastShiftTapMs = 0L
     private var lastSpaceCommitMs = 0L
 
@@ -118,6 +123,35 @@ class SlideInputMethodService :
 
     /** What a separator would turn [composing] into, or null to leave it as typed. */
     private var pendingAutocorrection: String? = null
+
+    /**
+     * True when [composing] is a finished word the user tapped back into rather than one being
+     * typed.
+     *
+     * It changes two things. Nothing is autocorrected — the user went back to a word deliberately,
+     * and having the keyboard change it out from under them at that moment is the opposite of what
+     * they asked for. And picking from the strip replaces the word in place instead of appending a
+     * space, because there is already a sentence on the other side of it.
+     */
+    private var recomposed = false
+
+    /**
+     * False when the cursor sits inside [composing] rather than at its end.
+     *
+     * The composing region can only be extended at its end, so a keystroke with the cursor
+     * elsewhere in the word has to settle the region first and be typed literally. The region is
+     * still worth keeping in that state: it is what puts alternatives for the word in the strip.
+     */
+    private var composingAtEnd = true
+
+    /**
+     * Set whenever the keyboard itself edits the field, and cleared by the selection change that
+     * results.
+     *
+     * [onUpdateSelection] cannot otherwise tell the cursor landing where we just put it from the
+     * user tapping somewhere, and only the second is an invitation to reopen a word.
+     */
+    private var selfEdit = false
 
     /** The last word autocorrect changed, so the next backspace can put it back. */
     private var lastAutocorrect: Autocorrect? = null
@@ -242,18 +276,21 @@ class SlideInputMethodService :
             addView(emoji, MATCH_PARENT, MATCH_PARENT)
             addView(overlay, MATCH_PARENT, MATCH_PARENT)
         }
+        keyboardFrame = keys
 
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(strip, MATCH_PARENT, WRAP_CONTENT)
             addView(keys, MATCH_PARENT, WRAP_CONTENT)
+            inputRoot = this
+            applyTheme(theme)
         }
     }
 
     override fun onStartInputView(info: EditorInfo, restarting: Boolean) {
         super.onStartInputView(info, restarting)
         exitEmojiSearch(showPicker = false)
-        symbolsShown = false
+        layer = Layer.ALPHA
         hideEmojiPanel()
         passwordField = isPasswordField(info)
         incognito = (info.imeOptions and EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) != 0 ||
@@ -283,6 +320,11 @@ class SlideInputMethodService :
         suggestionStrip?.keyboardTheme = theme
         voiceOverlay?.keyboardTheme = theme
         emojiPanel?.keyboardTheme = theme
+        // The frame's navigation-bar strip and any rounding the window puts around the input view
+        // are the two places the keyboard's own colour does not otherwise reach, and both sit right
+        // along the bottom edge where a mismatch reads as the keyboard not fitting the screen.
+        keyboardFrame?.themeBackground = theme.background
+        inputRoot?.setBackgroundColor(theme.background)
     }
 
     /**
@@ -408,6 +450,8 @@ class SlideInputMethodService :
 
         val connection = currentInputConnection ?: return
 
+        if (key.type in EDITING_KEYS) selfEdit = true
+
         // Any keypress ends the swiped word: the candidates no longer describe what is in front of
         // the cursor, so leaving them up would offer a replacement for text that has moved on. A
         // typing strip is the opposite -- it is about to be rebuilt from the new keystroke.
@@ -421,8 +465,9 @@ class SlideInputMethodService :
             KeyType.SHIFT -> handleShiftTap()
             KeyType.DELETE -> handleDelete(connection)
             KeyType.ENTER -> handleEnter(connection)
-            KeyType.SYMBOLS -> switchLayer(showSymbols = true)
-            KeyType.ALPHA -> switchLayer(showSymbols = false)
+            KeyType.SYMBOLS -> switchLayer(Layer.SYMBOLS)
+            KeyType.SYMBOLS_ALT -> switchLayer(Layer.SYMBOLS_ALT)
+            KeyType.ALPHA -> switchLayer(Layer.ALPHA)
             KeyType.SPACE -> handleSpace(connection, text)
             KeyType.MIC -> onVoiceRequested()
             KeyType.EMOJI -> showEmojiPanel()
@@ -432,6 +477,7 @@ class SlideInputMethodService :
     }
 
     override fun onGestureComplete(points: List<GesturePoint>) {
+        selfEdit = true
         val decoder = gestureDecoder ?: return
         val connection = currentInputConnection ?: return
         val keys = keyboardView?.gestureKeyMap() ?: return
@@ -448,6 +494,7 @@ class SlideInputMethodService :
     }
 
     override fun onCursorMove(steps: Int) {
+        selfEdit = true
         val connection = currentInputConnection ?: return
         val extracted = connection.getExtractedText(ExtractedTextRequest(), 0)
         if (extracted != null) {
@@ -473,6 +520,7 @@ class SlideInputMethodService :
     }
 
     override fun onDeleteWordGesture() {
+        selfEdit = true
         val connection = currentInputConnection ?: return
         finishComposing(connection)
         val selected = connection.getSelectedText(0)
@@ -523,6 +571,7 @@ class SlideInputMethodService :
      */
     override fun onSuggestionPicked(index: Int, word: String) {
         performHaptic()
+        selfEdit = true
         when (stripMode) {
             StripMode.Gesture -> pickGestureAlternative(index, word)
             StripMode.Typing -> pickTypedSuggestion(word)
@@ -590,7 +639,7 @@ class SlideInputMethodService :
                 searchResults().firstOrNull()?.let { onSearchEmojiPicked(it) }
                 return
             }
-            KeyType.SHIFT, KeyType.SYMBOLS, KeyType.ALPHA, KeyType.EMOJI,
+            KeyType.SHIFT, KeyType.SYMBOLS, KeyType.SYMBOLS_ALT, KeyType.ALPHA, KeyType.EMOJI,
             KeyType.MIC, KeyType.GLOBE, KeyType.SETTINGS -> return
         }
         view.searchQuery = query.take(MAX_SEARCH_QUERY_LENGTH)
@@ -621,7 +670,7 @@ class SlideInputMethodService :
 
     private fun startEmojiSearch() {
         hideEmojiPanel()
-        searchPreviousSymbols = symbolsShown
+        searchPreviousLayer = layer
         keyboardView?.apply {
             searchQuery = ""
             searchMode = true
@@ -638,9 +687,9 @@ class SlideInputMethodService :
         view.searchMode = false
         view.searchQuery = ""
         view.searchResults = emptyList()
-        symbolsShown = searchPreviousSymbols
-        view.keyboardLayout = if (symbolsShown) Layouts.SymbolsEn else Layouts.QwertyEn
-        if (!symbolsShown) updateShiftFromCursor()
+        layer = searchPreviousLayer
+        view.keyboardLayout = layoutFor(layer)
+        if (layer == Layer.ALPHA) updateShiftFromCursor()
         refreshSuggestionEmptyMessage()
         if (showPicker && emojiData != null) {
             emojiPanel?.reset()
@@ -721,6 +770,7 @@ class SlideInputMethodService :
     override fun onVoiceResult(text: String) {
         hideVoiceOverlay()
         if (text.isBlank()) return
+        selfEdit = true
 
         val connection = currentInputConnection ?: return
         commitDictation(connection, text)
@@ -798,6 +848,7 @@ class SlideInputMethodService :
 
     override fun onEmojiPicked(emoji: String) {
         performHaptic()
+        selfEdit = true
         currentInputConnection?.commitText(emoji, 1)
         // Whatever the undo record pointed at is no longer what sits before the cursor.
         lastAutocorrect = null
@@ -833,6 +884,11 @@ class SlideInputMethodService :
     // region Input handling
 
     private fun handleCharacter(connection: InputConnection, text: String) {
+        // Typing with the cursor parked in the middle of a reopened word: the region can only grow
+        // at its end, so settling it first is the only way the letter lands where the user is
+        // looking.
+        if (composing.isNotEmpty() && !composingAtEnd) abandonComposing()
+
         if (isWordCharacter(text) && suggestionsAvailable()) {
             composing.append(text)
             connection.setComposingText(composing, 1)
@@ -850,7 +906,10 @@ class SlideInputMethodService :
 
     /** Letters and the apostrophe build a word; everything else ends one. */
     private fun isWordCharacter(text: String): Boolean =
-        text.length == 1 && (text[0].isLetter() || text[0] == '\'')
+        text.length == 1 && isWordCharacter(text[0])
+
+    private fun isWordCharacter(character: Char): Boolean =
+        character.isLetter() || character == '\''
 
     private fun handleSpace(connection: InputConnection, text: String) {
         // Space is where a typed word is settled, and so where autocorrect actually happens.
@@ -882,6 +941,10 @@ class SlideInputMethodService :
 
     private fun handleDelete(connection: InputConnection) {
         if (revertAutocorrect(connection)) return
+
+        // Same reasoning as typing: with the cursor inside a reopened word, shortening the region
+        // would delete its last letter rather than the one before the cursor.
+        if (composing.isNotEmpty() && !composingAtEnd) abandonComposing()
 
         // Mid-word, backspace shortens the composing region rather than deleting from the editor,
         // so the suggestions keep up with what is actually in front of the cursor.
@@ -942,11 +1005,17 @@ class SlideInputMethodService :
         )
     }
 
-    private fun switchLayer(showSymbols: Boolean) {
-        symbolsShown = showSymbols
-        if (showSymbols) setShift(ShiftState.OFF)
-        keyboardView?.keyboardLayout = if (showSymbols) Layouts.SymbolsEn else Layouts.QwertyEn
-        if (!showSymbols) updateShiftFromCursor()
+    private fun switchLayer(target: Layer) {
+        layer = target
+        if (target != Layer.ALPHA) setShift(ShiftState.OFF)
+        keyboardView?.keyboardLayout = layoutFor(target)
+        if (target == Layer.ALPHA) updateShiftFromCursor()
+    }
+
+    private fun layoutFor(layer: Layer) = when (layer) {
+        Layer.ALPHA -> Layouts.QwertyEn
+        Layer.SYMBOLS -> Layouts.SymbolsEn
+        Layer.SYMBOLS_ALT -> Layouts.SymbolsAltEn
     }
 
     // endregion
@@ -979,7 +1048,8 @@ class SlideInputMethodService :
             keys = keys,
             blockOffensive = settings.blockOffensiveWords,
         )
-        pendingAutocorrection = result.autocorrection.takeIf { settings.autocorrectEnabled }
+        pendingAutocorrection = result.autocorrection
+            .takeIf { settings.autocorrectEnabled && !recomposed }
 
         stripMode = StripMode.Typing
         suggestionStrip?.setSuggestions(result.words.map { it.word })
@@ -1008,6 +1078,8 @@ class SlideInputMethodService :
         connection.finishComposingText()
         composing.setLength(0)
         pendingAutocorrection = null
+        recomposed = false
+        composingAtEnd = true
         clearSuggestions()
         return corrected
     }
@@ -1017,9 +1089,13 @@ class SlideInputMethodService :
      * us or the field has been swapped. Correcting text we may no longer own is not worth the risk.
      */
     private fun abandonComposing() {
+        val wasComposing = composing.isNotEmpty()
         composing.setLength(0)
         pendingAutocorrection = null
         lastAutocorrect = null
+        recomposed = false
+        composingAtEnd = true
+        if (wasComposing) selfEdit = true
         currentInputConnection?.finishComposingText()
         clearSuggestions()
     }
@@ -1083,15 +1159,24 @@ class SlideInputMethodService :
         val connection = currentInputConnection ?: return
         if (composing.isEmpty()) return
 
+        // A word reopened from the middle of a sentence already has a separator after it. Adding
+        // another would turn every correction into a stray double space.
+        val appendSpace = !recomposed
+        // The dictionary is lowercase. A word reopened mid-sentence was written with whatever
+        // capitalisation the user chose, and swapping it for a correction must not quietly undo it.
+        val replacement = if (recomposed) matchCase(composing.toString(), word) else word
+
         connection.beginBatchEdit()
-        connection.setComposingText(word, 1)
+        connection.setComposingText(replacement, 1)
         connection.finishComposingText()
-        connection.commitText(" ", 1)
+        if (appendSpace) connection.commitText(" ", 1)
         connection.endBatchEdit()
 
         composing.setLength(0)
         pendingAutocorrection = null
         lastAutocorrect = null
+        recomposed = false
+        composingAtEnd = true
         lastSpaceCommitMs = 0L
         clearSuggestions()
         updateShiftFromCursor()
@@ -1100,9 +1185,11 @@ class SlideInputMethodService :
     /**
      * Notices the user moving the cursor, tapping elsewhere, or selecting text.
      *
-     * Everything the keyboard believes about the word in progress is only true while the cursor
-     * sits at the end of it. The moment that stops holding, the safe move is to forget it rather
-     * than to correct text the user has navigated away from.
+     * Two jobs. A word in progress is dropped once the cursor leaves it, because everything the
+     * keyboard believes about it stops being true at that point and correcting text the user has
+     * navigated away from is the worst thing it could do. And a cursor that lands *in* a finished
+     * word reopens it, which is what makes a wrong word fixable after the fact instead of only in
+     * the second or so before the next space.
      */
     override fun onUpdateSelection(
         oldSelStart: Int,
@@ -1116,12 +1203,74 @@ class SlideInputMethodService :
             oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd,
         )
 
+        val ourEdit = selfEdit
+        selfEdit = false
+
         // Editors that do not report a composing region give -1 here. That is not evidence the
         // cursor moved, so it must not be treated as such, or suggestions would never survive a
         // keystroke in those apps.
-        val cursorLeftTheWord =
-            newSelStart != newSelEnd || (candidatesEnd >= 0 && newSelEnd != candidatesEnd)
-        if (composing.isNotEmpty() && cursorLeftTheWord) abandonComposing()
+        val insideComposing = candidatesStart >= 0 && candidatesEnd >= 0 &&
+            newSelStart >= candidatesStart && newSelEnd <= candidatesEnd
+        val cursorLeftTheWord = newSelStart != newSelEnd ||
+            (candidatesEnd >= 0 && !insideComposing)
+
+        if (composing.isNotEmpty() && !cursorLeftTheWord) {
+            composingAtEnd = candidatesEnd < 0 || newSelEnd == candidatesEnd
+            return
+        }
+        // Dropping one word and reopening another are the same gesture — a tap somewhere else in
+        // the sentence — so the tap that ends the first must be allowed to start the second.
+        if (composing.isNotEmpty()) abandonComposing()
+
+        if (!ourEdit) reopenWordAtCursor(newSelStart, newSelEnd)
+    }
+
+    /**
+     * Turns the finished word the cursor has landed in back into a composing region, so the strip
+     * offers replacements for it.
+     *
+     * This is the only route to fixing a word the keyboard got wrong once the moment has passed —
+     * a swipe that decoded to the wrong thing two words ago, or a correction noticed on re-reading.
+     * Without it the only remedy is deleting back to the mistake and retyping everything after it.
+     *
+     * Nothing is changed here, only marked: the word is put back exactly as it stands, autocorrect
+     * is held off for it, and if the user carries on typing or moves away again it settles
+     * untouched.
+     */
+    private fun reopenWordAtCursor(selectionStart: Int, selectionEnd: Int) {
+        if (selectionStart != selectionEnd || selectionStart < 0) return
+        if (stripMode != StripMode.Empty) return
+        if (!suggestionsAvailable()) return
+        if (searchModeShown || emojiPanelShown || voiceOverlayShown) return
+
+        val connection = currentInputConnection ?: return
+        val before = connection.getTextBeforeCursor(MAX_REOPEN_CHARS, 0)?.toString() ?: return
+        val after = connection.getTextAfterCursor(MAX_REOPEN_CHARS, 0)?.toString() ?: return
+
+        var start = before.length
+        while (start > 0 && isWordCharacter(before[start - 1])) start--
+        var end = 0
+        while (end < after.length && isWordCharacter(after[end])) end++
+
+        // A run that reaches either end of the window may well continue past it, and reopening half
+        // of a word would offer replacements for something the user never typed.
+        if (start == 0 && before.length == MAX_REOPEN_CHARS) return
+        if (end == after.length && after.length == MAX_REOPEN_CHARS) return
+
+        val word = before.substring(start) + after.substring(0, end)
+        if (word.length !in MIN_REOPEN_LENGTH..MAX_REOPEN_LENGTH) return
+        if (word.none(Char::isLetter)) return
+
+        val regionStart = selectionStart - (before.length - start)
+        if (regionStart < 0) return
+
+        selfEdit = true
+        connection.setComposingRegion(regionStart, regionStart + word.length)
+        composing.setLength(0)
+        composing.append(word)
+        recomposed = true
+        composingAtEnd = end == 0
+        updateTypingSuggestions()
     }
 
     /** A word autocorrect changed, and what it changed from. */
@@ -1142,7 +1291,7 @@ class SlideInputMethodService :
 
     /** Applies sentence auto-capitalisation, unless caps lock is on or the user disabled it. */
     private fun updateShiftFromCursor() {
-        if (symbolsShown) return
+        if (layer != Layer.ALPHA) return
         if (shiftState() == ShiftState.LOCKED) return
         if (!settings.autoCapitalize) {
             setShift(ShiftState.OFF)
@@ -1241,5 +1390,22 @@ class SlideInputMethodService :
         const val MAX_WORD_DELETE_CHARS = 2048
         const val MAX_SEARCH_QUERY_LENGTH = 64
         const val MAX_SEARCH_RESULTS = 6
+
+        /** Text read either side of the cursor when reopening a word. */
+        const val MAX_REOPEN_CHARS = 48
+
+        /** Below this, a word has too many neighbours for the strip to be worth anything. */
+        const val MIN_REOPEN_LENGTH = 2
+
+        /** Above this it is not a word, and the suggester would refuse it anyway. */
+        const val MAX_REOPEN_LENGTH = 28
+
+        /** The key types that change the field, and so expect a selection update of their own. */
+        val EDITING_KEYS = setOf(
+            KeyType.CHARACTER,
+            KeyType.SPACE,
+            KeyType.DELETE,
+            KeyType.ENTER,
+        )
     }
 }

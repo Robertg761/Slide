@@ -19,6 +19,7 @@ object Layouts {
     private val shift = Key("⇧", KeyType.SHIFT, widthWeight = 1.5f, gestureEligible = false)
     private val delete = Key("⌫", KeyType.DELETE, widthWeight = 1.5f, repeatable = true, gestureEligible = false)
     private val toSymbols = Key("?123", KeyType.SYMBOLS, widthWeight = 1.5f, gestureEligible = false)
+    private val toSymbolsAlt = Key("=\\<", KeyType.SYMBOLS_ALT, widthWeight = 1.5f, gestureEligible = false)
     private val toAlpha = Key("ABC", KeyType.ALPHA, widthWeight = 1.5f, gestureEligible = false)
     private val enter = Key("⏎", KeyType.ENTER, widthWeight = 1.5f, gestureEligible = false)
     private val space = Key(" ", KeyType.SPACE, output = " ", widthWeight = 5f, gestureEligible = false)
@@ -103,17 +104,59 @@ object Layouts {
         languageTag = "en",
         rows = listOf(
             KeyRow("1234567890".map { sym(it.toString()) }),
-            KeyRow(listOf("@", "#", "$", "%", "&", "-", "+", "(", ")").map { sym(it) }, leadingGap = 0.5f, trailingGap = 0.5f),
             KeyRow(
-                listOf(Key("=\\<", KeyType.SYMBOLS, widthWeight = 1.5f, gestureEligible = false)) +
-                    listOf("*", "\"", "'", ":", ";", "!", "?").map { sym(it) } +
+                listOf(
+                    sym("@"), sym("#"), sym("$", "€£¥¢"), sym("%", "‰"), sym("&"),
+                    sym("-", "_–—~"), sym("+", "±"), sym("(", "[{<"), sym(")", "]}>"),
+                ),
+                leadingGap = 0.5f,
+                trailingGap = 0.5f,
+            ),
+            KeyRow(
+                listOf(toSymbolsAlt) +
+                    listOf(sym("*"), sym("\""), sym("'"), sym(":"), sym(";"), sym("!"), sym("?")) +
                     listOf(delete),
             ),
             KeyRow(listOf(toAlpha, emoji, space, period, enter)),
         ),
     )
 
-    private fun sym(s: String) = Key(s, KeyType.CHARACTER, gestureEligible = false)
+    /**
+     * Second symbols page (`=\<`), reached from the `=\<` key on [SymbolsEn].
+     *
+     * This is where the characters people go looking for and cannot find on the first page live:
+     * the slash, the equals sign, the brackets and the currency symbols.
+     */
+    val SymbolsAltEn = KeyboardLayout(
+        id = "symbols_alt_en",
+        label = "Symbols",
+        languageTag = "en",
+        rows = listOf(
+            KeyRow(
+                listOf(
+                    sym("~"), sym("`"), sym("|"), sym("•"), sym("√"),
+                    sym("π"), sym("÷"), sym("×"), sym("¶"), sym("∆"),
+                ),
+            ),
+            KeyRow(
+                listOf(
+                    sym("£"), sym("¢"), sym("€"), sym("¥"), sym("^"),
+                    sym("°"), sym("="), sym("{"), sym("}"),
+                ),
+                leadingGap = 0.5f,
+                trailingGap = 0.5f,
+            ),
+            KeyRow(
+                listOf(toSymbols) +
+                    listOf(sym("\\"), sym("/"), sym("<"), sym(">"), sym("["), sym("]"), sym("©", "®™")) +
+                    listOf(delete),
+            ),
+            KeyRow(listOf(toAlpha, emoji, space, period, enter)),
+        ),
+    )
+
+    private fun sym(s: String, alternates: String = "") =
+        Key(s, KeyType.CHARACTER, alternates = alternates.map(Char::toString), gestureEligible = false)
 
     /** Inserts the digit row at the top when the setting is enabled. */
     fun withNumberRow(layout: KeyboardLayout, enabled: Boolean): KeyboardLayout =

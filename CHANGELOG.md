@@ -1,5 +1,36 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- A second symbols page behind `=\<`, carrying the slash, equals sign, brackets, angle brackets,
+  pipe, caret, and currency symbols. The key previously asked for the page it was already on, so
+  nothing happened when it was pressed.
+- Tapping into a word that is already typed reopens it, so the suggestion strip offers replacements
+  for it. Fixing a wrong swipe or a missed correction no longer means deleting back to it.
+
+### Changed
+
+- Backspace deletes on touch-down instead of on release, and its auto-repeat reaches full speed in
+  about a third of the time it used to.
+- The navigation-bar strip below the keys is painted in the keyboard's own background colour, so
+  the keyboard meets the bottom of the screen without a black band and a visible seam.
+- Swipes are reconstructed from every touch sample Android batches into a move event rather than
+  only the newest, which gives the decoder the path the finger actually took on a fast swipe.
+- A swipe too short for the decoder to read now types the key it started on instead of committing
+  nothing.
+
+### Fixed
+
+- Updates: the downloader checks the HTTP status, the byte count, and the file's magic number, and
+  only moves a download into place once it is whole — a truncated APK used to be kept under its
+  final name and fail verification on every subsequent attempt. If the signing certificates cannot
+  be read out of the archive, the update is no longer refused as unreadable; Android enforces the
+  signature on install either way.
+- Updates: `getPackageArchiveInfo` and `getPackageInfo` no longer call API 33-only overloads on a
+  minSdk 26 app, which would have thrown `NoSuchMethodError` on Android 8 through 12.
+
 ## [0.2.0] - 2026-08-08
 
 ### Added
