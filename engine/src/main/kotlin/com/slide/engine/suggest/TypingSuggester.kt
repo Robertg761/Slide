@@ -215,6 +215,42 @@ class TypingSuggester(
     /** Correction candidates for the current call: lexicon index to its cheapest edit cost. */
     private val corrections = HashMap<Int, Float>()
 
+    /**
+     * Where each character of the current input was touched, as x,y pairs. Null when unknown.
+     *
+     * Held for the duration of one [suggest] call, alongside [contextIndex], rather than threaded
+     * through every private method that needs it.
+     */
+    private var touchPoints: FloatArray? = null
+
+    /** The keyboard the current call is measuring against, for turning pixels into key widths. */
+    private var touchKeys: GestureKeyMap? = null
+
+    /** The touch behind character [position], or null if the caller did not record one. */
+    private fun touchAt(position: Int): Pair<Float, Float>? {
+        val points = touchPoints ?: return null
+        val x = points[position * 2]
+        val y = points[position * 2 + 1]
+        // Not every character arrives from a key press: an alternate chosen from a long-press
+        // popup, or a letter restored by an undo, has no touch of its own.
+        if (x.isNaN() || y.isNaN()) return null
+        return x to y
+    }
+
+    /**
+     * How far a point is from a letter's key, in key widths and heights.
+     *
+     * Scaled per axis, so "one key away" is 1.0 whether the keys are square or tall, exactly as in
+     * the static neighbour table this stands in for.
+     */
+    private fun normalisedDistance(letter: Char, x: Float, y: Float): Float? {
+        val keys = touchKeys ?: return null
+        if (!keys.has(letter)) return null
+        val dx = (keys.centerX(letter) - x) / keys.keyWidth
+        val dy = (keys.centerY(letter) - y) / keys.keyHeight
+        return hypot(dx, dy)
+    }
+
     /** Whether the shipped dictionary already has this word, and so whether learning it is idle. */
     fun knows(word: String): Boolean = lexicon.indexOf(word.lowercase()) >= 0
 
@@ -222,12 +258,18 @@ class TypingSuggester(
      * @param previousWord the word immediately before the one being typed, if there is one and the
      *   cursor has not moved away from it. Supplying it is what lets the sentence break a tie that
      *   spelling and frequency cannot; omitting it costs accuracy but is never wrong.
+     * @param touchPoints where each character was actually touched, as x,y pairs in the same view
+     *   pixels as [keys], with NaN for characters that came from somewhere other than a key press.
+     *   Two floats per character of [typed]; anything else is ignored. Without it a mis-hit is
+     *   priced by how far apart two keys are, which is the same for every press of that key; with
+     *   it, by how close the finger came to the key it was reaching for.
      */
     fun suggest(
         typed: String,
         keys: GestureKeyMap,
         blockOffensive: Boolean = true,
         previousWord: String? = null,
+        touchPoints: FloatArray? = null,
     ): TypingSuggestions {
         if (typed.isEmpty() || typed.length > config.maxWordLength) return TypingSuggestions.None
         val lower = typed.lowercase()
@@ -236,6 +278,10 @@ class TypingSuggester(
         ensureNeighbours(keys)
         corrections.clear()
         contextIndex = contextIndexFor(previousWord)
+        // A short array would read past its end on the last character, and a stale one would price
+        // this word by where the last one was typed. Either is worse than not knowing.
+        this.touchPoints = touchPoints?.takeIf { it.size >= typed.length * 2 }
+        this.touchKeys = keys
 
         // Whether the dictionary knows the word and whether we are willing to show it are separate
         // questions. A blocked word is still a word, and correcting a deliberately typed obscenity
@@ -300,10 +346,28 @@ class TypingSuggester(
             val letter = lower[position]
             val slot = letter - 'a'
             if (slot !in 0 until ALPHABET) continue
-            val letters = neighbourLetters[slot] ?: continue
-            val distances = neighbourDistance[slot]!!
 
             lower.toCharArray(buffer)
+
+            // Where the finger actually landed, when the caller knows. A touch that caught the
+            // right-hand edge of "s" is far better evidence for "d" than the fact that d is next
+            // to s, which is equally true of every "s" ever typed.
+            val touch = touchAt(position)
+            if (touch != null) {
+                val (x, y) = touch
+                for (i in 0 until ALPHABET) {
+                    if (i == slot) continue
+                    val candidate = 'a' + i
+                    val distance = normalisedDistance(candidate, x, y) ?: continue
+                    if (distance > config.neighbourRadius) continue
+                    buffer[position] = candidate
+                    offerCorrection(length, config.substitutionCost * distance, blockOffensive)
+                }
+                continue
+            }
+
+            val letters = neighbourLetters[slot] ?: continue
+            val distances = neighbourDistance[slot]!!
             for (i in letters.indices) {
                 buffer[position] = letters[i]
                 offerCorrection(length, config.substitutionCost * distances[i], blockOffensive)

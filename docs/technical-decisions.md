@@ -81,7 +81,18 @@ this size is mostly gaps. Measured on held-out sentences, it takes autocorrect f
 of single-edit typos while slightly *reducing* wrong corrections, since the cases it resolves are
 exactly the ambiguous ones that a wrong correction used to come from.
 
-Adaptive personal n-grams accumulate locally on top; not built yet.
+Adaptive personal n-grams accumulate locally on top; the personal dictionary learns words, not yet
+the pairs they appear in.
+
+**The touch model**: corrections are priced by where the finger actually landed rather than by
+which keys are adjacent. The static version — cost proportional to the distance between two key
+centres — says the same thing about every press of a key, when the interesting question is how
+close *this* press came to the key next door. Measured against simulated typing in which the
+pressed key falls out of the sampled touch position, so mis-hits arise from geometry rather than
+from a hand-written list, this corrects several points more of them and slightly fewer wrongly, at
+every level of sloppiness. The magnitude should not be quoted as fact: real fingers are not
+isotropic Gaussians and carry a systematic bias this simulation has none of. Settling it needs
+touch logs from a device, which Slide does not collect.
 
 **Do not** copy anything from Gboard itself — no dictionaries, no assets, no code.
 

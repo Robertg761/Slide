@@ -139,6 +139,15 @@ class SlideInputMethodService :
      */
     private val composing = StringBuilder()
 
+    /**
+     * Where each character of [composing] was touched, as x,y pairs, or NaN where unknown.
+     *
+     * Kept in step with [composing] rather than derived from it, because it cannot be derived: the
+     * same letter typed twice has two different touches, and that difference is the whole value.
+     * Preallocated, so tracking it costs no allocation on the keypress path.
+     */
+    private val composingTouches = FloatArray(MAX_TRACKED_TOUCHES * 2) { Float.NaN }
+
     /** What a separator would turn [composing] into, or null to leave it as typed. */
     private var pendingAutocorrection: String? = null
 
@@ -479,7 +488,7 @@ class SlideInputMethodService :
         performSound(key)
     }
 
-    override fun onKeyCommit(key: Key, text: String) {
+    override fun onKeyCommit(key: Key, text: String, touchX: Float, touchY: Float) {
         if (keyboardView?.searchMode == true) {
             handleSearchKey(key, text)
             return
@@ -509,7 +518,7 @@ class SlideInputMethodService :
             KeyType.MIC -> onVoiceRequested()
             KeyType.EMOJI -> showEmojiPanel()
             KeyType.GLOBE, KeyType.SETTINGS -> Unit
-            KeyType.CHARACTER -> handleCharacter(connection, text)
+            KeyType.CHARACTER -> handleCharacter(connection, text, touchX, touchY)
         }
     }
 
@@ -970,13 +979,19 @@ class SlideInputMethodService :
 
     // region Input handling
 
-    private fun handleCharacter(connection: InputConnection, text: String) {
+    private fun handleCharacter(
+        connection: InputConnection,
+        text: String,
+        touchX: Float = Float.NaN,
+        touchY: Float = Float.NaN,
+    ) {
         // Typing with the cursor parked in the middle of a reopened word: the region can only grow
         // at its end, so settling it first is the only way the letter lands where the user is
         // looking.
         if (composing.isNotEmpty() && !composingAtEnd) abandonComposing()
 
         if (isWordCharacter(text) && suggestionsAvailable()) {
+            recordTouch(composing.length, touchX, touchY)
             composing.append(text)
             connection.setComposingText(composing, 1)
             updateTypingSuggestions()
@@ -989,6 +1004,30 @@ class SlideInputMethodService :
 
         if (shiftState() == ShiftState.SHIFTED) setShift(ShiftState.OFF)
         updateShiftFromCursor()
+    }
+
+    /**
+     * Notes where a character was touched, so the corrector can price a mis-hit by how close the
+     * finger came rather than by how far apart two keys are.
+     *
+     * Anything past the tracked length is simply not recorded: the corrector refuses words that
+     * long anyway, and a bounds check here is cheaper than growing an array on the keypress path.
+     */
+    private fun recordTouch(position: Int, x: Float, y: Float) {
+        if (position !in 0 until MAX_TRACKED_TOUCHES) return
+        composingTouches[position * 2] = x
+        composingTouches[position * 2 + 1] = y
+    }
+
+    /**
+     * Forgets the recorded touches.
+     *
+     * Called wherever [composing] is emptied or replaced by something that was not typed just now.
+     * A stale touch is worse than no touch: it would price this word by where the last one was
+     * typed, which is a confident answer drawn from the wrong evidence.
+     */
+    private fun clearTouches() {
+        composingTouches.fill(Float.NaN)
     }
 
     /** Letters and the apostrophe build a word; everything else ends one. */
@@ -1037,6 +1076,7 @@ class SlideInputMethodService :
         // so the suggestions keep up with what is actually in front of the cursor.
         if (composing.isNotEmpty()) {
             composing.setLength(composing.length - 1)
+            recordTouch(composing.length, Float.NaN, Float.NaN)
             if (composing.isEmpty()) {
                 // The empty string has to be committed before the region is finished. On its own,
                 // finishComposingText() settles what is there rather than removing it, which would
@@ -1135,6 +1175,7 @@ class SlideInputMethodService :
             keys = keys,
             blockOffensive = settings.blockOffensiveWords,
             previousWord = precedingWord(),
+            touchPoints = composingTouches,
         )
         pendingAutocorrection = result.autocorrection
             .takeIf { settings.autocorrectEnabled && !recomposed }
@@ -1216,6 +1257,7 @@ class SlideInputMethodService :
 
         connection.finishComposingText()
         composing.setLength(0)
+        clearTouches()
         pendingAutocorrection = null
         recomposed = false
         composingAtEnd = true
@@ -1230,6 +1272,7 @@ class SlideInputMethodService :
     private fun abandonComposing() {
         val wasComposing = composing.isNotEmpty()
         composing.setLength(0)
+        clearTouches()
         pendingAutocorrection = null
         lastAutocorrect = null
         recomposed = false
@@ -1323,6 +1366,7 @@ class SlideInputMethodService :
         connection.endBatchEdit()
 
         composing.setLength(0)
+        clearTouches()
         pendingAutocorrection = null
         lastAutocorrect = null
         recomposed = false
@@ -1417,6 +1461,7 @@ class SlideInputMethodService :
         selfEdit = true
         connection.setComposingRegion(regionStart, regionStart + word.length)
         composing.setLength(0)
+        clearTouches()
         composing.append(word)
         recomposed = true
         composingAtEnd = end == 0
@@ -1540,6 +1585,14 @@ class SlideInputMethodService :
         const val MAX_WORD_DELETE_CHARS = 2048
         const val MAX_SEARCH_QUERY_LENGTH = 64
         const val MAX_SEARCH_RESULTS = 6
+
+        /**
+         * Characters whose touch positions are tracked.
+         *
+         * Comfortably past the longest word the corrector will look at, so the bound is never the
+         * thing that stops a word being priced by where the finger landed.
+         */
+        const val MAX_TRACKED_TOUCHES = 48
 
         /** Text read either side of the cursor when reopening a word. */
         const val MAX_REOPEN_CHARS = 48

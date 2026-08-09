@@ -4,6 +4,11 @@
 
 ### Added
 
+- Corrections use where your finger actually landed, not just which key it registered. A touch
+  that caught the right-hand edge of "s" is strong evidence for "d"; that d is next to s is equally
+  true of every "s" ever typed. On simulated typing where mis-hits emerge from the geometry rather
+  than being written in, this corrects 5.7 more points of them at ordinary accuracy and slightly
+  fewer wrongly. Words typed accurately are untouched.
 - Slide learns your words. A word committed deliberately twice — or rescued once from an
   autocorrect, which is the clearest signal a keyboard ever gets — stops being corrected away, and
   starts being offered as a completion. This is the gap that made a keyboard feel like it was

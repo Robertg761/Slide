@@ -46,8 +46,16 @@ class KeyboardView @JvmOverloads constructor(
         /** Fired the moment a key is touched — drives haptics and sound, not text. */
         fun onKeyDown(key: Key)
 
-        /** Fired when a key press resolves into input. */
-        fun onKeyCommit(key: Key, text: String)
+        /**
+         * Fired when a key press resolves into input.
+         *
+         * [touchX] and [touchY] are where the finger first landed, in this view's pixels, or NaN
+         * when the input did not come from a key press the user aimed — an auto-repeat, or a
+         * character chosen from a long-press popup. The corrector uses it to price a mis-hit by
+         * how close the finger came to the key it was reaching for, rather than by how far apart
+         * two keys happen to be.
+         */
+        fun onKeyCommit(key: Key, text: String, touchX: Float = Float.NaN, touchY: Float = Float.NaN)
 
         /** Fired when a swipe completes. The decoder consumes this; see docs/technical-decisions.md. */
         fun onGestureComplete(points: List<GesturePoint>)
@@ -772,7 +780,12 @@ class KeyboardView @JvmOverloads constructor(
         // second time on release.
         if (!pointer.longPressFired && !pointer.repeatFired && !pointer.committedOnDown) {
             announceForAccessibility(accessibilityLabel(pointer.placed.key))
-            listener?.onKeyCommit(pointer.placed.key, outputFor(pointer.placed.key))
+            listener?.onKeyCommit(
+                pointer.placed.key,
+                outputFor(pointer.placed.key),
+                pointer.downX,
+                pointer.downY,
+            )
         }
         invalidate()
     }
@@ -888,7 +901,12 @@ class KeyboardView @JvmOverloads constructor(
         if (decodable) {
             listener?.onGestureComplete(points)
         } else {
-            listener?.onKeyCommit(pointer.placed.key, outputFor(pointer.placed.key))
+            listener?.onKeyCommit(
+                pointer.placed.key,
+                outputFor(pointer.placed.key),
+                pointer.downX,
+                pointer.downY,
+            )
         }
     }
 
