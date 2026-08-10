@@ -40,11 +40,11 @@ jobs:
             echo "Pinned Android SDK manager was not found at $sdkmanager" >&2
             exit 1
           }
-          yes | "$sdkmanager" \
+          "$sdkmanager" --install \
             "platforms;android-37.0" \
             "build-tools;36.0.0" \
             "ndk;28.2.13676358" \
-            "cmake;3.22.1" >/dev/null
+            "cmake;3.22.1" </dev/null >/dev/null
 
       - name: Fetch and verify the pinned speech model
         run: bash tools/fetch_model.sh base.en-q5_1

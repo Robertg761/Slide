@@ -45,11 +45,11 @@ jobs:
             echo "Pinned Android SDK manager was not found at $sdkmanager" >&2
             exit 1
           }
-          yes | "$sdkmanager" \
+          "$sdkmanager" --install \
             "platforms;android-37.0" \
             "build-tools;36.0.0" \
             "ndk;28.2.13676358" \
-            "cmake;3.22.1" >/dev/null
+            "cmake;3.22.1" </dev/null >/dev/null
 
       - name: Validate immutable release metadata
         id: metadata
@@ -195,7 +195,7 @@ jobs:
             echo "Pinned Android SDK manager was not found at $sdkmanager" >&2
             exit 1
           }
-          yes | "$sdkmanager" "build-tools;36.0.0" >/dev/null
+          "$sdkmanager" --install "build-tools;36.0.0" </dev/null >/dev/null
 
       - name: Sign without checking out or executing repository code
         env:
