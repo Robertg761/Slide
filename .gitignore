@@ -18,9 +18,12 @@ __pycache__/
 *.bin
 *.gguf
 *.ggml
+*.pte
+third_party/executorch/*.aar
 
 # ...but the lexicon and the bigram model are small generated assets the build depends on, and
 # there is no way to rebuild them at install time, so they ship.
 !engine/src/main/assets/lexicon_en.bin
 !engine/src/main/assets/bigrams_en.bin
+!engine/src/main/assets/trigrams_en.bin
 !core/src/main/assets/emoji.bin

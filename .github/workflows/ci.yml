@@ -49,6 +49,12 @@ jobs:
       - name: Fetch and verify the pinned speech model
         run: bash tools/fetch_model.sh base.en-q5_1
 
+      - name: Prepare the pinned on-device inference runtime
+        run: bash tools/fetch_executorch.sh
+
+      - name: Fetch and verify the pinned swipe models
+        run: bash tools/fetch_swipe_models.sh
+
       - name: Verify monotonic release version history
         shell: bash
         run: |

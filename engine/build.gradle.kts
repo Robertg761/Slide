@@ -8,6 +8,7 @@ android {
 
     defaultConfig {
         minSdk = 26
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     compileOptions {
@@ -15,10 +16,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    // The lexicon and the bigram model are already tightly packed; letting the build recompress
-    // them would only cost startup time, since both are read straight out of the APK.
+    // The models are already tightly packed; letting the build recompress them only costs startup
+    // time, since they are copied out of the APK for memory-mapped inference.
     androidResources {
-        noCompress += "bin"
+        noCompress += listOf("bin", "pte")
     }
 
     testOptions {
@@ -29,6 +30,9 @@ android {
         unitTests.all {
             it.inputs.dir(layout.projectDirectory.dir("src/main/assets"))
             it.inputs.dir(layout.projectDirectory.dir("src/test/resources"))
+            listOf("slide.realSwipeDataset", "slide.realSwipeLimit").forEach { property ->
+                System.getProperty(property)?.let { value -> it.systemProperty(property, value) }
+            }
         }
 
         // The learned-words store logs when it finds a file it cannot read, and that path is
@@ -41,5 +45,10 @@ android {
 dependencies {
     api(project(":core"))
     implementation(libs.androidx.core.ktx)
+    implementation(files(rootProject.layout.projectDirectory.file("third_party/executorch/executorch-android-1.2.0-slide.aar")))
+    runtimeOnly(libs.fbjni)
+    runtimeOnly(libs.nativeloader)
     testImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.junit)
+    androidTestImplementation(libs.androidx.test.runner)
 }

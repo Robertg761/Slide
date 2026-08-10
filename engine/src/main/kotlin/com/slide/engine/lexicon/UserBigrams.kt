@@ -57,6 +57,23 @@ class UserBigrams(
         if (size > capacity) trim()
     }
 
+    /** Removes one observation after the user explicitly replaces a committed suggestion. */
+    fun unlearn(previous: String, next: String) {
+        val previousKey = previous.lowercase()
+        val nextKey = next.lowercase()
+        val successors = pairs[previousKey] ?: return
+        val existing = successors[nextKey] ?: return
+        if (existing.count <= 1) {
+            successors.remove(nextKey)
+        } else {
+            successors[nextKey] = existing.copy(count = existing.count - 1)
+        }
+        if (successors.isEmpty()) {
+            pairs.remove(previousKey, successors)
+            contextSurfaces.remove(previousKey)
+        }
+    }
+
     /** What this person has written after [previous], with counts. Empty when nothing is known. */
     fun successorsOf(previous: String): Map<String, Int> =
         pairs[previous.lowercase()]?.values?.associate { it.surface.value to it.count } ?: emptyMap()

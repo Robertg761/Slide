@@ -1,0 +1,44 @@
+--- a/org/pytorch/executorch/Tensor.java
++++ b/org/pytorch/executorch/Tensor.java
+@@ -169,0 +170,13 @@
++  /** Creates the boolean tensor required by models with masked layout inputs. */
++  public static Tensor fromBlob(boolean[] data, long[] shape) {
++    checkArgument(data != null, ERROR_MSG_DATA_ARRAY_NOT_NULL);
++    checkArgument(shape != null, ERROR_MSG_SHAPE_NOT_NULL);
++    checkShape(shape);
++    checkShapeAndDataCapacityConsistency(data.length, shape);
++    final ByteBuffer byteBuffer = allocateByteBuffer((int) numel(shape));
++    for (boolean value : data) {
++      byteBuffer.put((byte) (value ? 1 : 0));
++    }
++    return new Tensor_bool(byteBuffer, shape);
++  }
++
+@@ -580,0 +594,24 @@
++  static class Tensor_bool extends Tensor {
++    private final ByteBuffer data;
++
++    private Tensor_bool(ByteBuffer data, long[] shape) {
++      super(shape);
++      this.data = data;
++    }
++
++    @Override
++    public DType dtype() {
++      return DType.BOOL;
++    }
++
++    @Override
++    Buffer getRawDataBuffer() {
++      return data;
++    }
++
++    @Override
++    public String toString() {
++      return String.format("Tensor(%s, dtype=torch.bool)", Arrays.toString(shape));
++    }
++  }
++
+@@ -910,0 +949,2 @@
++    } else if (DType.BOOL.jniCode == dtype) {
++      tensor = new Tensor_bool(data, shape);

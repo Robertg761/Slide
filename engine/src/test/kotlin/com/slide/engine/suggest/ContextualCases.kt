@@ -17,6 +17,7 @@ object ContextualCases {
         val typo: String,
         val intended: String,
         val previous: String,
+        val older: String?,
         val kind: TypoCorpus.Kind,
     )
 
@@ -53,7 +54,7 @@ object ContextualCases {
                 // A typo that is itself a word is protected by a different rule entirely.
                 if (lexicon.contains(typo)) continue
 
-                out += Case(typo, word, previous, kindFor(n))
+                out += Case(typo, word, previous, tokens.getOrNull(at - 2), kindFor(n))
                 break
             }
         }

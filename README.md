@@ -24,9 +24,8 @@ always enforces the installed app's signing identity.
 
 Typing, themes, and gesture decoding were verified on a Galaxy S24 Ultra (Android 16). The native
 Base Whisper model also loaded and transcribed an 11-second fixture on that phone in a prior
-benchmark (about 100 ms load and 1.7 seconds decode). The final 0.2.1 app packaging and complete
-microphone-to-editor flow have not been installed or rerun on hardware in this release-hardening
-pass.
+benchmark (about 100 ms load and 1.7 seconds decode). The 0.3.0 app packaging, neural swipe model,
+and complete microphone-to-editor flow have not yet been rerun on physical hardware.
 
 **Working**
 - QWERTY typing with multi-touch rollover and slide-off correction
@@ -38,10 +37,10 @@ pass.
 - Key preview popups, key borders, number row, haptics, keypress sound
 - Password, email, URL, no-suggestions, and incognito field policy, with a manual no-learning mode
 - A personal dictionary that learns the words and phrases you use and stops correcting them away
-- Next-word prediction in the strip, from the corpus and from your own repeated phrases
-- **Gesture typing** — SHARK²-derived decoder over a 160k-word lexicon, 95.8% top-1 and 100%
-  top-5 on the isolated test corpus at 0.21 ms mean decode. In a sentence, where the bigram model
-  can break ties the path cannot, 96.8% top-1 against 93.8% without it
+- Next-word prediction in the strip, using one- and two-word corpus context plus repeated phrases
+- **Gesture typing** — an offline neural spatial model with Slide's trie-constrained beam search,
+  a deterministic SHARK²-style fallback, live candidates while sliding, and correction-aware
+  local phrase learning
 - Suggestion strip showing the decoder's top three candidates, one tap to correct a miss
 - Offensive-word filtering for suggestions (on by default, as in Gboard)
 
@@ -51,11 +50,12 @@ pass.
   in place. A release-device run of the real microphone-to-editor flow is still outstanding.
 - **Autocorrect and typed-word suggestions.** The word being typed is held as composing text, so
   a correction replaces a region the editor owns rather than a character count the keyboard
-  guessed at. Corrections are generated as single edits over a key-proximity model — transposition,
-  neighbouring-key substitution, doubled and dropped letters, missing apostrophes — and ranked
-  against completions of the same prefix. Backspace immediately after a correction puts back
-  exactly what was typed. 0.031 ms per keystroke, and both the strip and autocorrection have
-  their own settings switches.
+  guessed at. A fast single-edit path handles ordinary slips; a trie-pruned weighted sequence
+  decoder recovers bounded two-edit words. Both use actual touch positions, one- and two-word
+  context, and a device-local per-key spatial model learned only from confirmed text. Candidates
+  are ranked against completions of the same prefix. Backspace immediately after a correction
+  puts back exactly what was typed. The single-edit path measures 0.031 ms and the gated two-edit
+  fallback 2.35 ms on the JVM benchmark; the strip and autocorrection have separate switches.
 
   Most of the work here is in refusing to correct: a word already in the dictionary is never
   rewritten (checked against ~4,300 sampled real words), nor is a fragment that a common word
@@ -99,9 +99,20 @@ low-memory kill can stop dictation without taking the keyboard down in every app
 
 ## Assets
 
-Only the speech model is missing from a fresh clone; the lexicon and emoji catalogue are committed.
-The build fetches that model once, verifies an immutable source revision and SHA-256, and packages
-it in the APK. The installed app never downloads model weights.
+The speech and neural swipe weights are missing from a fresh clone; generated language assets are
+committed. The build fetches weights once from immutable revisions, verifies SHA-256, and packages
+them in the APK. The installed app never downloads model weights.
+
+**Swipe models** (gitignored):
+
+```bash
+tools/fetch_executorch.sh
+tools/fetch_swipe_models.sh
+```
+
+The model terms are packaged with the app and gesture typing is visibly attributed to FUTO Swipe
+in settings. Slide's trie beam search, context integration, fallback, and input handling are its
+own Apache-2.0 implementation.
 
 **Speech model** (gitignored, 59,721,011 bytes):
 
@@ -134,10 +145,10 @@ python3 tools/build_lexicon.py /tmp/aosp_en.txt engine/src/main/assets/lexicon_e
 ./gradlew :engine:testDebugUnitTest
 ```
 
-**The bigram model** is what lets autocorrect read the sentence rather than guess from spelling —
-"at ocne" reaches "once" because the corpus knows what follows "at". It is generated from
-Tatoeba's English sentence export and committed alongside the lexicon, which it is keyed against
-by index, so it must be rebuilt whenever the lexicon is:
+**The context models** let autocorrect read the sentence rather than guess from spelling —
+"at ocne" reaches "once" because the corpus knows what follows "at". They are generated from
+Tatoeba's English sentence export and committed alongside the lexicon, which they are keyed
+against by index, so they must be rebuilt whenever the lexicon is:
 
 ```bash
 curl -sL -o /tmp/tatoeba.tsv.bz2 https://downloads.tatoeba.org/exports/per_language/eng/eng_sentences.tsv.bz2
@@ -145,7 +156,8 @@ bunzip2 -kf /tmp/tatoeba.tsv.bz2
 python3 tools/build_bigrams.py /tmp/tatoeba.tsv \
     engine/src/main/assets/lexicon_en.bin \
     engine/src/main/assets/bigrams_en.bin \
-    engine/src/test/resources/heldout_en.txt
+    engine/src/test/resources/heldout_en.txt \
+    engine/src/main/assets/trigrams_en.bin
 ./gradlew :engine:testDebugUnitTest
 ```
 
@@ -219,8 +231,8 @@ name back at you, and the phrases you repeat, so it can offer them. Those live i
 you can read or delete, and are excluded from cloud backup and device transfer alike —
 the words a person uses that most people do not are the most revealing thing here, and they should
 not leave the phone just because the phone was backed up. Hold a word in the suggestion strip to
-teach it or to take it back, or use **Clear learned data** in settings to remove all learned words
-and phrases from both the running keyboard and storage.
+teach it or to take it back, or use **Clear learned data** in settings to remove learned words,
+phrases, and per-key touch calibration from both the running keyboard and storage.
 Recent emoji usage is stored under Android's no-backup directory and is not included in cloud
 backup or device transfer.
 
@@ -230,8 +242,8 @@ Slide's own source code and documentation are licensed under the
 [Apache License 2.0](LICENSE). This permissive licence includes an explicit patent grant.
 
 Slide clones Gboard's *functionality*, not its implementation. No Gboard code, binaries,
-dictionaries, or assets are used. Dictionaries come from the Apache-2.0 AOSP wordlists; the bigram
-model is derived from [Tatoeba](https://tatoeba.org) sentence data, used and redistributed under
+dictionaries, or assets are used. Dictionaries come from the Apache-2.0 AOSP wordlists; context
+models are derived from [Tatoeba](https://tatoeba.org) sentence data, used and redistributed under
 CC BY 2.0 FR; emoji data and search keywords come from Unicode and CLDR under the Unicode licence;
 Whisper weights and `whisper.cpp` are MIT. Emoji are drawn with the system font, so no glyphs are
 redistributed. The packaged terms and notices, including attribution and licence links, are

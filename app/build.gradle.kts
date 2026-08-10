@@ -11,8 +11,8 @@ android {
         applicationId = "com.slide"
         minSdk = 26
         targetSdk = 36
-        versionCode = 8
-        versionName = "0.2.1"
+        versionCode = 9
+        versionName = "0.3.0"
     }
 
     buildTypes {
@@ -27,9 +27,10 @@ android {
     }
 
     androidResources {
-        // Library noCompress declarations do not propagate into the final application APK. Whisper
-        // maps this asset directly, so the application must make the packaging rule itself.
-        noCompress += "bin"
+        // Library noCompress declarations do not propagate into the final application APK.
+        // Whisper maps its model directly, while swipe inference copies already-packed models to
+        // mmap-friendly storage; the application therefore owns both packaging rules.
+        noCompress += listOf("bin", "pte")
     }
 
     compileOptions {

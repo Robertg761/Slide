@@ -1,8 +1,10 @@
 package com.slide.engine.suggest
 
 import com.slide.engine.gesture.GestureKeyMap
+import com.slide.engine.gesture.SwipeLexiconTrie
 import com.slide.engine.lexicon.Bigrams
 import com.slide.engine.lexicon.Lexicon
+import com.slide.engine.lexicon.Trigrams
 import com.slide.engine.lexicon.UserBigrams
 import com.slide.engine.lexicon.UserDictionary
 import kotlin.math.hypot
@@ -125,6 +127,17 @@ data class SuggesterConfig(
 
     /** A correction costing more than this is too speculative to apply without being asked. */
     val maxAutocorrectCost: Float = 0.8f,
+    /** Two-edit candidates are considered only after the fast one-edit search finds nothing. */
+    val minMultiEditLength: Int = 4,
+    /** Maximum unscaled weighted cost admitted by the bounded second-stage decoder. */
+    val maxMultiEditCost: Float = 1.25f,
+    /**
+     * Sequence costs are discounted because a two-slip non-word has much stronger evidence of
+     * being finished than an ordinary completion. The raw threshold above still bounds reach.
+     */
+    val multiEditScoreScale: Float = 0.55f,
+    /** A second-stage candidate already survived a stronger no-one-edit and distance-two gate. */
+    val multiEditAutocorrectMargin: Float = 0.035f,
     /** Never autocorrect into a word the user is unlikely to have wanted. */
     val minAutocorrectFrequency: Int = 40,
     /**
@@ -178,6 +191,8 @@ data class SuggesterConfig(
      * somewhere other than Tatoeba, not against a larger sweep of the same.
      */
     val contextWeight: Float = 0.6f,
+    /** Extra evidence available only when both preceding words match a retained corpus context. */
+    val trigramContextWeight: Float = 0.75f,
 
     /**
      * Weight on how well a candidate follows the preceding word *for this person specifically*.
@@ -202,11 +217,10 @@ data class SuggesterConfig(
 /**
  * Suggests words for text typed on the keys, and decides when to autocorrect.
  *
- * Corrections are found by generating the spellings one edit away from what was typed and looking
- * each up, rather than by scanning the dictionary for near matches. For an eight-letter word that
- * is a few hundred binary searches over a sorted array — microseconds — where a scan would be
- * millions of comparisons on every keystroke. The cost is that two-edit typos are not corrected;
- * they still get a strip full of completions, and are far rarer than single slips.
+ * The common path generates spellings one edit away and looks each up directly. If that finds no
+ * word, a second stage evaluates only lexicon length buckets within two edits using a weighted
+ * Damerau-Levenshtein decoder. Ordinary keypresses therefore keep the microsecond path while
+ * mangled words such as a missed letter plus a neighbouring mis-hit still have a route home.
  *
  * The keyboard geometry comes in as a [GestureKeyMap]: it is the gesture decoder's type by history,
  * but what it actually describes is where the letters are, which is exactly what a touch model for
@@ -217,10 +231,16 @@ class TypingSuggester(
     private val config: SuggesterConfig = SuggesterConfig(),
     /** Null when the asset is missing, which reduces this to spelling-only correction. */
     private val bigrams: Bigrams? = null,
+    /** Two-word context, layered on the broad-coverage bigram rather than replacing it. */
+    private val trigrams: Trigrams? = null,
     /** The words this person uses that the shipped dictionary does not have. */
     private val userDictionary: UserDictionary? = null,
     /** The word pairs this person writes, as opposed to the ones English writes on average. */
     private val userBigrams: UserBigrams? = null,
+    /** Where this person's taps tend to land, retained only on this device. */
+    private val spatialModel: SpatialTouchModel? = null,
+    /** Shared with neural swipe decoding so the lexicon's compact prefix index is built once. */
+    private val trie: SwipeLexiconTrie = SwipeLexiconTrie(lexicon),
 ) {
 
     /**
@@ -237,6 +257,7 @@ class TypingSuggester(
 
     /** Lexicon index of the word before the one being typed, or -1. Set per [suggest] call. */
     private var contextIndex = -1
+    private var olderContextIndex = -1
 
     /** Reusable buffer for generated spellings, one longer than the input to fit an insertion. */
     private var buffer = CharArray(config.maxWordLength + 1)
@@ -248,6 +269,16 @@ class TypingSuggester(
 
     /** Correction candidates for the current call: lexicon index to its cheapest edit cost. */
     private val corrections = HashMap<Int, Float>()
+    private val multiEditIndices = HashSet<Int>()
+
+    /** Reused rows for the bounded second-stage decoder; no per-candidate arrays are allocated. */
+    private val unitRows = Array(3) { IntArray(config.maxWordLength + 3) }
+    private val weightedRows = Array(3) { FloatArray(config.maxWordLength + 3) }
+
+    /** One edit-distance row per trie depth for allocation-free prefix pruning. */
+    private val trieUnitRows = Array(config.maxWordLength + MAX_MULTI_EDITS + 2) {
+        IntArray(config.maxWordLength + 1)
+    }
 
     /**
      * Where each character of the current input was touched, as x,y pairs. Null when unknown.
@@ -279,6 +310,7 @@ class TypingSuggester(
      */
     private fun normalisedDistance(letter: Char, x: Float, y: Float): Float? {
         val keys = touchKeys ?: return null
+        spatialModel?.distance(letter, x, y, keys)?.let { return it }
         if (!keys.has(letter)) return null
         val dx = (keys.centerX(letter) - x) / keys.keyWidth
         val dy = (keys.centerY(letter) - y) / keys.keyHeight
@@ -301,6 +333,7 @@ class TypingSuggester(
      */
     fun predict(
         previousWord: String?,
+        previousPreviousWord: String? = null,
         blockOffensive: Boolean = true,
         limit: Int = config.maxResults,
     ): List<String> {
@@ -324,6 +357,18 @@ class TypingSuggester(
 
         val model = bigrams
         val context = contextIndexFor(previousWord)
+        val olderContext = contextIndexFor(previousPreviousWord)
+        val longerModel = trigrams
+        if (longerModel != null && olderContext >= 0 && context >= 0) {
+            for (index in longerModel.topSuccessors(olderContext, context, limit * 2)) {
+                if (blockOffensive && lexicon.isOffensive(index)) continue
+                val word = lexicon.wordAt(index)
+                val key = lexicon.lowercaseAt(index)
+                if (ranked.containsKey(key)) continue
+                ranked[key] = word to (TRIGRAM_PREDICTION_FLOOR +
+                    longerModel.score(olderContext, context, index))
+            }
+        }
         if (model != null && context >= 0) {
             for (index in model.topSuccessors(context, limit * 2)) {
                 if (blockOffensive && lexicon.isOffensive(index)) continue
@@ -355,6 +400,7 @@ class TypingSuggester(
         keys: GestureKeyMap,
         blockOffensive: Boolean = true,
         previousWord: String? = null,
+        previousPreviousWord: String? = null,
         touchPoints: FloatArray? = null,
     ): TypingSuggestions {
         if (typed.isEmpty() || typed.length > config.maxWordLength) return TypingSuggestions.None
@@ -363,7 +409,9 @@ class TypingSuggester(
 
         ensureNeighbours(keys)
         corrections.clear()
+        multiEditIndices.clear()
         contextIndex = contextIndexFor(previousWord)
+        olderContextIndex = contextIndexFor(previousPreviousWord)
         buildPersonalContext(previousWord)
         // A short array would read past its end on the last character, and a stale one would price
         // this word by where the last one was typed. Either is worse than not knowing.
@@ -379,6 +427,13 @@ class TypingSuggester(
         val completions = collectCompletions(lower, blockOffensive)
         if (lower.length >= config.minCorrectionLength) collectCorrections(lower, blockOffensive)
         collectUnambiguousContraction(lower, blockOffensive)
+        if (
+            exact < 0 &&
+            corrections.isEmpty() &&
+            lower.length >= config.minMultiEditLength
+        ) {
+            collectMultiEditCorrections(lower, blockOffensive)
+        }
 
         val ranked = rank(shown, completions, properNounsUnmarked = typed.none(Char::isUpperCase))
 
@@ -523,6 +578,168 @@ class TypingSuggester(
         if (existing == null || cost < existing) corrections[index] = cost
     }
 
+    /**
+     * Searches two-edit words only when the generated one-edit path has no dictionary candidate.
+     *
+     * Bucketing by target length cuts the 160k lexicon to the only words an edit distance of two
+     * can reach. A unit-cost row enforces that hard bound; the parallel weighted row ranks the
+     * survivors by touch geometry and mechanical-slip costs.
+     */
+    private fun collectMultiEditCorrections(lower: String, blockOffensive: Boolean) {
+        val root = trieUnitRows[0]
+        for (position in 0..lower.length) root[position] = position
+
+        fun visit(parent: Int, depth: Int, previousTarget: Char) {
+            var node = trie.firstChild(parent)
+            while (node >= 0) {
+                val target = 'a' + trie.lastLetter(node)
+                val previous = trieUnitRows[depth - 1]
+                val current = trieUnitRows[depth]
+                current[0] = depth
+                var rowMinimum = current[0]
+                for (position in 1..lower.length) {
+                    val source = lower[position - 1]
+                    current[position] = minOf(
+                        previous[position] + 1,
+                        current[position - 1] + 1,
+                        previous[position - 1] + if (source == target) 0 else 1,
+                    )
+                    if (
+                        depth > 1 && position > 1 &&
+                        source == previousTarget && lower[position - 2] == target
+                    ) {
+                        current[position] = minOf(
+                            current[position],
+                            trieUnitRows[depth - 2][position - 2] + 1,
+                        )
+                    }
+                    rowMinimum = minOf(rowMinimum, current[position])
+                }
+
+                if (current[lower.length] <= MAX_MULTI_EDITS) {
+                    trie.forEachTerminal(node) { index ->
+                        if (blockOffensive && lexicon.isOffensive(index)) return@forEachTerminal
+                        if (isStrictCompletion(index, lower)) return@forEachTerminal
+                        val result = editDistance(lower, index)
+                        if (result.edits !in 1..MAX_MULTI_EDITS) return@forEachTerminal
+                        if (result.cost > config.maxMultiEditCost) return@forEachTerminal
+                        corrections[index] = result.cost * config.multiEditScoreScale
+                        multiEditIndices.add(index)
+                    }
+                }
+                if (
+                    rowMinimum <= MAX_MULTI_EDITS &&
+                    depth + 1 < trieUnitRows.size &&
+                    depth < lower.length + MAX_MULTI_EDITS
+                ) {
+                    visit(node, depth + 1, target)
+                }
+                node = trie.nextSibling(node)
+            }
+        }
+
+        visit(parent = 0, depth = 1, previousTarget = '\u0000')
+    }
+
+    private fun isStrictCompletion(index: Int, lower: String): Boolean {
+        if (lexicon.lengthAt(index) <= lower.length) return false
+        for (position in lower.indices) {
+            if (lexicon.charAt(index, position) != lower[position]) return false
+        }
+        return true
+    }
+
+    private data class EditResult(val edits: Int, val cost: Float)
+
+    /** Optimal-string-alignment distance against a lexicon entry, with weighted and unit rows. */
+    private fun editDistance(source: String, targetIndex: Int): EditResult {
+        val targetLength = lexicon.lengthAt(targetIndex)
+        var unitPreviousPrevious = unitRows[0]
+        var unitPrevious = unitRows[1]
+        var unitCurrent = unitRows[2]
+        var weightedPreviousPrevious = weightedRows[0]
+        var weightedPrevious = weightedRows[1]
+        var weightedCurrent = weightedRows[2]
+
+        unitPrevious[0] = 0
+        weightedPrevious[0] = 0f
+        for (j in 1..targetLength) {
+            val target = lexicon.charAt(targetIndex, j - 1)
+            unitPrevious[j] = j
+            weightedPrevious[j] = weightedPrevious[j - 1] + insertionCost(target)
+        }
+
+        for (i in 1..source.length) {
+            val sourceChar = source[i - 1]
+            unitCurrent[0] = i
+            weightedCurrent[0] = weightedPrevious[0] + deletionCost(source, i - 1)
+
+            for (j in 1..targetLength) {
+                val targetChar = lexicon.charAt(targetIndex, j - 1)
+                val same = sourceChar == targetChar
+                unitCurrent[j] = minOf(
+                    unitPrevious[j] + 1,
+                    unitCurrent[j - 1] + 1,
+                    unitPrevious[j - 1] + if (same) 0 else 1,
+                )
+                weightedCurrent[j] = minOf(
+                    weightedPrevious[j] + deletionCost(source, i - 1),
+                    weightedCurrent[j - 1] + insertionCost(targetChar),
+                    weightedPrevious[j - 1] +
+                        if (same) 0f else substitutionCost(sourceChar, targetChar, i - 1),
+                )
+
+                if (
+                    i > 1 && j > 1 &&
+                    source[i - 1] == lexicon.charAt(targetIndex, j - 2) &&
+                    source[i - 2] == targetChar
+                ) {
+                    unitCurrent[j] = minOf(unitCurrent[j], unitPreviousPrevious[j - 2] + 1)
+                    weightedCurrent[j] = minOf(
+                        weightedCurrent[j],
+                        weightedPreviousPrevious[j - 2] + config.transpositionCost,
+                    )
+                }
+            }
+
+            val oldUnit = unitPreviousPrevious
+            unitPreviousPrevious = unitPrevious
+            unitPrevious = unitCurrent
+            unitCurrent = oldUnit
+            val oldWeighted = weightedPreviousPrevious
+            weightedPreviousPrevious = weightedPrevious
+            weightedPrevious = weightedCurrent
+            weightedCurrent = oldWeighted
+        }
+        return EditResult(unitPrevious[targetLength], weightedPrevious[targetLength])
+    }
+
+    private fun insertionCost(target: Char): Float =
+        if (target == '\'') config.apostropheCost else config.insertionCost
+
+    private fun deletionCost(source: String, position: Int): Float {
+        val repeats = (position > 0 && source[position] == source[position - 1]) ||
+            (position + 1 < source.length && source[position] == source[position + 1])
+        return if (repeats) config.doubledLetterCost else config.deletionCost
+    }
+
+    private fun substitutionCost(source: Char, target: Char, position: Int): Float {
+        if (source !in 'a'..'z' || target !in 'a'..'z') return IMPOSSIBLE_COST
+        val touch = touchAt(position)
+        val distance = if (touch != null) {
+            normalisedDistance(target, touch.first, touch.second)
+        } else {
+            val keys = touchKeys ?: return IMPOSSIBLE_COST
+            if (!keys.has(source) || !keys.has(target)) return IMPOSSIBLE_COST
+            hypot(
+                (keys.centerX(target) - keys.centerX(source)) / keys.keyWidth,
+                (keys.centerY(target) - keys.centerY(source)) / keys.keyHeight,
+            )
+        } ?: return IMPOSSIBLE_COST
+        if (distance > config.neighbourRadius) return IMPOSSIBLE_COST
+        return config.substitutionCost * distance
+    }
+
     // endregion
 
     // region Ranking
@@ -608,7 +825,12 @@ class TypingSuggester(
         if ((corrections[index] ?: Float.MAX_VALUE) > config.maxAutocorrectCost) return null
 
         val runnerUp = ranked.getOrNull(1)
-        if (runnerUp != null && best.score - runnerUp.score < config.autocorrectMargin) return null
+        val requiredMargin = if (index in multiEditIndices) {
+            config.multiEditAutocorrectMargin
+        } else {
+            config.autocorrectMargin
+        }
+        if (runnerUp != null && best.score - runnerUp.score < requiredMargin) return null
 
         // The user may simply not have finished. If what they typed starts a word they plausibly
         // meant, an unfinished word is the likelier explanation than a misspelled one.
@@ -692,6 +914,11 @@ class TypingSuggester(
         if (model != null && contextIndex >= 0) {
             score += config.contextWeight * model.score(contextIndex, index)
         }
+        val longerModel = trigrams
+        if (longerModel != null && olderContextIndex >= 0 && contextIndex >= 0) {
+            score += config.trigramContextWeight *
+                longerModel.score(olderContextIndex, contextIndex, index)
+        }
 
         // What this person writes, on top of what English writes. Added rather than blended, for
         // the same reason as the corpus term: personal data is mostly absent, and a model that is
@@ -740,7 +967,7 @@ class TypingSuggester(
      * look up and the corrector falls back to spelling alone for that keystroke.
      */
     private fun contextIndexFor(previousWord: String?): Int {
-        if (bigrams == null || previousWord.isNullOrEmpty()) return -1
+        if ((bigrams == null && trigrams == null) || previousWord.isNullOrEmpty()) return -1
         val cleaned = previousWord.lowercase().trim('\'')
         if (cleaned.isEmpty() || !cleaned.all { it in 'a'..'z' || it == '\'' }) return -1
         return lexicon.indexOf(cleaned)
@@ -826,9 +1053,12 @@ class TypingSuggester(
          * some other continuation.
          */
         const val PERSONAL_PREDICTION_FLOOR = 1f
+        const val TRIGRAM_PREDICTION_FLOOR = 0.5f
 
         const val ALPHABET = 26
         const val MIN_CANDIDATE_LENGTH = 2
+        const val MAX_MULTI_EDITS = 2
+        const val IMPOSSIBLE_COST = 10_000f
         val LN_MAX_FREQUENCY = ln(256f)
 
         /**

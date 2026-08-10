@@ -111,7 +111,11 @@ private fun SetupScreen(repository: SettingsRepository) {
     var showThirdPartyNotices by remember { mutableStateOf(false) }
     val thirdPartyNotices = remember {
         runCatching {
-            context.assets.open("THIRD_PARTY_NOTICES.txt").bufferedReader().use { it.readText() }
+            val notices = context.assets.open("THIRD_PARTY_NOTICES.txt")
+                .bufferedReader().use { it.readText() }
+            val swipeTerms = context.assets.open("swipe/FUTO_MODEL_LICENSE.md")
+                .bufferedReader().use { it.readText() }
+            "$notices\n\nFull FUTO Swipe model terms\n---------------------------\n\n$swipeTerms"
         }.getOrElse { "Licences and notices could not be loaded." }
     }
 
@@ -318,7 +322,8 @@ private fun SetupScreen(repository: SettingsRepository) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("About", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "Slide is Apache-2.0 licensed and includes open-source software and public language data.",
+                        "Slide is Apache-2.0 licensed and includes open-source software and " +
+                            "public language data. Gesture typing is powered by FUTO Swipe technology.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

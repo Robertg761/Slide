@@ -2,6 +2,8 @@ package com.slide.engine
 
 import com.slide.engine.lexicon.BigramLoader
 import com.slide.engine.lexicon.Bigrams
+import com.slide.engine.lexicon.Trigrams
+import com.slide.engine.lexicon.TrigramLoader
 import java.io.File
 
 /** The real bigram asset, loaded once for the whole test run. */
@@ -9,6 +11,15 @@ object TestBigrams {
     val instance: Bigrams by lazy {
         File("src/main/assets/${BigramLoader.ASSET_NAME}").inputStream().use {
             BigramLoader.read(it, TestLexicon.instance)
+        }
+    }
+}
+
+/** The real two-word-context asset, loaded once for the whole test run. */
+object TestTrigrams {
+    val instance: Trigrams by lazy {
+        File("src/main/assets/${TrigramLoader.ASSET_NAME}").inputStream().use {
+            TrigramLoader.read(it, TestLexicon.instance)
         }
     }
 }

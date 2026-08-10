@@ -10,6 +10,8 @@ package com.slide.ime.text
  */
 object PrecedingWord {
 
+    data class Context(val older: String?, val previous: String?)
+
     /** Past one of these, the preceding word belongs to a different sentence. */
     private const val SENTENCE_ENDS = ".!?\n"
 
@@ -39,6 +41,34 @@ object PrecedingWord {
      * after "I like", the swipe that follows lands after "like", and "like" is what predicts it.
      */
     fun beforeNewWord(before: String): String? = wordEndingAt(before, before.length)
+
+    /** The two words before the fragment currently being typed, without crossing a sentence. */
+    fun contextOf(before: String): Context {
+        var cursor = before.length
+        while (cursor > 0 && isWordCharacter(before[cursor - 1])) cursor--
+        return contextEndingAt(before, cursor)
+    }
+
+    /** The two words before a whole-word input such as a swipe or next-word prediction. */
+    fun contextBeforeNewWord(before: String): Context = contextEndingAt(before, before.length)
+
+    private fun contextEndingAt(before: String, from: Int): Context {
+        var cursor = from
+
+        fun previousWord(): String? {
+            while (cursor > 0 && !isWordCharacter(before[cursor - 1])) {
+                if (before[cursor - 1] in SENTENCE_ENDS) return null
+                cursor--
+            }
+            val end = cursor
+            while (cursor > 0 && isWordCharacter(before[cursor - 1])) cursor--
+            return before.substring(cursor, end).takeIf { it.isNotEmpty() }
+        }
+
+        val previous = previousWord() ?: return Context(null, null)
+        val older = previousWord()
+        return Context(older, previous)
+    }
 
     /**
      * Walks back from [from] over any separators and returns the word before them.

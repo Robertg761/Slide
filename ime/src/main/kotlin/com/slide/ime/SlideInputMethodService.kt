@@ -34,13 +34,21 @@ import com.slide.core.settings.SettingsRepository
 import com.slide.core.theme.KeyboardTheme
 import com.slide.core.theme.Themes
 import com.slide.engine.gesture.GestureDecoder
+import com.slide.engine.gesture.GestureDecodingEngine
 import com.slide.engine.gesture.GestureKeyMap
 import com.slide.engine.gesture.GesturePoint
+import com.slide.engine.gesture.NeuralGestureDecoder
+import com.slide.engine.gesture.SwipeLexiconTrie
+import com.slide.engine.lexicon.Bigrams
 import com.slide.engine.lexicon.BigramLoader
+import com.slide.engine.lexicon.Lexicon
 import com.slide.engine.lexicon.LexiconLoader
+import com.slide.engine.lexicon.Trigrams
+import com.slide.engine.lexicon.TrigramLoader
 import com.slide.engine.lexicon.UserBigrams
 import com.slide.engine.lexicon.UserDictionary
 import com.slide.engine.lexicon.UserDictionaryStore
+import com.slide.engine.suggest.SpatialTouchModel
 import com.slide.engine.suggest.TypingSuggester
 import com.slide.ime.text.AndroidGraphemeBoundaries
 import com.slide.ime.text.EditorInputPolicy
@@ -132,7 +140,7 @@ class SlideInputMethodService :
      * Swipes that land before it is ready commit nothing rather than queueing, since a word
      * appearing seconds after the gesture would be worse than none at all.
      */
-    private var gestureDecoder: GestureDecoder? = null
+    private var gestureDecoder: GestureDecodingEngine? = null
 
     /** Shares the lexicon with the decoder; null until it loads, for the same reason. */
     private var typingSuggester: TypingSuggester? = null
@@ -155,6 +163,9 @@ class SlideInputMethodService :
 
     /** The word pairs this person writes, learned alongside the words themselves. */
     private val userBigrams = UserBigrams()
+
+    /** Per-key touch offsets learned only from words this person confirmed. */
+    private val spatialTouchModel = SpatialTouchModel()
 
     private val userDictionaryStore by lazy { UserDictionaryStore(applicationContext) }
 
@@ -259,6 +270,14 @@ class SlideInputMethodService :
     /** The shift state the last swipe was committed under, so alternatives are cased to match. */
     private var lastGestureShift = ShiftState.OFF
 
+    /** Context and candidate whose observation must be repaired if an alternative is selected. */
+    private var lastGestureLearnedPair: Pair<String, String>? = null
+
+    /** Coalesces partial traces so model inference never queues behind the user's finger. */
+    private var pendingGesturePreview: List<GesturePoint>? = null
+    private var gesturePreviewJob: Job? = null
+    private var gesturePreviewGeneration = 0L
+
     private val vibrator: Vibrator? by lazy {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)?.defaultVibrator
@@ -330,7 +349,7 @@ class SlideInputMethodService :
                             clearSuggestions()
                             updatePredictions()
                         }
-                        stripMode == StripMode.Gesture &&
+                        stripMode in setOf(StripMode.Gesture, StripMode.GesturePreview) &&
                             previous.blockOffensiveWords != updated.blockOffensiveWords ->
                             clearSuggestions()
                     }
@@ -352,29 +371,49 @@ class SlideInputMethodService :
         // Roughly a megabyte to parse; doing it on the main thread would stall the first frame
         // of the keyboard, which is the one moment the user is definitely watching.
         scope.launch {
-            val (lexicon, bigrams) = withContext(Dispatchers.IO) {
+            val (lexicon, bigrams, trigrams, decoder, trie) = withContext(Dispatchers.IO) {
                 val words = LexiconLoader.load(applicationContext)
                 // The model is keyed by lexicon index, so it is worthless without the lexicon and
                 // is not worth reading if that failed. A null model is survivable on its own: the
                 // corrector falls back to spelling alone.
-                words to words?.let { BigramLoader.load(applicationContext, it) }
+                val pairs = words?.let { BigramLoader.load(applicationContext, it) }
+                val triples = words?.let { TrigramLoader.load(applicationContext, it) }
+                val trie = words?.let(::SwipeLexiconTrie)
+                val loadedDecoder = words?.let {
+                    val fallback = GestureDecoder(it, bigrams = pairs, trigrams = triples)
+                    NeuralGestureDecoder.createOrNull(
+                        context = applicationContext,
+                        lexicon = it,
+                        bigrams = pairs,
+                        userBigrams = userBigrams,
+                        trie = requireNotNull(trie),
+                        trigrams = triples,
+                        fallback = fallback,
+                    ) ?: fallback
+                }
+                LoadedLanguageResources(words, pairs, triples, loadedDecoder, trie)
             }
             // Typing and swiping are the only paths that learn. Do not publish either engine until
             // the persisted dictionaries have been restored, or a word learned in the gap could
             // be wiped by restore completing a moment later.
             learnedDataReady.await()
             if (lexicon != null) {
-                gestureDecoder = GestureDecoder(lexicon, bigrams = bigrams)
+                gestureDecoder = decoder
                 typingSuggester = TypingSuggester(
                     lexicon,
                     bigrams = bigrams,
+                    trigrams = trigrams,
                     userDictionary = userDictionary,
                     userBigrams = userBigrams,
+                    spatialModel = spatialTouchModel,
+                    trie = requireNotNull(trie),
                 )
                 Log.i(
                     TAG,
-                    "Decoder and suggester ready with ${lexicon.size} words" +
-                        (bigrams?.let { ", ${it.pairCount} bigrams" } ?: ", no context model"),
+                    "${if (decoder is NeuralGestureDecoder) "Neural" else "Fallback"} decoder " +
+                        "and suggester ready with ${lexicon.size} words" +
+                        (bigrams?.let { ", ${it.pairCount} bigrams" } ?: ", no bigrams") +
+                        (trigrams?.let { ", ${it.tripleCount} trigrams" } ?: ", no trigrams"),
                 )
                 updateGestureAvailability()
             }
@@ -397,6 +436,14 @@ class SlideInputMethodService :
             Log.i(TAG, "Emoji ready: ${renderable.sumOf { it.size }} of ${catalogue.size} drawable")
         }
     }
+
+    private data class LoadedLanguageResources(
+        val lexicon: Lexicon?,
+        val bigrams: Bigrams?,
+        val trigrams: Trigrams?,
+        val decoder: GestureDecodingEngine?,
+        val trie: SwipeLexiconTrie?,
+    )
 
     override fun onCreateInputView(): View {
         val theme = resolveTheme()
@@ -651,6 +698,10 @@ class SlideInputMethodService :
         if (voiceClientDelegate.isInitialized()) voiceClient.unbind()
         val finalLearnedData = captureFinalLearnedData()
         scope.cancel()
+        // Neural close shares its monitor with decode, so a native preview already in flight
+        // finishes before its modules are destroyed. Cancelling first prevents another preview
+        // from entering after that destruction.
+        (gestureDecoder as? AutoCloseable)?.close()
         finalLearnedData?.let(::flushFinalLearnedData)
         keyboardView = null
         suggestionStrip = null
@@ -680,7 +731,13 @@ class SlideInputMethodService :
         // Any keypress ends the swiped word: the candidates no longer describe what is in front of
         // the cursor, so leaving them up would offer a replacement for text that has moved on. A
         // typing strip is the opposite -- it is about to be rebuilt from the new keystroke.
-        if (stripMode == StripMode.Gesture || stripMode == StripMode.Prediction) clearSuggestions()
+        if (
+            stripMode == StripMode.Gesture ||
+            stripMode == StripMode.GesturePreview ||
+            stripMode == StripMode.Prediction
+        ) {
+            clearSuggestions()
+        }
 
         // An autocorrection can only be taken back by the very next key press, and only by
         // backspace. Anything else the user does means they have accepted it.
@@ -712,11 +769,13 @@ class SlideInputMethodService :
         val connection = currentInputConnection ?: return false
         val keys = currentGestureKeyMap() ?: return false
 
+        val context = precedingContextForSwipe()
         val candidates = decoder.decode(
             points = points,
             keys = keys,
             blockOffensive = settings.blockOffensiveWords,
-            previousWord = precedingWordForSwipe(),
+            previousWord = context.previous,
+            previousPreviousWord = context.older,
         )
         val best = candidates.firstOrNull() ?: return false
 
@@ -735,6 +794,51 @@ class SlideInputMethodService :
             clearSuggestions()
         }
         return true
+    }
+
+    override fun onGesturePreview(points: List<GesturePoint>) {
+        if (!settings.gestureTypingEnabled || !editorInputPolicy.allowsSuggestions) return
+        if (searchModeShown || emojiPanelShown || voiceOverlayShown || layer != Layer.ALPHA) return
+        if (gestureDecoder == null || currentGestureKeyMap() == null) return
+
+        pendingGesturePreview = points
+        if (gesturePreviewJob?.isActive == true) return
+        val generation = gesturePreviewGeneration
+        gesturePreviewJob = scope.launch {
+            while (generation == gesturePreviewGeneration) {
+                val trace = pendingGesturePreview ?: break
+                pendingGesturePreview = null
+                val decoder = gestureDecoder ?: break
+                val keys = currentGestureKeyMap() ?: break
+                val blockOffensive = settings.blockOffensiveWords
+                val context = precedingContextForSwipe()
+                val candidates = withContext(Dispatchers.Default) {
+                    decoder.decode(
+                        trace,
+                        keys,
+                        blockOffensive,
+                        context.previous,
+                        context.older,
+                    )
+                }
+                if (generation != gesturePreviewGeneration) break
+                // A newer trace will be decoded immediately; avoid flashing a result that is
+                // already stale while the finger is still moving.
+                if (pendingGesturePreview == null && candidates.isNotEmpty()) {
+                    stripMode = StripMode.GesturePreview
+                    lastGestureCommit = null
+                    suggestionStrip?.setSuggestions(candidates.map { it.word })
+                }
+            }
+        }
+    }
+
+    override fun onGesturePreviewCancelled() {
+        gesturePreviewGeneration++
+        pendingGesturePreview = null
+        gesturePreviewJob?.cancel()
+        gesturePreviewJob = null
+        if (stripMode == StripMode.GesturePreview) clearSuggestions()
     }
 
     override fun onCursorMove(steps: Int) {
@@ -825,7 +929,9 @@ class SlideInputMethodService :
         val before = connection.getTextBeforeCursor(1, 0)
         val needsSpace = !before.isNullOrEmpty() && before[0].let { it.isLetterOrDigit() || it in ".,!?;:'\")" }
 
-        learnPair(precedingWordForSwipe(), word)
+        val previousWord = precedingWordForSwipe()
+        learnPair(previousWord, word)
+        lastGestureLearnedPair = previousWord?.let { it to word }
 
         val shifted = shiftState()
         val text = (if (needsSpace) " " else "") + applyShift(word, shifted)
@@ -853,7 +959,7 @@ class SlideInputMethodService :
             StripMode.Gesture -> pickGestureAlternative(index, word)
             StripMode.Typing -> pickTypedSuggestion(word)
             StripMode.Prediction -> commitPrediction(word)
-            StripMode.Empty -> Unit
+            StripMode.GesturePreview, StripMode.Empty -> Unit
         }
     }
 
@@ -922,6 +1028,18 @@ class SlideInputMethodService :
         connection.commitText(replacement, 1)
         connection.endBatchEdit()
 
+        // The first-ranked word was only a machine guess. Selecting another candidate is direct
+        // evidence: remove the wrong observation and teach the chosen pair instead.
+        lastGestureLearnedPair?.let { (context, guessed) ->
+            if (!incognito) {
+                userBigrams.unlearn(context, guessed)
+                userBigrams.learn(context, word)
+                learnedPersistence.markDirty()
+                saveLearnedWords()
+            }
+            lastGestureLearnedPair = context to word
+        }
+
         // The strip stays up, and keeps its order, so a second wrong guess is also one tap away
         // and the candidates do not move under the user's thumb.
         lastGestureCommit = replacement
@@ -937,6 +1055,7 @@ class SlideInputMethodService :
     private fun clearSuggestions() {
         suggestionStrip?.clear()
         lastGestureCommit = null
+        lastGestureLearnedPair = null
         stripMode = StripMode.Empty
     }
 
@@ -1545,11 +1664,13 @@ class SlideInputMethodService :
     }
 
     private fun updateTypingSuggestions(suggester: TypingSuggester, keys: GestureKeyMap) {
+        val context = precedingContext()
         val result = suggester.suggest(
             typed = composing.toString(),
             keys = keys,
             blockOffensive = settings.blockOffensiveWords,
-            previousWord = precedingWord(),
+            previousWord = context.previous,
+            previousPreviousWord = context.older,
             touchPoints = composingTouches,
         )
         pendingAutocorrection = result.autocorrection
@@ -1596,6 +1717,15 @@ class SlideInputMethodService :
         learnedPersistence.markDirty()
     }
 
+    /** Learns geometry only from a word the person explicitly allowed or selected. */
+    private fun learnTouches(typed: String, intended: String) {
+        if (incognito) return
+        val keys = currentGestureKeyMap() ?: return
+        if (spatialTouchModel.observe(typed, intended, composingTouches, keys) > 0) {
+            learnedPersistence.markDirty()
+        }
+    }
+
     /** Restores into temporary collections, then publishes them on the input thread. */
     private fun loadLearnedData() {
         val generation = learnedPersistence.beginLoad()
@@ -1611,14 +1741,17 @@ class SlideInputMethodService :
                         if (!learnedPersistence.isCurrent(generation)) return@withLock null
                         val words = UserDictionary()
                         val pairs = UserBigrams()
+                        val touches = SpatialTouchModel()
                         val deletionCompleted = userDictionaryStore.completePendingDeletion()
                         if (deletionCompleted) {
                             userDictionaryStore.load(words)
                             userDictionaryStore.load(pairs)
+                            userDictionaryStore.load(touches)
                         }
                         LearnedDataSnapshot(
                             words = words,
                             pairs = pairs,
+                            touches = touches,
                             deletionPending = !deletionCompleted,
                         )
                     }
@@ -1631,6 +1764,9 @@ class SlideInputMethodService :
                     // learning path without letting restore erase it.
                     userDictionary.restore(loaded.words.entries() + userDictionary.entries())
                     userBigrams.restore(loaded.pairs.entries() + userBigrams.entries())
+                    // Loading is complete before any typing engine is published, so unlike words
+                    // and pairs there cannot yet be a concurrent touch observation to merge.
+                    spatialTouchModel.restore(loaded.touches.entries())
                 }
             } finally {
                 val accepted = learnedPersistence.finishLoad(
@@ -1654,6 +1790,7 @@ class SlideInputMethodService :
         learnedPersistence.requestClear()
         userDictionary.clear()
         userBigrams.clear()
+        spatialTouchModel.clear()
 
         if (composing.isNotEmpty()) updateTypingSuggestions()
         if (stripMode == StripMode.Prediction) updatePredictions()
@@ -1710,6 +1847,7 @@ class SlideInputMethodService :
 
         val words = UserDictionary().also { it.restore(userDictionary.entries()) }
         val pairs = UserBigrams().also { it.restore(userBigrams.entries()) }
+        val touches = SpatialTouchModel().also { it.restore(spatialTouchModel.entries()) }
         scope.launch {
             val result = withContext(Dispatchers.IO) {
                 LEARNED_DATA_IO.withLock {
@@ -1722,8 +1860,9 @@ class SlideInputMethodService :
                     } else {
                         val wordsSaved = userDictionaryStore.save(words)
                         val pairsSaved = userDictionaryStore.save(pairs)
+                        val touchesSaved = userDictionaryStore.save(touches)
                         LearnedDataWriteResult(
-                            saved = wordsSaved && pairsSaved,
+                            saved = wordsSaved && pairsSaved && touchesSaved,
                             pendingDeleteResolved = true,
                         )
                     }
@@ -1749,6 +1888,7 @@ class SlideInputMethodService :
     private data class LearnedDataSnapshot(
         val words: UserDictionary,
         val pairs: UserBigrams,
+        val touches: SpatialTouchModel,
         val deletionPending: Boolean,
     )
 
@@ -1763,9 +1903,11 @@ class SlideInputMethodService :
 
         val words = UserDictionary().also { it.restore(userDictionary.entries()) }
         val pairs = UserBigrams().also { it.restore(userBigrams.entries()) }
+        val touches = SpatialTouchModel().also { it.restore(spatialTouchModel.entries()) }
         return FinalLearnedData(
             words = words,
             pairs = pairs,
+            touches = touches,
             completePendingDeletionFirst = learnedPersistence.clearOutstanding,
         )
     }
@@ -1787,7 +1929,8 @@ class SlideInputMethodService :
                     // forgot their final word rather than requested a full clear.
                     val wordsSaved = userDictionaryStore.save(data.words)
                     val pairsSaved = userDictionaryStore.save(data.pairs)
-                    wordsSaved && pairsSaved
+                    val touchesSaved = userDictionaryStore.save(data.touches)
+                    wordsSaved && pairsSaved && touchesSaved
                 }
             }
 
@@ -1802,6 +1945,7 @@ class SlideInputMethodService :
     private data class FinalLearnedData(
         val words: UserDictionary,
         val pairs: UserBigrams,
+        val touches: SpatialTouchModel,
         val completePendingDeletionFirst: Boolean,
     )
 
@@ -1809,9 +1953,16 @@ class SlideInputMethodService :
     private fun precedingWord(): String? =
         textBehindCursor()?.let(PrecedingWord::of)
 
+    private fun precedingContext(): PrecedingWord.Context =
+        textBehindCursor()?.let(PrecedingWord::contextOf) ?: PrecedingWord.Context(null, null)
+
     /** The word before a swipe, which has no fragment in front of the cursor to step over. */
     private fun precedingWordForSwipe(): String? =
         textBehindCursor()?.let(PrecedingWord::beforeNewWord)
+
+    private fun precedingContextForSwipe(): PrecedingWord.Context =
+        textBehindCursor()?.let(PrecedingWord::contextBeforeNewWord)
+            ?: PrecedingWord.Context(null, null)
 
     private fun textBehindCursor(): String? =
         currentInputConnection?.getTextBeforeCursor(MAX_CONTEXT_CHARS, 0)?.toString()
@@ -1827,24 +1978,32 @@ class SlideInputMethodService :
 
         val typed = composing.toString()
         val correction = pendingAutocorrection
+        val previous = precedingWord()
         var corrected = false
 
         if (correction != null && !correction.equals(typed, ignoreCase = true)) {
             val cased = matchTypedCase(typed, correction)
             connection.setComposingText(cased, 1)
-            lastAutocorrect = Autocorrect(original = typed, applied = cased)
+            lastAutocorrect = Autocorrect(
+                original = typed,
+                applied = cased,
+                previous = previous,
+                touches = composingTouches.copyOf(typed.length * 2),
+                keys = currentGestureKeyMap(),
+            )
             corrected = true
         } else if (!recomposed) {
             // Settled exactly as typed, with the keyboard offering no objection. That is the
             // ordinary way a word the dictionary has never heard of gets into the language.
             // Reopened words are excluded: the user went back to look at one, not to write it.
             learnWord(typed)
+            learnTouches(typed, typed)
         }
 
         // Whatever actually landed in the text is what followed the previous word, whether that is
         // what was typed or what it was corrected to. Read before the region is settled, so the
         // word in progress is still there to be stepped over.
-        learnPair(precedingWord(), if (corrected) lastAutocorrect?.applied.orEmpty() else typed)
+        learnPair(previous, if (corrected) lastAutocorrect?.applied.orEmpty() else typed)
 
         connection.finishComposingText()
         composing.setLength(0)
@@ -1905,6 +2064,17 @@ class SlideInputMethodService :
         // and said no, in the one gesture that means exactly that and nothing else. A word rescued
         // this way is trusted from now on rather than waiting to be typed again.
         learnWord(undo.original, weight = TRUSTED_AT_ONCE)
+        if (!incognito && !undo.previous.isNullOrEmpty()) {
+            userBigrams.unlearn(undo.previous, undo.applied)
+            userBigrams.learn(undo.previous, undo.original)
+            learnedPersistence.markDirty()
+        }
+        val keys = undo.keys
+        if (!incognito && keys != null && undo.touches != null) {
+            if (spatialTouchModel.observe(undo.original, undo.original, undo.touches, keys) > 0) {
+                learnedPersistence.markDirty()
+            }
+        }
 
         updateShiftFromCursor()
         return true
@@ -1928,6 +2098,13 @@ class SlideInputMethodService :
         // The dictionary is lowercase. Whether this word is new or reopened, swapping it for a
         // correction must not quietly undo the capitalization the person typed.
         val replacement = matchTypedCase(composing.toString(), word)
+        val previous = precedingWord()
+
+        // A strip tap is explicit confirmation, including when it chooses a correction. Learn
+        // before clearing the composing trace; insertions in the intended word are aligned and
+        // skipped by the spatial model because no physical touch exists for them.
+        learnTouches(composing.toString(), replacement)
+        learnPair(previous, replacement)
 
         // Reaching past the keyboard's own first choice to pick out what they wrote is a deliberate
         // choice, and means the same thing as undoing a correction.
@@ -1970,8 +2147,10 @@ class SlideInputMethodService :
         if (searchModeShown || emojiPanelShown || voiceOverlayShown) return
 
         val suggester = typingSuggester ?: return
+        val context = precedingContextForSwipe()
         val predictions = suggester.predict(
-            previousWord = precedingWordForSwipe(),
+            previousWord = context.previous,
+            previousPreviousWord = context.older,
             blockOffensive = settings.blockOffensiveWords,
         )
         if (predictions.isEmpty()) {
@@ -2125,10 +2304,16 @@ class SlideInputMethodService :
     }
 
     /** A word autocorrect changed, and what it changed from. */
-    private data class Autocorrect(val original: String, val applied: String)
+    private data class Autocorrect(
+        val original: String,
+        val applied: String,
+        val previous: String?,
+        val touches: FloatArray?,
+        val keys: GestureKeyMap?,
+    )
 
     /** What the suggestion strip is showing, and so what a tap on it should do. */
-    private enum class StripMode { Empty, Gesture, Typing, Prediction }
+    private enum class StripMode { Empty, GesturePreview, Gesture, Typing, Prediction }
 
     // endregion
 

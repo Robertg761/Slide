@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.3.0] - 2026-08-10
+
+### Added
+
+- Gesture typing now uses the offline FUTO Swipe neural spatial model on supported 64-bit Android
+  devices, followed by Slide's own trie-constrained CTC beam search. The existing deterministic
+  decoder remains available automatically if neural inference cannot start.
+- The suggestion strip shows coalesced partial candidates while a swipe is still in progress,
+  without allowing preview inference to queue behind newer finger positions.
+- Typed correction can recover bounded two-edit mistakes through a trie-pruned weighted sequence
+  search. The fast single-edit path remains first, so ordinary key slips keep their existing
+  latency.
+- A trigram language model adds the word before the immediately preceding word to tap, swipe, and
+  next-word ranking. On 16,139 held-out typo cases it bought 194 additional correct corrections
+  for 14 additional wrong ones over bigram context alone.
+- Slide learns a private per-key spatial calibration from confirmed typing and correction choices.
+  It is stored under Android's no-backup directory and is removed by **Clear learned data**.
+
+### Changed
+
+- Swipe traces now retain Android's historical samples and event timing, are resampled at a stable
+  cadence, and are normalised against the active keyboard layout before neural inference.
+- Choosing a different swipe candidate repairs the learned phrase evidence for the rejected and
+  selected words. Undoing an autocorrection likewise repairs phrase evidence and learns the
+  confirmed touch alignment rather than the rejected correction.
+- Release and CI builds reproducibly prepare a pinned ExecuTorch Android runtime, fetch immutable
+  swipe-model revisions, verify their SHA-256 digests, and package the model licence and visible
+  FUTO Swipe attribution. Release verification now checks the swipe models, trigram, native
+  runtime ABIs, compression methods, and exact hashes in the final APK.
+
+### Fixed
+
+- A corrupt or interrupted copied swipe-model file is atomically replaced instead of being reused
+  on the next keyboard start.
+- Neural runtime failures disable repeated retries for that keyboard process and fall back cleanly;
+  shutdown now waits for any active decode before releasing native modules.
+- Live swipe previews are cancelled when the gesture, field, or keyboard session becomes stale, so
+  a late partial result cannot replace the final candidates.
+
+### Known limitations
+
+- Neural swipe inference is packaged for arm64-v8a and x86_64. The deterministic decoder is used on
+  32-bit Android ABIs.
+- The neural instrumentation test and release APK were built successfully, but this release's
+  neural accuracy and latency have not yet been measured on a physical Android device.
+
 ## [0.2.1] - 2026-08-10
 
 ### Added

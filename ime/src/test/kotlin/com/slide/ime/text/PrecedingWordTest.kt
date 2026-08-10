@@ -73,6 +73,34 @@ class PrecedingWordTest {
         assertNull(PrecedingWord.beforeNewWord("I went home. "))
     }
 
+    @Test
+    fun `returns two-word context for typing and whole-word input`() {
+        assertEquals(
+            PrecedingWord.Context("we", "arrive"),
+            PrecedingWord.contextOf("we arrive hom"),
+        )
+        assertEquals(
+            PrecedingWord.Context("we", "arrive"),
+            PrecedingWord.contextBeforeNewWord("we arrive "),
+        )
+        assertEquals(
+            PrecedingWord.Context("arrive", "home"),
+            PrecedingWord.contextBeforeNewWord("we arrive home"),
+        )
+    }
+
+    @Test
+    fun `two-word context stops at a sentence boundary`() {
+        assertEquals(
+            PrecedingWord.Context(null, "The"),
+            PrecedingWord.contextOf("we arrived. The nex"),
+        )
+        assertEquals(
+            PrecedingWord.Context(null, null),
+            PrecedingWord.contextOf("we arrived. nex"),
+        )
+    }
+
     /** The two differ exactly where they should: one skips a word in progress, the other does not. */
     @Test
     fun `the typing and swipe lookups disagree only about the trailing word`() {

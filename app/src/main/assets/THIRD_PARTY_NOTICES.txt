@@ -177,6 +177,56 @@ into Slide's own packed binary format.
 Copyright The Android Open Source Project and its contributors.
 https://source.android.com/docs/setup/about/licenses
 
+FUTO Swipe model weights
+------------------------
+
+Slide's gesture typing is powered by FUTO Swipe technology. Slide packages the unmodified
+honorable_sturgeon encoder and magic_macaw decoder weights from the FUTO Swipe Model. The weights
+are distributed under the FUTO Model Weights License 1.0. The complete terms are packaged at
+engine/src/main/assets/swipe/FUTO_MODEL_LICENSE.md and are reproduced in distributed APKs.
+
+Copyright FUTO Holdings, Inc.
+https://huggingface.co/futo-org/futo-swipe
+
+ExecuTorch
+----------
+
+Slide uses the ExecuTorch Android runtime to run the swipe models entirely on device.
+ExecuTorch is distributed under the BSD 3-Clause License.
+
+Copyright (c) Meta Platforms, Inc. and affiliates.
+Copyright 2023 Arm Limited and/or its affiliates.
+Copyright (c) Qualcomm Innovation Center, Inc.
+Copyright (c) 2023 Apple Inc.
+Copyright (c) 2024 MediaTek Inc.
+Copyright 2023 NXP
+Copyright (c) 2025 Samsung Electronics Co. LTD
+Copyright (c) Intel Corporation
+https://github.com/pytorch/executorch
+
+Redistribution and use in source and binary forms, with or without modification, are permitted
+provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this list of conditions
+  and the following disclaimer.
+* Redistributions in binary form must reproduce the above copyright notice, this list of
+  conditions and the following disclaimer in the documentation and/or other materials provided
+  with the distribution.
+* Neither the name Meta nor the names of its contributors may be used to endorse or promote
+  products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
+IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER
+IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+ExecuTorch's fbjni and NativeLoader dependencies are distributed under the Apache License,
+Version 2.0, whose complete terms appear above.
+
 whisper.cpp and Whisper model weights
 -------------------------------------
 
@@ -209,13 +259,13 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 Tatoeba sentence data
 ---------------------
 
-Slide's packed English bigram model is derived from English sentences contributed to the Tatoeba
+Slide's packed English bigram and trigram models are derived from sentences contributed to Tatoeba
 Project. Source: https://tatoeba.org. Copyright the individual Tatoeba contributors. The source
 data is made available under Creative Commons Attribution 2.0 France (CC BY 2.0 FR):
 https://creativecommons.org/licenses/by/2.0/fr/deed.en
 
 Slide normalises the English text, excludes project-specific stock names, counts adjacent word
-pairs, and redistributes only the resulting aggregate counts keyed to its packed lexicon. No
+pairs and triples, and redistributes only the resulting aggregate counts keyed to its lexicon. No
 complete source sentences or contributor identifiers are included in the app.
 
 Unicode emoji and CLDR data

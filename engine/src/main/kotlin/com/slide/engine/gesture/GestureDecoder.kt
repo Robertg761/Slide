@@ -2,6 +2,7 @@ package com.slide.engine.gesture
 
 import com.slide.engine.lexicon.Bigrams
 import com.slide.engine.lexicon.Lexicon
+import com.slide.engine.lexicon.Trigrams
 import kotlin.math.hypot
 import kotlin.math.ln
 
@@ -67,6 +68,8 @@ data class DecoderConfig(
      * on the near side of the peak.
      */
     val contextWeight: Float = 1.5f,
+    /** Extra evidence from the two-word context when the sparse trigram model has it. */
+    val trigramContextWeight: Float = 1.0f,
     /** Words scored per swipe. Pruning normally yields far fewer; this is a latency backstop. */
     val maxScored: Int = 3000,
     /** Candidates returned to the caller. */
@@ -97,10 +100,12 @@ class GestureDecoder(
     private val config: DecoderConfig = DecoderConfig(),
     /** Null when the asset is missing, which reduces this to geometry and frequency. */
     private val bigrams: Bigrams? = null,
-) {
+    private val trigrams: Trigrams? = null,
+) : GestureDecodingEngine {
 
     /** Lexicon index of the word before the swipe, or -1. Set per [decode] call. */
     private var contextIndex = -1
+    private var olderContextIndex = -1
 
     /** Sample indices at which the trace passed near each letter, ascending. Reused per decode. */
     private val nearIndices = arrayOfNulls<IntArray>(ALPHABET)
@@ -123,13 +128,16 @@ class GestureDecoder(
      *   to separate candidates that trace the same path; omitting it costs accuracy but is never
      *   wrong.
      */
-    fun decode(
+    @Synchronized
+    override fun decode(
         points: List<GesturePoint>,
         keys: GestureKeyMap,
-        blockOffensive: Boolean = true,
-        previousWord: String? = null,
+        blockOffensive: Boolean,
+        previousWord: String?,
+        previousPreviousWord: String?,
     ): List<GestureCandidate> {
         contextIndex = contextIndexFor(previousWord)
+        olderContextIndex = contextIndexFor(previousPreviousWord)
         if (points.size < config.minimumPoints) return emptyList()
 
         val trace = SampledTrace.of(points, config.sampleCount)
@@ -309,12 +317,20 @@ class GestureDecoder(
             0f
         }
 
-        return locationTerm + shapeTerm + endpointTerm + languageTerm + contextTerm
+        val trigramTerm = if (
+            trigrams != null && olderContextIndex >= 0 && contextIndex >= 0
+        ) {
+            config.trigramContextWeight * trigrams.score(olderContextIndex, contextIndex, wordIndex)
+        } else {
+            0f
+        }
+
+        return locationTerm + shapeTerm + endpointTerm + languageTerm + contextTerm + trigramTerm
     }
 
     /** Resolves the preceding word to a lexicon index; -1 when there is nothing to look up. */
     private fun contextIndexFor(previousWord: String?): Int {
-        if (bigrams == null || previousWord.isNullOrEmpty()) return -1
+        if ((bigrams == null && trigrams == null) || previousWord.isNullOrEmpty()) return -1
         val cleaned = previousWord.lowercase().trim('\'')
         if (cleaned.isEmpty() || !cleaned.all { it in 'a'..'z' || it == '\'' }) return -1
         return lexicon.indexOf(cleaned)

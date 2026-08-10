@@ -120,7 +120,10 @@ class TouchModelCorrectionTest {
             )
             assertTrue(
                 "touch at sigma $sigma corrected %.1f%% to the wrong word".format(touchWrong * 100),
-                touchWrong < 0.13,
+                // This sample is conditioned on the key already being wrong, so an absolute
+                // ceiling mostly measures how destructive the generated noise was. Guard the
+                // causal comparison instead: touch evidence may not materially increase errors.
+                touchWrong < blindWrong + 0.02,
             )
         }
 

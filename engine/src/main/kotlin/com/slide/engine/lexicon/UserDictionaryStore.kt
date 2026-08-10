@@ -2,6 +2,7 @@ package com.slide.engine.lexicon
 
 import android.content.Context
 import android.util.Log
+import com.slide.engine.suggest.SpatialTouchModel
 import java.io.BufferedWriter
 import java.io.File
 import java.io.FileOutputStream
@@ -31,11 +32,17 @@ class UserDictionaryStore(
     /** Staging lives outside Android's backup domain; tests default to the target directory. */
     private val temporaryDirectory: File = file.absoluteFile.parentFile
         ?: throw IllegalArgumentException("Learned-word file has no parent directory"),
+    private val spatialFile: File = File(
+        file.absoluteFile.parentFile
+            ?: throw IllegalArgumentException("Learned-word file has no parent directory"),
+        SPATIAL_FILE_NAME,
+    ),
 ) {
 
     /** Serialises separate Store instances that address the same learned-data files. */
     private val operationLock = operationLocks.computeIfAbsent(
-        "${file.absoluteFile.toPath().normalize()}\u0000${pairFile.absoluteFile.toPath().normalize()}",
+        "${file.absoluteFile.toPath().normalize()}\u0000${pairFile.absoluteFile.toPath().normalize()}" +
+            "\u0000${spatialFile.absoluteFile.toPath().normalize()}",
     ) { Any() }
     private val deletionMarker = File(temporaryDirectory, CLEAR_PENDING_FILE_NAME)
 
@@ -122,6 +129,46 @@ class UserDictionaryStore(
             }
         }
 
+    fun load(into: SpatialTouchModel) {
+        synchronized(operationLock) {
+            if (deletionPending()) {
+                into.clear()
+                Log.i(TAG, "Learned touch offsets withheld while deletion is pending")
+                return
+            }
+            if (!spatialFile.exists()) return
+            try {
+                val restored = spatialFile.readLines().mapNotNull { line ->
+                    val parts = line.split('\t')
+                    if (parts.size != 6 || parts[0].length != 1) return@mapNotNull null
+                    val count = parts[1].toIntOrNull() ?: return@mapNotNull null
+                    val meanX = parts[2].toFloatOrNull() ?: return@mapNotNull null
+                    val meanY = parts[3].toFloatOrNull() ?: return@mapNotNull null
+                    val m2X = parts[4].toFloatOrNull() ?: return@mapNotNull null
+                    val m2Y = parts[5].toFloatOrNull() ?: return@mapNotNull null
+                    SpatialTouchModel.Entry(parts[0][0], count, meanX, meanY, m2X, m2Y)
+                }
+                into.restore(restored)
+                Log.i(TAG, "Restored ${restored.size} learned touch offsets")
+            } catch (e: IOException) {
+                Log.w(TAG, "Could not read learned touch offsets; starting empty", e)
+            }
+        }
+    }
+
+    fun save(from: SpatialTouchModel): Boolean =
+        synchronized(operationLock) {
+            if (deletionPending()) return@synchronized false
+            writeAtomically(spatialFile) { writer ->
+                for (entry in from.entries()) {
+                    writer.write(entry.letter.toString())
+                    writer.write("\t${entry.count}\t${entry.meanX}\t${entry.meanY}")
+                    writer.write("\t${entry.m2X}\t${entry.m2Y}")
+                    writer.newLine()
+                }
+            }
+        }
+
     /**
      * Durably records a clear request before attempting to remove any personal data.
      *
@@ -156,7 +203,7 @@ class UserDictionaryStore(
     /** Deletes the payload and every known save residue, but never the deletion marker. */
     private fun deleteLearnedData(): Boolean {
         var succeeded = true
-        for (target in listOf(file, pairFile)) {
+        for (target in listOf(file, pairFile, spatialFile)) {
             if (!deleteIfPresent(target)) succeeded = false
             if (!deleteTemporaryFiles(target)) succeeded = false
         }
@@ -286,6 +333,7 @@ class UserDictionaryStore(
         const val TAG = "SlideUserDict"
         const val FILE_NAME = "learned_words.txt"
         const val PAIR_FILE_NAME = "learned_pairs.txt"
+        const val SPATIAL_FILE_NAME = "learned_touch_offsets.txt"
         const val TEMP_SUFFIX = ".tmp"
         const val CLEAR_PENDING_FILE_NAME = "learned_data.clear_pending"
         val CLEAR_PENDING_CONTENT = "clear\n".toByteArray(StandardCharsets.US_ASCII)

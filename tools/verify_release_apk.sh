@@ -17,9 +17,17 @@ EXPECTED_TARGET_SDK="36"
 EXPECTED_BUILD_TOOLS="36.0.0"
 MODEL_PATH="assets/ggml-base.en-q5_1.bin"
 NOTICES_PATH="assets/THIRD_PARTY_NOTICES.txt"
+SWIPE_LICENSE_PATH="assets/swipe/FUTO_MODEL_LICENSE.md"
+SWIPE_ENCODER_PATH="assets/swipe/encoder.pte"
+SWIPE_DECODER_PATH="assets/swipe/decoder.pte"
+TRIGRAM_PATH="assets/trigrams_en.bin"
 MODEL_SIZE="59721011"
 MODEL_SHA256="4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f"
+SWIPE_ENCODER_SHA256="725242bab5d14345e96ff214e8de2bfbc1f962c232d320df9c24cb82ffd1fbaf"
+SWIPE_DECODER_SHA256="01eaf16ac4bc0f1ed0698c240807f0e95e6d427bcf6de04983ffc50736744d85"
+TRIGRAM_SHA256="dd85903183a89ddd957978636e5366e1e11e2aed14ef5d8c9b13abea48dcb3e1"
 EXPECTED_ABIS=(arm64-v8a armeabi-v7a x86 x86_64)
+EXECUTORCH_ABIS=(arm64-v8a x86_64)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 [[ -f "$APK" ]] || { echo "APK not found: $APK" >&2; exit 1; }
@@ -84,6 +92,38 @@ notices_size="$(unzip -lv "$APK" | awk -v path="$NOTICES_PATH" '$NF == path { pr
     exit 1
 }
 
+swipe_license_size="$(unzip -lv "$APK" | awk -v path="$SWIPE_LICENSE_PATH" '$NF == path { print $1; found=1 } END { if (!found) exit 1 }')"
+[[ "$swipe_license_size" =~ ^[0-9]+$ && "$swipe_license_size" -ge 5000 ]] || {
+    echo "Packaged FUTO Swipe model licence is missing or unexpectedly short." >&2
+    exit 1
+}
+
+verify_stored_asset() {
+    local path="$1"
+    local expected_sha="$2"
+    local length method actual_sha
+    read -r length method < <(
+        unzip -lv "$APK" | awk -v path="$path" '$NF == path { print $1, $2; found=1 } END { if (!found) exit 1 }'
+    )
+    [[ "$length" =~ ^[0-9]+$ && "$length" -gt 0 ]] || {
+        echo "Packaged asset is missing or empty: $path" >&2
+        exit 1
+    }
+    [[ "$method" == "Stored" ]] || {
+        echo "$path must be STORED, but ZIP method is $method" >&2
+        exit 1
+    }
+    actual_sha="$(unzip -p "$APK" "$path" | sha256sum | awk '{print $1}')"
+    [[ "$actual_sha" == "$expected_sha" ]] || {
+        echo "Wrong SHA-256 for $path: expected $expected_sha, got $actual_sha" >&2
+        exit 1
+    }
+}
+
+verify_stored_asset "$SWIPE_ENCODER_PATH" "$SWIPE_ENCODER_SHA256"
+verify_stored_asset "$SWIPE_DECODER_PATH" "$SWIPE_DECODER_SHA256"
+verify_stored_asset "$TRIGRAM_PATH" "$TRIGRAM_SHA256"
+
 mapfile -t packaged_models < <(unzip -Z1 "$APK" | sed -n '/^assets\/ggml-.*\.bin$/p')
 if [[ ${#packaged_models[@]} -ne 1 || "${packaged_models[0]}" != "$MODEL_PATH" ]]; then
     printf 'Unexpected packaged model set:\n%s\n' "${packaged_models[*]:-(none)}" >&2
@@ -117,6 +157,16 @@ if [[ "${packaged_abis[*]}" != "${EXPECTED_ABIS[*]}" ]]; then
     exit 1
 fi
 
+mapfile -t executorch_abis < <(
+    unzip -Z1 "$APK" \
+        | sed -n 's#^lib/\([^/]*\)/libexecutorch\.so$#\1#p' \
+        | sort
+)
+if [[ "${executorch_abis[*]}" != "${EXECUTORCH_ABIS[*]}" ]]; then
+    echo "Wrong libexecutorch.so ABI set: expected ${EXECUTORCH_ABIS[*]}, got ${executorch_abis[*]:-(none)}" >&2
+    exit 1
+fi
+
 if [[ "$EXPECTED_SIGNER" == "unsigned" ]]; then
     if "$APKSIGNER" verify --min-sdk-version 26 "$APK" >/dev/null 2>&1; then
         echo "The unprivileged build unexpectedly produced a signed APK." >&2
@@ -132,6 +182,6 @@ else
     }
 fi
 
-printf 'Verified %s (%s %s, model %s, ABIs %s, signer %s)\n' \
+printf 'Verified %s (%s %s, speech %s, swipe models and trigram verified, ABIs %s, signer %s)\n' \
     "$APK" "$EXPECTED_VERSION" "$EXPECTED_VERSION_CODE" "$MODEL_SHA256" \
     "${EXPECTED_ABIS[*]}" "$EXPECTED_SIGNER"

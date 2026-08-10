@@ -110,6 +110,12 @@ jobs:
       - name: Fetch and verify the pinned speech model
         run: bash tools/fetch_model.sh base.en-q5_1
 
+      - name: Prepare the pinned on-device inference runtime
+        run: bash tools/fetch_executorch.sh
+
+      - name: Fetch and verify the pinned swipe models
+        run: bash tools/fetch_swipe_models.sh
+
       - name: Run all JVM tests and release lint
         run: >-
           ./gradlew --no-daemon --no-build-cache --no-configuration-cache

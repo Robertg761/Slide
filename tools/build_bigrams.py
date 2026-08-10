@@ -4,6 +4,7 @@ Builds Slide's bigram language model from a plain-text sentence corpus.
 
 Source:  Tatoeba's English sentence export (CC BY 2.0 FR, https://tatoeba.org).
 Output:  engine/src/main/assets/bigrams_en.bin
+         engine/src/main/assets/trigrams_en.bin
          engine/src/test/resources/heldout_en.txt   (evaluation only, never shipped)
 
 Why a sentence corpus and not the AOSP wordlist: the AOSP combined wordlist Slide's lexicon comes
@@ -34,7 +35,7 @@ Usage:
     python3 tools/build_bigrams.py /tmp/tatoeba_eng.tsv \\
         engine/src/main/assets/lexicon_en.bin \\
         engine/src/main/assets/bigrams_en.bin \\
-        engine/src/test/resources/heldout_en.txt
+        engine/src/test/resources/heldout_en.txt [engine/src/main/assets/trigrams_en.bin]
 """
 
 from __future__ import annotations
@@ -49,6 +50,8 @@ from pathlib import Path
 
 MAGIC = b"SBIG"
 VERSION = 2
+TRIGRAM_MAGIC = b"STRI"
+TRIGRAM_VERSION = 1
 
 LEXICON_MAGIC = b"SLEX"
 
@@ -62,6 +65,7 @@ MIN_PAIR_COUNT = 2
 # A context with too little evidence cannot say anything useful about which of two candidates was
 # meant, and its successors would be scored against a total that is mostly accident.
 MIN_CONTEXT_TOTAL = 5
+MIN_TRIGRAM_CONTEXT_TOTAL = 3
 
 # Where the quantised score bottoms out. P(next | previous) below this is indistinguishable from
 # "no information", so it is not worth spending a byte on.
@@ -174,6 +178,29 @@ def count_pairs(corpus: list[str], index_of: dict[str, int]) -> dict[int, dict[i
     return pairs
 
 
+def count_triples(
+    corpus: list[str], index_of: dict[str, int]
+) -> dict[tuple[int, int], dict[int, int]]:
+    """Counts third words conditioned on the two in-lexicon words immediately before them."""
+    triples: dict[tuple[int, int], dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    kept = 0
+    for text in corpus:
+        history: list[int] = []
+        for token in TOKEN_RE.findall(text.lower()):
+            word = token.strip("'")
+            current = -1 if word in PLACEHOLDER_NAMES else index_of.get(word, -1)
+            if current < 0:
+                history.clear()
+                continue
+            if len(history) == 2:
+                triples[(history[0], history[1])][current] += 1
+                kept += 1
+            history.append(current)
+            history = history[-2:]
+    print(f"  counted       {kept:,} in-lexicon triples")
+    return triples
+
+
 def quantise(count: int, total: int) -> int:
     probability = count / total
     if probability <= PROBABILITY_FLOOR:
@@ -242,12 +269,61 @@ def encode(
     return bytes(out)
 
 
+def encode_trigrams(
+    triples: dict[tuple[int, int], dict[int, int]],
+    word_count: int,
+    fingerprint: bytes,
+) -> bytes:
+    contexts: list[tuple[int, int]] = []
+    offsets: list[int] = [0]
+    block = bytearray()
+    scores = bytearray()
+
+    for context in sorted(triples):
+        successors = triples[context]
+        total = sum(successors.values())
+        if total < MIN_TRIGRAM_CONTEXT_TOTAL:
+            continue
+        kept = sorted(
+            (nxt, count) for nxt, count in successors.items() if count >= MIN_PAIR_COUNT
+        )
+        kept = [(nxt, quantise(count, total)) for nxt, count in kept]
+        kept = [(nxt, score) for nxt, score in kept if score > 0]
+        if not kept:
+            continue
+
+        contexts.append(context)
+        previous = 0
+        for nxt, score in kept:
+            varint(nxt - previous, block)
+            previous = nxt
+            scores.append(score)
+        offsets.append(len(scores))
+
+    print(f"  contexts      {len(contexts):,}")
+    print(f"  triples       {len(scores):,}")
+    out = bytearray()
+    out.extend(TRIGRAM_MAGIC)
+    out.append(TRIGRAM_VERSION)
+    out.extend(struct.pack(">I", word_count))
+    out.extend(fingerprint)
+    out.extend(struct.pack(">III", len(contexts), len(scores), len(block)))
+    for older, previous in contexts:
+        out.extend(struct.pack(">II", older, previous))
+    for offset in offsets:
+        out.extend(struct.pack(">I", offset))
+    out.extend(block)
+    out.extend(scores)
+    return bytes(out)
+
+
 def main() -> int:
-    if len(sys.argv) != 5:
+    if len(sys.argv) not in (5, 6):
         print(__doc__)
         return 2
 
     corpus_path, lexicon_path, target, heldout_path = (Path(p) for p in sys.argv[1:5])
+    trigram_path = Path(sys.argv[5]) if len(sys.argv) == 6 else None
 
     print(f"reading {lexicon_path}")
     words = read_lexicon(lexicon_path)
@@ -270,6 +346,14 @@ def main() -> int:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(blob)
     print(f"wrote {target}  {len(blob):,} bytes")
+
+    if trigram_path is not None:
+        print("building trigrams")
+        triples = count_triples(train, index_of)
+        trigram_blob = encode_trigrams(triples, len(words), fingerprint)
+        trigram_path.parent.mkdir(parents=True, exist_ok=True)
+        trigram_path.write_bytes(trigram_blob)
+        print(f"wrote {trigram_path}  {len(trigram_blob):,} bytes")
 
     # Only as many held-out sentences as the evaluation needs; the rest is dead weight in the repo.
     heldout_path.parent.mkdir(parents=True, exist_ok=True)
