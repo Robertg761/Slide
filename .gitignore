@@ -23,3 +23,4 @@ __pycache__/
 # there is no way to rebuild them at install time, so they ship.
 !engine/src/main/assets/lexicon_en.bin
 !engine/src/main/assets/bigrams_en.bin
+!core/src/main/assets/emoji.bin
