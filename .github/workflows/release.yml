@@ -39,7 +39,13 @@ jobs:
         shell: bash
         run: |
           set -eu
-          yes | sdkmanager \
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          sdkmanager="$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          [[ -x "$sdkmanager" ]] || {
+            echo "Pinned Android SDK manager was not found at $sdkmanager" >&2
+            exit 1
+          }
+          yes | "$sdkmanager" \
             "platforms;android-37" \
             "build-tools;36.0.0" \
             "ndk;28.2.13676358" \
@@ -183,7 +189,13 @@ jobs:
         shell: bash
         run: |
           set -eu
-          yes | sdkmanager "build-tools;36.0.0" >/dev/null
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          sdkmanager="$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          [[ -x "$sdkmanager" ]] || {
+            echo "Pinned Android SDK manager was not found at $sdkmanager" >&2
+            exit 1
+          }
+          yes | "$sdkmanager" "build-tools;36.0.0" >/dev/null
 
       - name: Sign without checking out or executing repository code
         env:
