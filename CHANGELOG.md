@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.3.1] - 2026-08-10
+
 ### Fixed
 
 - A neural swipe that produced no terminal candidate now runs the deterministic decoder instead
@@ -25,8 +27,9 @@
   action keys retain their stronger surfaces. Keycaps use more consistent rounding and spacing.
 - The best suggestion occupies the centre cell, the idle strip stays visually quiet, the space
   bar uses a user-facing language label, and the gesture trail is continuous and smoothed.
-- The suggestion strip now has a permanent settings control with full touch and accessibility
-  targets, calmer candidate emphasis, and rounded pressed states alongside the voice control.
+- The suggestion strip now has an unmistakable gear control with full touch and accessibility
+  targets. It opens a themed, scrollable preferences panel inside the keyboard window, and editor
+  transitions always close that panel so another app cannot inherit a stale settings surface.
 - Key previews stay within the keyboard width, alternate-character selection cancels cleanly when
   the finger leaves its interaction corridor, and popup surfaces use consistent rounding.
 - Swipe-time drawing reuses action-icon paths, popup geometry, and preview backgrounds instead of

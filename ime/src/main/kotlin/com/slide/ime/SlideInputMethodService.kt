@@ -1,7 +1,6 @@
 package com.slide.ime
 
 import android.content.Context
-import android.content.Intent
 import android.content.res.Configuration
 import android.inputmethodservice.InputMethodService
 import android.media.AudioManager
@@ -62,6 +61,7 @@ import com.slide.ime.view.EmojiGlyphs
 import com.slide.ime.view.EmojiPanelView
 import com.slide.ime.view.EnterAction
 import com.slide.ime.view.KeyboardFrame
+import com.slide.ime.view.KeyboardSettingsPanelView
 import com.slide.ime.view.KeyboardView
 import com.slide.ime.view.ShiftState
 import com.slide.ime.view.SuggestionStripView
@@ -84,6 +84,7 @@ class SlideInputMethodService :
     InputMethodService(),
     KeyboardView.Listener,
     SuggestionStripView.Listener,
+    KeyboardSettingsPanelView.Listener,
     EmojiPanelView.Listener,
     VoiceOverlayView.Listener,
     VoiceInputClient.Listener {
@@ -95,6 +96,7 @@ class SlideInputMethodService :
     private var suggestionStrip: SuggestionStripView? = null
     private var voiceOverlay: VoiceOverlayView? = null
     private var emojiPanel: EmojiPanelView? = null
+    private var keyboardSettingsPanel: KeyboardSettingsPanelView? = null
     private var keyboardFrame: KeyboardFrame? = null
     private var inputRoot: View? = null
     private var settings = KeyboardSettings()
@@ -328,6 +330,7 @@ class SlideInputMethodService :
                     gestureKeyMapCache = null
                 }
                 keyboardView?.settings = updated
+                keyboardSettingsPanel?.settings = updated
                 emojiPanel?.skinTone = updated.emojiSkinTone
                 updateGestureAvailability()
 
@@ -501,22 +504,30 @@ class SlideInputMethodService :
             }
             visibility = View.GONE
         }
+        val keyboardSettings = KeyboardSettingsPanelView(this).apply {
+            listener = this@SlideInputMethodService
+            keyboardTheme = theme
+            settings = this@SlideInputMethodService.settings
+            visibility = View.GONE
+        }
 
         suggestionStrip = strip
         keyboardView = view
         gestureKeyMapCache = null
         voiceOverlay = overlay
         emojiPanel = emoji
+        keyboardSettingsPanel = keyboardSettings
         updateGestureAvailability()
 
-        // The picker and the voice overlay sit on top of the keys rather than replacing them, so the
-        // input view keeps exactly the same height whichever is open. Swapping in a panel of a
-        // different height would resize the window and shove the app's text around mid-sentence.
+        // Emoji, voice, and settings sit on top of the keys rather than replacing them, so the
+        // input view keeps exactly the same height whichever panel is open. Swapping in a child of
+        // a different height would resize the window and shove the app's text around mid-sentence.
         // KeyboardFrame is what holds them to the keys' height; the keys must be added first.
         val keys = KeyboardFrame(this).apply {
             addView(view, MATCH_PARENT, WRAP_CONTENT)
             addView(emoji, MATCH_PARENT, MATCH_PARENT)
             addView(overlay, MATCH_PARENT, MATCH_PARENT)
+            addView(keyboardSettings, MATCH_PARENT, MATCH_PARENT)
         }
         keyboardFrame = keys
 
@@ -535,11 +546,13 @@ class SlideInputMethodService :
         // which an old speech result could otherwise see the framework's new InputConnection.
         editorGeneration++
         cancelVoiceForEditorTransition()
+        hideKeyboardSettingsPanel(restoreEditorUi = false)
     }
 
     override fun onFinishInput() {
         editorGeneration++
         cancelVoiceForEditorTransition()
+        hideKeyboardSettingsPanel(restoreEditorUi = false)
         super.onFinishInput()
     }
 
@@ -547,6 +560,7 @@ class SlideInputMethodService :
         super.onStartInputView(info, restarting)
         editorGeneration++
         cancelVoiceForEditorTransition()
+        hideKeyboardSettingsPanel(restoreEditorUi = false)
         exitEmojiSearch(showPicker = false)
         layer = Layer.ALPHA
         hideEmojiPanel()
@@ -597,6 +611,7 @@ class SlideInputMethodService :
         suggestionStrip?.keyboardTheme = theme
         voiceOverlay?.keyboardTheme = theme
         emojiPanel?.keyboardTheme = theme
+        keyboardSettingsPanel?.keyboardTheme = theme
         // The frame's navigation-bar strip and any rounding the window puts around the input view
         // are the two places the keyboard's own colour does not otherwise reach, and both sit right
         // along the bottom edge where a mismatch reads as the keyboard not fitting the screen.
@@ -618,6 +633,7 @@ class SlideInputMethodService :
         cancelVoiceForEditorTransition()
         exitEmojiSearch(showPicker = false)
         hideEmojiPanel()
+        hideKeyboardSettingsPanel(restoreEditorUi = false)
         if (voiceClientDelegate.isInitialized()) voiceClient.unbind()
         voiceCancellationPending = false
         if (learnedPersistence.deletionPending) scheduleLearnedDataDelete()
@@ -634,6 +650,7 @@ class SlideInputMethodService :
         super.onFinishInputView(finishingInput)
         editorGeneration++
         cancelVoiceForEditorTransition()
+        hideKeyboardSettingsPanel(restoreEditorUi = false)
         literalWordInProgress = false
         abandonComposing()
         cachedSelectionStart = -1
@@ -667,6 +684,11 @@ class SlideInputMethodService :
             true
         }
 
+        keyboardSettingsPanelShown -> {
+            hideKeyboardSettingsPanel(restoreEditorUi = true)
+            true
+        }
+
         searchModeShown -> {
             exitEmojiSearch(showPicker = true)
             true
@@ -692,6 +714,15 @@ class SlideInputMethodService :
     }
 
     private var backCallbackRegistered = false
+
+    private fun refreshBackCallback() {
+        setBackCallbackRegistered(
+            voiceOverlayShown ||
+                keyboardSettingsPanelShown ||
+                searchModeShown ||
+                emojiPanelShown,
+        )
+    }
 
     private fun setBackCallbackRegistered(registered: Boolean) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
@@ -725,6 +756,7 @@ class SlideInputMethodService :
         suggestionStrip = null
         voiceOverlay = null
         emojiPanel = null
+        keyboardSettingsPanel = null
         super.onDestroy()
     }
 
@@ -781,7 +813,10 @@ class SlideInputMethodService :
             clearSuggestions()
             return false
         }
-        if (searchModeShown || emojiPanelShown || voiceOverlayShown || layer != Layer.ALPHA) return false
+        if (
+            searchModeShown || emojiPanelShown || voiceOverlayShown ||
+            keyboardSettingsPanelShown || layer != Layer.ALPHA
+        ) return false
 
         val decoder = gestureDecoder ?: return false
         val connection = currentInputConnection ?: return false
@@ -816,7 +851,10 @@ class SlideInputMethodService :
 
     override fun onGesturePreview(points: List<GesturePoint>) {
         if (!settings.gestureTypingEnabled || !editorInputPolicy.allowsSuggestions) return
-        if (searchModeShown || emojiPanelShown || voiceOverlayShown || layer != Layer.ALPHA) return
+        if (
+            searchModeShown || emojiPanelShown || voiceOverlayShown ||
+            keyboardSettingsPanelShown || layer != Layer.ALPHA
+        ) return
         if (gestureDecoder == null || currentGestureKeyMap() == null) return
 
         pendingGesturePreview = points
@@ -983,14 +1021,65 @@ class SlideInputMethodService :
 
     override fun onSettingsRequested() {
         performHaptic()
-        val intent = packageManager.getLaunchIntentForPackage(packageName)
-        if (intent == null) {
-            announce("Slide settings are unavailable")
-            return
+        if (keyboardSettingsPanelShown) {
+            hideKeyboardSettingsPanel(restoreEditorUi = true)
+        } else {
+            showKeyboardSettingsPanel()
         }
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        startActivity(intent)
     }
+
+    override fun onKeyboardSettingsDismissed() {
+        performHaptic()
+        hideKeyboardSettingsPanel(restoreEditorUi = true)
+    }
+
+    override fun onKeyboardSettingsChanged(settings: KeyboardSettings) {
+        performHaptic()
+        // The panel carries its complete latest snapshot, so two quick toggles cannot overwrite
+        // each other while DataStore serialises the writes.
+        scope.launch { settingsRepository.update { settings } }
+    }
+
+    private fun showKeyboardSettingsPanel() {
+        val panel = keyboardSettingsPanel ?: return
+        if (panel.visibility == View.VISIBLE) return
+
+        // Settings are an interaction mode, not a new Android task. Settle the current word and
+        // close mutually exclusive panels before covering the keys in-place.
+        currentInputConnection?.let(::finishComposing)
+        if (voiceOverlayShown) onVoiceDismissed(committed = false)
+        exitEmojiSearch(showPicker = false)
+        hideEmojiPanel()
+        clearSuggestions()
+
+        panel.settings = settings
+        panel.visibility = View.VISIBLE
+        suggestionStrip?.voiceEnabled = false
+        suggestionStrip?.setEmptyMessage("Keyboard settings")
+        updateGestureAvailability()
+        refreshBackCallback()
+        panel.announceForAccessibility("Keyboard settings opened")
+    }
+
+    private fun hideKeyboardSettingsPanel(restoreEditorUi: Boolean) {
+        val panel = keyboardSettingsPanel ?: return
+        if (panel.visibility != View.VISIBLE) return
+        panel.visibility = View.GONE
+
+        suggestionStrip?.voiceEnabled = editorInputPolicy.allowsVoice
+        clearSuggestions()
+        refreshSuggestionEmptyMessage()
+        updateGestureAvailability()
+        refreshBackCallback()
+        if (restoreEditorUi) {
+            updateShiftFromCursor()
+            updatePredictions()
+            keyboardView?.announceForAccessibility("Keyboard settings closed")
+        }
+    }
+
+    private val keyboardSettingsPanelShown: Boolean
+        get() = keyboardSettingsPanel?.visibility == View.VISIBLE
 
     /**
      * Holding a candidate teaches the keyboard a word, or takes one back.
@@ -1091,6 +1180,7 @@ class SlideInputMethodService :
     private fun refreshSuggestionEmptyMessage() {
         suggestionStrip?.setEmptyMessage(
             when {
+                keyboardSettingsPanelShown -> "Keyboard settings"
                 passwordField -> "Suggestions are off in password fields"
                 !editorInputPolicy.allowsSuggestions -> "Suggestions are off in this field"
                 !settings.suggestionsEnabled -> "Suggestions are disabled"
@@ -1179,7 +1269,7 @@ class SlideInputMethodService :
             emojiPanel?.visibility = View.VISIBLE
         }
         updateGestureAvailability()
-        setBackCallbackRegistered(if (showPicker) true else emojiPanelShown || voiceOverlayShown)
+        refreshBackCallback()
     }
 
     override fun onSearchQueryChanged(query: String) {
@@ -1328,7 +1418,7 @@ class SlideInputMethodService :
             state = VoiceInput.State.Idle
         }
         updateGestureAvailability()
-        setBackCallbackRegistered(emojiPanelShown)
+        refreshBackCallback()
     }
 
     /** Cancels asynchronous speech before an editor generation can be replaced. */
@@ -1373,7 +1463,7 @@ class SlideInputMethodService :
             visibility = View.GONE
         }
         updateGestureAvailability()
-        setBackCallbackRegistered(voiceOverlayShown)
+        refreshBackCallback()
     }
 
     private val searchModeShown: Boolean
@@ -1675,7 +1765,8 @@ class SlideInputMethodService :
             layer == Layer.ALPHA &&
             !searchModeShown &&
             !emojiPanelShown &&
-            !voiceOverlayShown
+            !voiceOverlayShown &&
+            !keyboardSettingsPanelShown
     }
 
     // endregion
@@ -1688,7 +1779,7 @@ class SlideInputMethodService :
 
     /** Reuses immutable geometry until a layout-affecting event invalidates it. */
     private fun currentGestureKeyMap(): GestureKeyMap? {
-        if (layer != Layer.ALPHA || searchModeShown) return null
+        if (layer != Layer.ALPHA || searchModeShown || keyboardSettingsPanelShown) return null
         gestureKeyMapCache?.let { return it }
         return keyboardView?.gestureKeyMap()?.also { gestureKeyMapCache = it }
     }
@@ -2185,7 +2276,7 @@ class SlideInputMethodService :
     private fun updatePredictions() {
         if (composing.isNotEmpty()) return
         if (!fieldSuggestionsEnabled()) return
-        if (searchModeShown || emojiPanelShown || voiceOverlayShown) return
+        if (searchModeShown || emojiPanelShown || voiceOverlayShown || keyboardSettingsPanelShown) return
 
         val suggester = typingSuggester ?: return
         val context = precedingContextForSwipe()
@@ -2307,7 +2398,7 @@ class SlideInputMethodService :
         if (selectionStart != selectionEnd || selectionStart < 0) return
         if (stripMode != StripMode.Empty) return
         if (!fieldSuggestionsEnabled()) return
-        if (searchModeShown || emojiPanelShown || voiceOverlayShown) return
+        if (searchModeShown || emojiPanelShown || voiceOverlayShown || keyboardSettingsPanelShown) return
 
         val suggester = typingSuggester ?: return
         val keys = currentGestureKeyMap() ?: return

@@ -18,6 +18,8 @@ import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
 import androidx.customview.widget.ExploreByTouchHelper
 import com.slide.core.theme.KeyboardTheme
 import com.slide.core.theme.Themes
+import kotlin.math.cos
+import kotlin.math.sin
 
 /**
  * The row of word candidates above the keys.
@@ -290,32 +292,34 @@ class SuggestionStripView(context: Context) : View(context) {
     private fun drawSettingsButton(canvas: Canvas) {
         val centerX = settingsWidth() / 2f
         val centerY = height / 2f
+
+        pressedPaint.color = keyboardTheme.specialKeyBackground
+        canvas.drawCircle(centerX, centerY, height * 0.36f, pressedPaint)
         if (settingsPressed) {
             pressedPaint.color = keyboardTheme.keyPressedOverlay
             canvas.drawCircle(centerX, centerY, height * 0.4f, pressedPaint)
         }
 
-        dividerPaint.color = keyboardTheme.divider
-        val inset = dp(10f)
-        canvas.drawLine(settingsWidth(), inset, settingsWidth(), height - inset, dividerPaint)
-
-        // Three compact sliders read clearly as customization without relying on a font glyph.
+        // A conventional gear is immediately recognisable as settings. The previous sliders
+        // glyph was visually tidy but ambiguous enough to hide this feature in plain sight.
         iconPaint.color = keyboardTheme.suggestionText
         iconPaint.style = Paint.Style.STROKE
-        iconPaint.strokeWidth = dp(1.8f)
-        val left = centerX - dp(8f)
-        val right = centerX + dp(8f)
-        for (row in 0..2) {
-            val y = centerY + dp((row - 1) * 6f)
-            val knobX = when (row) {
-                0 -> centerX - dp(3f)
-                1 -> centerX + dp(4f)
-                else -> centerX - dp(1f)
-            }
-            canvas.drawLine(left, y, right, y, iconPaint)
-            iconPaint.style = Paint.Style.FILL
-            canvas.drawCircle(knobX, y, dp(2.3f), iconPaint)
-            iconPaint.style = Paint.Style.STROKE
+        iconPaint.strokeWidth = dp(2.4f)
+        iconPaint.strokeCap = Paint.Cap.ROUND
+        canvas.drawCircle(centerX, centerY, dp(5.6f), iconPaint)
+        val toothInner = dp(7f)
+        val toothOuter = dp(9.3f)
+        repeat(8) { index ->
+            val angle = Math.toRadians(index * 45.0)
+            val dx = cos(angle).toFloat()
+            val dy = sin(angle).toFloat()
+            canvas.drawLine(
+                centerX + dx * toothInner,
+                centerY + dy * toothInner,
+                centerX + dx * toothOuter,
+                centerY + dy * toothOuter,
+                iconPaint,
+            )
         }
     }
 
