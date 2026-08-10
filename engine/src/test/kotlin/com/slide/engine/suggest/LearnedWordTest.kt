@@ -91,6 +91,14 @@ class LearnedWordTest {
         assertTrue("expected 'kubernetes' among $offered", "kubernetes" in offered)
     }
 
+    @Test
+    fun `a learned completion retains meaningful casing`() {
+        learned.learn("iPhoneX", weight = 3)
+        val offered = suggester.suggest("iphon", keys).words.map { it.word }
+
+        assertTrue("expected 'iPhoneX' among $offered", "iPhoneX" in offered)
+    }
+
     /**
      * Learning must not disturb the shipped dictionary. A corpus word stays exactly as it was,
      * whatever the user has taught the keyboard alongside it.

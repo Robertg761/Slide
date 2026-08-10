@@ -32,12 +32,14 @@ class UserDictionary(
      * Sorted so prefixes are contiguous, concurrent because it is written from the input thread
      * and read from whatever thread persists it.
      */
-    private val counts = ConcurrentSkipListMap<String, Int>()
+    private data class Entry(val surface: SurfaceForm, val count: Int)
 
-    val size: Int get() = counts.size
+    private val words = ConcurrentSkipListMap<String, Entry>()
 
-    /** Every word and its count, for persistence. */
-    fun entries(): List<Pair<String, Int>> = counts.map { it.key to it.value }
+    val size: Int get() = words.size
+
+    /** Every word in its best-known surface form, and its count, for persistence. */
+    fun entries(): List<Pair<String, Int>> = words.values.map { it.surface.value to it.count }
 
     /**
      * Records one deliberate use, returning whether the word is now trusted.
@@ -47,23 +49,33 @@ class UserDictionary(
      *   on its own to trust the word immediately.
      */
     fun learn(word: String, weight: Int = 1): Boolean {
-        if (!isLearnable(word)) return false
+        if (!isLearnable(word) || weight <= 0) return false
         val key = word.lowercase()
-        val updated = counts.merge(key, weight) { old, new -> minOf(old + new, MAX_COUNT) } ?: weight
-        if (counts.size > capacity) trim()
-        return updated >= trustThreshold
+        val updated = words.merge(
+            key,
+            Entry(SurfaceForm.first(word), minOf(weight, MAX_COUNT)),
+        ) { old, new ->
+            Entry(
+                // Weight measures lexical trust, not how many times this exact casing was seen.
+                // A revert worth two trust points is still one casing observation.
+                surface = old.surface.observe(word),
+                count = minOf(old.count + new.count, MAX_COUNT),
+            )
+        } ?: Entry(SurfaceForm.first(word), minOf(weight, MAX_COUNT))
+        if (words.size > capacity) trim()
+        return updated.count >= trustThreshold
     }
 
     /** Removes a word outright, and remembers nothing about it. */
-    fun forget(word: String): Boolean = counts.remove(word.lowercase()) != null
+    fun forget(word: String): Boolean = words.remove(word.lowercase()) != null
 
-    fun clear() = counts.clear()
+    fun clear() = words.clear()
 
     /** Whether the word has been used often enough to be defended from autocorrect. */
     fun isTrusted(word: String): Boolean =
-        (counts[word.lowercase()] ?: 0) >= trustThreshold
+        (words[word.lowercase()]?.count ?: 0) >= trustThreshold
 
-    fun countOf(word: String): Int = counts[word.lowercase()] ?: 0
+    fun countOf(word: String): Int = words[word.lowercase()]?.count ?: 0
 
     /**
      * Trusted words beginning with [prefix], commonest first.
@@ -74,21 +86,31 @@ class UserDictionary(
     fun completions(prefix: String, limit: Int): List<String> {
         if (prefix.isEmpty()) return emptyList()
         val lower = prefix.lowercase()
-        return counts.tailMap(lower)
+        return words.tailMap(lower)
             .asSequence()
             .takeWhile { it.key.startsWith(lower) }
-            .filter { it.value >= trustThreshold && it.key.length > lower.length }
-            .sortedByDescending { it.value }
+            .filter { it.value.count >= trustThreshold && it.key.length > lower.length }
+            .sortedByDescending { it.value.count }
             .take(limit)
-            .map { it.key }
+            .map { it.value.surface.value }
             .toList()
     }
 
     /** Loads persisted counts, replacing anything held. */
     fun restore(saved: List<Pair<String, Int>>) {
-        counts.clear()
+        words.clear()
         for ((word, count) in saved) {
-            if (isLearnable(word) && count > 0) counts[word.lowercase()] = minOf(count, MAX_COUNT)
+            if (!isLearnable(word) || count <= 0) continue
+            val key = word.lowercase()
+            words.merge(
+                key,
+                Entry(SurfaceForm.restored(word, count), minOf(count, MAX_COUNT)),
+            ) { old, new ->
+                Entry(
+                    surface = old.surface.merge(new.surface),
+                    count = minOf(old.count + new.count, MAX_COUNT),
+                )
+            }
         }
     }
 
@@ -103,11 +125,11 @@ class UserDictionary(
 
     /** Drops the least-used quarter, which is where anything learned by accident will be. */
     private fun trim() {
-        val doomed = counts.entries
-            .sortedBy { it.value }
-            .take(counts.size - capacity * 3 / 4)
+        val doomed = words.entries
+            .sortedBy { it.value.count }
+            .take(words.size - capacity * 3 / 4)
             .map { it.key }
-        doomed.forEach(counts::remove)
+        doomed.forEach(words::remove)
     }
 
     private companion object {

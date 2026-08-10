@@ -306,14 +306,20 @@ class TypingSuggester(
     ): List<String> {
         if (previousWord.isNullOrEmpty() || limit <= 0) return emptyList()
 
-        val ranked = LinkedHashMap<String, Float>()
+        // Keyed by the normalised spelling so a retained personal surface such as `Whitmore`
+        // cannot appear beside the corpus's lowercase copy of the same word.
+        val ranked = LinkedHashMap<String, Pair<String, Float>>()
 
         // This person's own habits first, and outright rather than by score: a phrase somebody
         // writes over and over is a better guess at their next word than the corpus average, which
         // is the entire reason for keeping it.
         userBigrams?.successorsOf(previousWord)?.forEach { (word, _) ->
+            val index = lexicon.indexOf(word)
+            if (blockOffensive && index >= 0 && lexicon.isOffensive(index)) return@forEach
             val strength = userBigrams.score(previousWord, word)
-            if (strength > 0f) ranked[word] = PERSONAL_PREDICTION_FLOOR + strength
+            if (strength > 0f) {
+                ranked[word.lowercase()] = word to (PERSONAL_PREDICTION_FLOOR + strength)
+            }
         }
 
         val model = bigrams
@@ -322,15 +328,16 @@ class TypingSuggester(
             for (index in model.topSuccessors(context, limit * 2)) {
                 if (blockOffensive && lexicon.isOffensive(index)) continue
                 val word = lexicon.wordAt(index)
-                if (ranked.containsKey(word.lowercase())) continue
-                ranked[word] = model.score(context, index)
+                val key = lexicon.lowercaseAt(index)
+                if (ranked.containsKey(key)) continue
+                ranked[key] = word to model.score(context, index)
             }
         }
 
-        return ranked.entries
-            .sortedByDescending { it.value }
+        return ranked.values
+            .sortedByDescending { it.second }
             .take(limit)
-            .map { it.key }
+            .map { it.first }
     }
 
     /**
@@ -371,6 +378,7 @@ class TypingSuggester(
 
         val completions = collectCompletions(lower, blockOffensive)
         if (lower.length >= config.minCorrectionLength) collectCorrections(lower, blockOffensive)
+        collectUnambiguousContraction(lower, blockOffensive)
 
         val ranked = rank(shown, completions, properNounsUnmarked = typed.none(Char::isUpperCase))
 
@@ -492,6 +500,20 @@ class TypingSuggester(
         }
     }
 
+    /**
+     * Apostrophe restoration for forms whose unpunctuated spelling has no competing word.
+     *
+     * The general corrector deliberately refuses to judge two-letter inputs, which is right for
+     * almost all of them but leaves `im` outside its reach. Keep this list explicit and small:
+     * `id` and `ill` are real words, so only `im` and `ive` are safe enough to change silently.
+     */
+    private fun collectUnambiguousContraction(lower: String, blockOffensive: Boolean) {
+        val target = UNAMBIGUOUS_CONTRACTIONS[lower] ?: return
+        val index = lexicon.indexOf(target)
+        if (index < 0 || (blockOffensive && lexicon.isOffensive(index))) return
+        corrections[index] = minOf(corrections[index] ?: Float.MAX_VALUE, config.apostropheCost)
+    }
+
     private fun offerCorrection(length: Int, cost: Float, blockOffensive: Boolean) {
         val index = lexicon.indexOf(buffer, length)
         if (index < 0) return
@@ -566,6 +588,16 @@ class TypingSuggester(
     ): String? {
         // A word the dictionary already knows is not a typo, whatever else scores well.
         if (isKnownWord) return null
+
+        // These are intentionally stronger than the generic margin and prefix guards: both are
+        // explicit, unambiguous missing-apostrophe forms, and `im` would otherwise be rejected as
+        // too short while the many words beginning "im" would make it look unfinished.
+        val contraction = UNAMBIGUOUS_CONTRACTIONS[lower]
+        if (contraction != null) {
+            val index = lexicon.indexOf(contraction)
+            if (index >= 0 && corrections.containsKey(index)) return lexicon.wordAt(index)
+        }
+
         if (lower.length < config.minCorrectionLength) return null
 
         val best = ranked.firstOrNull() ?: return null
@@ -606,7 +638,15 @@ class TypingSuggester(
         val result = ArrayList<WordSuggestion>(config.maxResults)
 
         if (autocorrection != null) {
-            result.add(ranked.first())
+            // Most autocorrections are the top-ranked item. Explicit high-confidence rules (the
+            // short I-contractions) can deliberately override that ordering, so find the item
+            // that space will actually commit instead of showing a different candidate first.
+            result.add(
+                ranked.firstOrNull {
+                    it.kind == WordSuggestion.Kind.Correction &&
+                        it.word.equals(autocorrection, ignoreCase = true)
+                } ?: WordSuggestion(autocorrection, 0f, WordSuggestion.Kind.Correction),
+            )
             result.add(literal)
         } else {
             // The literal, not the dictionary's copy of it: someone who typed "iPhone" or "hello"
@@ -798,5 +838,11 @@ class TypingSuggester(
          * out on purpose and still expect back: "dont", "wont", "cant", "im".
          */
         val INSERTABLE = CharArray(27) { if (it < 26) 'a' + it else '\'' }
+
+        /** Missing-apostrophe forms that are not also ordinary words. */
+        val UNAMBIGUOUS_CONTRACTIONS = mapOf(
+            "im" to "i'm",
+            "ive" to "i've",
+        )
     }
 }

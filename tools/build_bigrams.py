@@ -21,6 +21,7 @@ Bigrams are keyed by lexicon index, so this must be rebuilt whenever the lexicon
     "SBIG"          magic
     u8              format version
     u32             word count of the lexicon these indices refer to
+    [lexicon hash]  32-byte SHA-256 of ordered lowercase words, each followed by NUL
     u32             context count (distinct preceding words that have successors)
     u32             pair count
     u32             byte length of the successor block
@@ -38,6 +39,7 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import struct
@@ -46,7 +48,7 @@ from collections import defaultdict
 from pathlib import Path
 
 MAGIC = b"SBIG"
-VERSION = 1
+VERSION = 2
 
 LEXICON_MAGIC = b"SLEX"
 
@@ -115,6 +117,17 @@ def read_lexicon(path: Path) -> list[str]:
     return words
 
 
+def lexicon_fingerprint(words: list[str]) -> bytes:
+    """Stable identity of the exact ordered word list that the pair indices address."""
+    digest = hashlib.sha256()
+    for word in words:
+        if word != word.lower():
+            raise SystemExit(f"lexicon word is not lowercase: {word!r}")
+        digest.update(word.encode("ascii"))
+        digest.update(b"\0")
+    return digest.digest()
+
+
 def sentences(path: Path) -> tuple[list[str], list[str]]:
     """Splits the corpus into training and held-out sentences by id."""
     train: list[str] = []
@@ -176,7 +189,14 @@ def varint(value: int, out: bytearray) -> None:
     out.append(value)
 
 
-def encode(pairs: dict[int, dict[int, int]], word_count: int) -> bytes:
+def encode(
+    pairs: dict[int, dict[int, int]],
+    word_count: int,
+    fingerprint: bytes,
+) -> bytes:
+    if len(fingerprint) != hashlib.sha256().digest_size:
+        raise ValueError("lexicon fingerprint must be a SHA-256 digest")
+
     contexts: list[int] = []
     offsets: list[int] = [0]
     block = bytearray()
@@ -210,7 +230,9 @@ def encode(pairs: dict[int, dict[int, int]], word_count: int) -> bytes:
     out = bytearray()
     out.extend(MAGIC)
     out.append(VERSION)
-    out.extend(struct.pack(">IIII", word_count, len(contexts), len(scores), len(block)))
+    out.extend(struct.pack(">I", word_count))
+    out.extend(fingerprint)
+    out.extend(struct.pack(">III", len(contexts), len(scores), len(block)))
     for context in contexts:
         out.extend(struct.pack(">I", context))
     for offset in offsets:
@@ -231,6 +253,8 @@ def main() -> int:
     words = read_lexicon(lexicon_path)
     index_of = {word: index for index, word in enumerate(words)}
     print(f"  lexicon       {len(words):,} words")
+    fingerprint = lexicon_fingerprint(words)
+    print(f"  fingerprint   {fingerprint.hex()}")
 
     print(f"reading {corpus_path}")
     train, heldout = sentences(corpus_path)
@@ -241,7 +265,7 @@ def main() -> int:
         return 1
 
     pairs = count_pairs(train, index_of)
-    blob = encode(pairs, len(words))
+    blob = encode(pairs, len(words), fingerprint)
 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(blob)

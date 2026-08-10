@@ -8,7 +8,6 @@ import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
-import android.text.InputType
 import android.util.Log
 import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
@@ -35,6 +34,7 @@ import com.slide.core.settings.SettingsRepository
 import com.slide.core.theme.KeyboardTheme
 import com.slide.core.theme.Themes
 import com.slide.engine.gesture.GestureDecoder
+import com.slide.engine.gesture.GestureKeyMap
 import com.slide.engine.gesture.GesturePoint
 import com.slide.engine.lexicon.BigramLoader
 import com.slide.engine.lexicon.LexiconLoader
@@ -42,7 +42,10 @@ import com.slide.engine.lexicon.UserBigrams
 import com.slide.engine.lexicon.UserDictionary
 import com.slide.engine.lexicon.UserDictionaryStore
 import com.slide.engine.suggest.TypingSuggester
+import com.slide.ime.text.EditorInputPolicy
 import com.slide.ime.text.PrecedingWord
+import com.slide.ime.text.SelectionUpdate
+import com.slide.ime.text.matchTypedCase
 import com.slide.ime.view.EmojiGlyphs
 import com.slide.ime.view.EmojiPanelView
 import com.slide.ime.view.EnterAction
@@ -51,13 +54,18 @@ import com.slide.ime.view.KeyboardView
 import com.slide.ime.view.ShiftState
 import com.slide.ime.view.SuggestionStripView
 import com.slide.ime.view.VoiceOverlayView
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 class SlideInputMethodService :
@@ -78,6 +86,7 @@ class SlideInputMethodService :
     private var keyboardFrame: KeyboardFrame? = null
     private var inputRoot: View? = null
     private var settings = KeyboardSettings()
+    private var settingsLoaded = false
 
     /**
      * Connected to the speech process only while the keyboard is on screen.
@@ -97,11 +106,19 @@ class SlideInputMethodService :
     private var lastShiftTapMs = 0L
     private var lastSpaceCommitMs = 0L
 
-    /** Set when the field asks us not to learn from input (password fields, incognito browsers). */
-    private var incognito = false
+    /** Set when the field or the user asks us not to learn from input. */
+    // Fail closed until the first persisted settings snapshot arrives. The language engines are
+    // gated on that snapshot too, but emoji recents can become interactive independently.
+    private var incognito = true
 
     /** Password fields get no suggestions at all, not merely no learning. */
     private var passwordField = false
+
+    /** One policy shared by typing, swiping, prediction, and personalized learning. */
+    private var editorInputPolicy = EditorInputPolicy.NaturalText
+
+    /** Whether the active editor set IME_FLAG_NO_PERSONALIZED_LEARNING. */
+    private var editorRequestsNoLearning = false
 
     /**
      * Null until the lexicon finishes loading, and permanently null if the asset is unreadable.
@@ -113,6 +130,14 @@ class SlideInputMethodService :
 
     /** Shares the lexicon with the decoder; null until it loads, for the same reason. */
     private var typingSuggester: TypingSuggester? = null
+
+    /**
+     * The key geometry currently used by both typing and gesture scoring.
+     *
+     * GestureKeyMap is immutable. Reusing one until the view's bounds or layout changes avoids
+     * rebuilding both it and TypingSuggester's neighbour cache on every character.
+     */
+    private var gestureKeyMapCache: GestureKeyMap? = null
 
     /**
      * The words this person uses that the shipped dictionary does not have.
@@ -127,8 +152,10 @@ class SlideInputMethodService :
 
     private val userDictionaryStore by lazy { UserDictionaryStore(applicationContext) }
 
-    /** Set when something has been learned since the last save. */
-    private var learnedSinceSave = false
+    private val learnedDataReady = CompletableDeferred<Unit>()
+    private var learnedLoadStarted = false
+    private val learnedPersistence = LearnedDataPersistenceState()
+    private var observedLearnedDataClearEpoch: Long? = null
 
     private var emojiData: EmojiData? = null
     private var recentEmoji: List<String> = emptyList()
@@ -176,6 +203,16 @@ class SlideInputMethodService :
     private var composingAtEnd = true
 
     /**
+     * True when this word began as literal committed text rather than composing text.
+     *
+     * The model loads asynchronously and settings can change while a key is down. Once even one
+     * character of a word has bypassed composition, the rest must do the same; starting later
+     * would let autocorrect replace only the suffix. A separator, cursor move, or full-word reopen
+     * is the safe point at which the latch is reset.
+     */
+    private var literalWordInProgress = false
+
+    /**
      * Set whenever the keyboard itself edits the field, and cleared by the selection change that
      * results.
      *
@@ -220,9 +257,65 @@ class SlideInputMethodService :
         settingsRepository = SettingsRepository(applicationContext)
         settingsRepository.settings
             .onEach { updated ->
+                val previous = settings
                 settings = updated
+                settingsLoaded = true
+                incognito = editorRequestsNoLearning ||
+                    !editorInputPolicy.allowsPersonalizedLearning ||
+                    updated.incognitoModeEnabled
+
+                val previousClearEpoch = observedLearnedDataClearEpoch
+                observedLearnedDataClearEpoch = updated.learnedDataClearEpoch
+                if (previousClearEpoch == null && !learnedLoadStarted) {
+                    // Establish the persisted clear epoch before reading either file. Otherwise a
+                    // settings clear that wins startup could become our baseline after stale data
+                    // had already been restored into memory.
+                    learnedLoadStarted = true
+                    loadLearnedData()
+                } else if (
+                    previousClearEpoch != null &&
+                    previousClearEpoch != updated.learnedDataClearEpoch
+                ) {
+                    clearLearnedDataFromMemoryAndDisk()
+                }
+
+                if (
+                    previous.showNumberRow != updated.showNumberRow ||
+                    previous.keyHeightScale != updated.keyHeightScale ||
+                    previous.bottomPaddingDp != updated.bottomPaddingDp
+                ) {
+                    gestureKeyMapCache = null
+                }
                 keyboardView?.settings = updated
                 emojiPanel?.skinTone = updated.emojiSkinTone
+
+                val suggestionPolicyChanged =
+                    previous.suggestionsEnabled != updated.suggestionsEnabled ||
+                        previous.autocorrectEnabled != updated.autocorrectEnabled ||
+                        previous.blockOffensiveWords != updated.blockOffensiveWords
+                if (!fieldSuggestionsEnabled()) {
+                    if (composing.isNotEmpty()) {
+                        // The already-entered prefix is now committed literally. Keep the rest of
+                        // this same word literal even if the setting is immediately turned back on.
+                        literalWordInProgress = true
+                        abandonComposing()
+                    } else {
+                        clearSuggestions()
+                    }
+                } else if (suggestionPolicyChanged) {
+                    when {
+                        composing.isNotEmpty() -> updateTypingSuggestions()
+                        stripMode == StripMode.Prediction -> {
+                            clearSuggestions()
+                            updatePredictions()
+                        }
+                        stripMode == StripMode.Gesture &&
+                            previous.blockOffensiveWords != updated.blockOffensiveWords ->
+                            clearSuggestions()
+                    }
+                }
+
+                refreshSuggestionEmptyMessage()
                 applyTheme(resolveTheme())
             }
             .launchIn(scope)
@@ -235,13 +328,6 @@ class SlideInputMethodService :
             }
             .launchIn(scope)
 
-        scope.launch {
-            withContext(Dispatchers.IO) {
-                userDictionaryStore.load(userDictionary)
-                userDictionaryStore.load(userBigrams)
-            }
-        }
-
         // Roughly a megabyte to parse; doing it on the main thread would stall the first frame
         // of the keyboard, which is the one moment the user is definitely watching.
         scope.launch {
@@ -252,6 +338,10 @@ class SlideInputMethodService :
                 // corrector falls back to spelling alone.
                 words to words?.let { BigramLoader.load(applicationContext, it) }
             }
+            // Typing and swiping are the only paths that learn. Do not publish either engine until
+            // the persisted dictionaries have been restored, or a word learned in the gap could
+            // be wiped by restore completing a moment later.
+            learnedDataReady.await()
             if (lexicon != null) {
                 gestureDecoder = GestureDecoder(lexicon, bigrams = bigrams)
                 typingSuggester = TypingSuggester(
@@ -298,6 +388,13 @@ class SlideInputMethodService :
             keyboardTheme = theme
             keyboardLayout = Layouts.QwertyEn
             enterAction = EnterAction.RETURN
+            addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+                if (
+                    left != oldLeft || top != oldTop || right != oldRight || bottom != oldBottom
+                ) {
+                    gestureKeyMapCache = null
+                }
+            }
         }
         val overlay = VoiceOverlayView(this).apply {
             listener = this@SlideInputMethodService
@@ -317,6 +414,7 @@ class SlideInputMethodService :
 
         suggestionStrip = strip
         keyboardView = view
+        gestureKeyMapCache = null
         voiceOverlay = overlay
         emojiPanel = emoji
 
@@ -345,10 +443,16 @@ class SlideInputMethodService :
         exitEmojiSearch(showPicker = false)
         layer = Layer.ALPHA
         hideEmojiPanel()
-        passwordField = isPasswordField(info)
-        incognito = (info.imeOptions and EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) != 0 ||
-            passwordField
+        editorInputPolicy = EditorInputPolicy.from(info.inputType)
+        passwordField = editorInputPolicy.isPassword
+        editorRequestsNoLearning =
+            (info.imeOptions and EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) != 0
+        incognito = !settingsLoaded || editorRequestsNoLearning ||
+            !editorInputPolicy.allowsPersonalizedLearning ||
+            settings.incognitoModeEnabled
+        literalWordInProgress = false
         abandonComposing()
+        gestureKeyMapCache = null
 
         keyboardView?.apply {
             keyboardLayout = Layouts.QwertyEn
@@ -366,6 +470,7 @@ class SlideInputMethodService :
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        gestureKeyMapCache = null
         applyTheme(resolveTheme())
     }
 
@@ -395,6 +500,7 @@ class SlideInputMethodService :
         hideEmojiPanel()
         hideVoiceOverlay()
         voiceClient.unbind()
+        if (learnedPersistence.deletionPending) scheduleLearnedDataDelete()
         saveLearnedWords()
     }
 
@@ -406,6 +512,7 @@ class SlideInputMethodService :
      */
     override fun onFinishInputView(finishingInput: Boolean) {
         super.onFinishInputView(finishingInput)
+        literalWordInProgress = false
         abandonComposing()
     }
 
@@ -482,7 +589,9 @@ class SlideInputMethodService :
 
     override fun onDestroy() {
         voiceClient.unbind()
+        val finalLearnedData = captureFinalLearnedData()
         scope.cancel()
+        finalLearnedData?.let(::flushFinalLearnedData)
         keyboardView = null
         suggestionStrip = null
         voiceOverlay = null
@@ -532,13 +641,19 @@ class SlideInputMethodService :
     }
 
     override fun onGestureComplete(points: List<GesturePoint>) {
-        selfEdit = true
+        if (!settings.gestureTypingEnabled || !editorInputPolicy.allowsSuggestions) {
+            clearSuggestions()
+            return
+        }
+        if (searchModeShown || emojiPanelShown || voiceOverlayShown || layer != Layer.ALPHA) return
+
         val decoder = gestureDecoder ?: return
         val connection = currentInputConnection ?: return
-        val keys = keyboardView?.gestureKeyMap() ?: return
+        val keys = currentGestureKeyMap() ?: return
 
         // A swipe ends the typed word as surely as a space does. It also settles what the swiped
         // word will be predicted from, so the context is read after this rather than before.
+        if (composing.isNotEmpty()) selfEdit = true
         finishComposing(connection)
 
         val candidates = decoder.decode(
@@ -549,9 +664,15 @@ class SlideInputMethodService :
         )
         val best = candidates.firstOrNull() ?: return
 
+        selfEdit = true
         commitGestureWord(connection, best.word)
-        stripMode = StripMode.Gesture
-        suggestionStrip?.setSuggestions(candidates.map { it.word })
+        literalWordInProgress = false
+        if (settings.suggestionsEnabled) {
+            stripMode = StripMode.Gesture
+            suggestionStrip?.setSuggestions(candidates.map { it.word })
+        } else {
+            clearSuggestions()
+        }
     }
 
     override fun onCursorMove(steps: Int) {
@@ -567,6 +688,7 @@ class SlideInputMethodService :
                 (start + steps).coerceIn(0, extracted.text?.length ?: start)
             }
             connection.setSelection(target, target)
+            literalWordInProgress = false
             abandonComposing()
             updateShiftFromCursor()
             keyboardView?.announceForAccessibility("Cursor moved")
@@ -576,6 +698,7 @@ class SlideInputMethodService :
                 connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, direction))
                 connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, direction))
             }
+            literalWordInProgress = false
             abandonComposing()
         }
     }
@@ -587,6 +710,7 @@ class SlideInputMethodService :
         val selected = connection.getSelectedText(0)
         if (!selected.isNullOrEmpty()) {
             connection.commitText("", 1)
+            literalWordInProgress = false
             return
         }
 
@@ -596,6 +720,7 @@ class SlideInputMethodService :
         while (start > 0 && before[start - 1].isWhitespace()) start--
         while (start > 0 && !before[start - 1].isWhitespace()) start--
         connection.deleteSurroundingText(before.length - start, 0)
+        literalWordInProgress = false
         updateShiftFromCursor()
     }
 
@@ -634,7 +759,6 @@ class SlideInputMethodService :
      */
     override fun onSuggestionPicked(index: Int, word: String) {
         performHaptic()
-        selfEdit = true
         when (stripMode) {
             StripMode.Gesture -> pickGestureAlternative(index, word)
             StripMode.Typing -> pickTypedSuggestion(word)
@@ -662,15 +786,16 @@ class SlideInputMethodService :
             return
         }
 
-        if (userDictionary.countOf(word) > 0) {
+        if (userDictionary.isTrusted(word)) {
             userDictionary.forget(word)
+            userBigrams.forget(word)
             announce("Forgot $word")
         } else {
             if (incognito) return
             userDictionary.learn(word, weight = TRUSTED_AT_ONCE)
             announce("Learned $word")
         }
-        learnedSinceSave = true
+        learnedPersistence.markDirty()
         saveLearnedWords()
         // The strip was built against the old dictionary, so what it offers may have just changed.
         if (composing.isNotEmpty()) updateTypingSuggestions()
@@ -701,6 +826,7 @@ class SlideInputMethodService :
         val prefix = if (previous.startsWith(" ")) " " else ""
         val replacement = prefix + applyShift(word, lastGestureShift)
 
+        selfEdit = true
         connection.beginBatchEdit()
         connection.deleteSurroundingText(previous.length, 0)
         connection.commitText(replacement, 1)
@@ -728,6 +854,7 @@ class SlideInputMethodService :
         suggestionStrip?.setEmptyMessage(
             when {
                 passwordField -> "Suggestions are off in password fields"
+                !editorInputPolicy.allowsSuggestions -> "Suggestions are off in this field"
                 !settings.suggestionsEnabled -> "Suggestions are disabled"
                 else -> "Type or swipe for suggestions"
             },
@@ -904,6 +1031,7 @@ class SlideInputMethodService :
 
         connection.commitText(if (needsSpace) " $text" else text, 1)
         lastAutocorrect = null
+        literalWordInProgress = false
         updateShiftFromCursor()
     }
 
@@ -960,6 +1088,7 @@ class SlideInputMethodService :
         currentInputConnection?.commitText(emoji, 1)
         // Whatever the undo record pointed at is no longer what sits before the cursor.
         lastAutocorrect = null
+        literalWordInProgress = false
         // Recents are personal by definition, so an incognito or password field contributes none.
         if (!incognito) scope.launch { settingsRepository.recordEmojiUse(emoji) }
         updateShiftFromCursor()
@@ -1002,20 +1131,51 @@ class SlideInputMethodService :
         // looking.
         if (composing.isNotEmpty() && !composingAtEnd) abandonComposing()
 
-        if (isWordCharacter(text) && suggestionsAvailable()) {
-            recordTouch(composing.length, touchX, touchY)
-            composing.append(text)
-            connection.setComposingText(composing, 1)
-            updateTypingSuggestions()
+        if (isWordCharacter(text)) {
+            // A cursor can arrive at the edge of existing text without a useful selection callback
+            // (notably on initial focus). Starting a one-character composing suffix there is just
+            // as unsafe as starting one after an asynchronous model load.
+            if (
+                composing.isEmpty() &&
+                !literalWordInProgress &&
+                cursorTouchesWord(connection)
+            ) {
+                literalWordInProgress = true
+            }
+
+            val suggester = typingSuggester.takeIf { fieldSuggestionsEnabled() }
+            val keys = suggester?.let { currentGestureKeyMap() }
+            if (literalWordInProgress || suggester == null || keys == null) {
+                if (composing.isNotEmpty()) {
+                    literalWordInProgress = true
+                    abandonComposing()
+                }
+                literalWordInProgress = true
+                connection.commitText(text, 1)
+                clearSuggestions()
+            } else {
+                recordTouch(composing.length, touchX, touchY)
+                composing.append(text)
+                connection.setComposingText(composing, 1)
+                updateTypingSuggestions(suggester, keys)
+            }
         } else {
             // Punctuation ends a word, so it settles whatever was pending first -- typing "teh,"
             // should correct exactly as "teh " does.
             finishComposing(connection)
             connection.commitText(text, 1)
+            literalWordInProgress = false
         }
 
         if (shiftState() == ShiftState.SHIFTED) setShift(ShiftState.OFF)
         updateShiftFromCursor()
+    }
+
+    /** Whether a new composing region here would cover only a suffix of an existing word. */
+    private fun cursorTouchesWord(connection: InputConnection): Boolean {
+        val before = connection.getTextBeforeCursor(1, 0)?.lastOrNull()
+        val after = connection.getTextAfterCursor(1, 0)?.firstOrNull()
+        return before?.let(::isWordCharacter) == true || after?.let(::isWordCharacter) == true
     }
 
     /**
@@ -1068,6 +1228,7 @@ class SlideInputMethodService :
             connection.commitText(text, 1)
             lastSpaceCommitMs = now
         }
+        literalWordInProgress = false
         updateShiftFromCursor()
         updatePredictions()
     }
@@ -1101,6 +1262,7 @@ class SlideInputMethodService :
                 connection.setComposingText(composing, 1)
                 updateTypingSuggestions()
             }
+            literalWordInProgress = false
             updateShiftFromCursor()
             return
         }
@@ -1114,6 +1276,7 @@ class SlideInputMethodService :
             val toDelete = if (before.length == 2 && Character.isSurrogatePair(before[0], before[1])) 2 else 1
             connection.deleteSurroundingText(toDelete, 0)
         }
+        literalWordInProgress = cursorTouchesWord(connection)
         updateShiftFromCursor()
     }
 
@@ -1128,6 +1291,7 @@ class SlideInputMethodService :
         } else {
             connection.commitText("\n", 1)
         }
+        literalWordInProgress = false
         updateShiftFromCursor()
     }
 
@@ -1147,6 +1311,7 @@ class SlideInputMethodService :
 
     private fun switchLayer(target: Layer) {
         layer = target
+        gestureKeyMapCache = null
         if (target != Layer.ALPHA) setShift(ShiftState.OFF)
         keyboardView?.keyboardLayout = layoutFor(target)
         if (target == Layer.ALPHA) updateShiftFromCursor()
@@ -1162,27 +1327,29 @@ class SlideInputMethodService :
 
     // region The word being typed
 
-    /**
-     * Whether the keyboard should be composing and suggesting at all.
-     *
-     * Password fields are excluded outright rather than merely excluded from learning: a strip that
-     * completes someone's password in three cells beside their thumb is a shoulder-surfing hazard,
-     * and composing text there also trips up managers that watch the field.
-     */
-    private fun suggestionsAvailable(): Boolean =
-        settings.suggestionsEnabled &&
-            !passwordField &&
-            typingSuggester != null &&
-            keyboardView?.gestureKeyMap() != null
+    /** Whether language candidates are appropriate for this field and enabled by the user. */
+    private fun fieldSuggestionsEnabled(): Boolean =
+        settings.suggestionsEnabled && editorInputPolicy.allowsSuggestions
+
+    /** Reuses immutable geometry until a layout-affecting event invalidates it. */
+    private fun currentGestureKeyMap(): GestureKeyMap? {
+        if (layer != Layer.ALPHA || searchModeShown) return null
+        gestureKeyMapCache?.let { return it }
+        return keyboardView?.gestureKeyMap()?.also { gestureKeyMapCache = it }
+    }
 
     private fun updateTypingSuggestions() {
-        val suggester = typingSuggester
-        val keys = keyboardView?.gestureKeyMap()
+        val suggester = typingSuggester.takeIf { fieldSuggestionsEnabled() }
+        val keys = suggester?.let { currentGestureKeyMap() }
         if (suggester == null || keys == null || composing.isEmpty()) {
             clearSuggestions()
             return
         }
 
+        updateTypingSuggestions(suggester, keys)
+    }
+
+    private fun updateTypingSuggestions(suggester: TypingSuggester, keys: GestureKeyMap) {
         val result = suggester.suggest(
             typed = composing.toString(),
             keys = keys,
@@ -1216,7 +1383,7 @@ class SlideInputMethodService :
         if (!word.all { it.isLetter() || it == '\'' }) return
 
         userDictionary.learn(word, weight)
-        learnedSinceSave = true
+        learnedPersistence.markDirty()
     }
 
     /**
@@ -1231,7 +1398,109 @@ class SlideInputMethodService :
         if (incognito) return
         if (previous.isNullOrEmpty() || word.isEmpty()) return
         userBigrams.learn(previous, word)
-        learnedSinceSave = true
+        learnedPersistence.markDirty()
+    }
+
+    /** Restores into temporary collections, then publishes them on the input thread. */
+    private fun loadLearnedData() {
+        val generation = learnedPersistence.beginLoad()
+        scope.launch {
+            var loadedResult: LearnedDataSnapshot? = null
+            try {
+                val loaded = withContext(Dispatchers.IO) {
+                    // A prior service may still be committing its last snapshot. Waiting before
+                    // taking the shared IO lock prevents this instance from restoring stale data
+                    // and later overwriting that final commit.
+                    LEARNED_DATA_FINALIZER_JOB?.join()
+                    LEARNED_DATA_IO.withLock {
+                        if (!learnedPersistence.isCurrent(generation)) return@withLock null
+                        val words = UserDictionary()
+                        val pairs = UserBigrams()
+                        val deletionCompleted = userDictionaryStore.completePendingDeletion()
+                        if (deletionCompleted) {
+                            userDictionaryStore.load(words)
+                            userDictionaryStore.load(pairs)
+                        }
+                        LearnedDataSnapshot(
+                            words = words,
+                            pairs = pairs,
+                            deletionPending = !deletionCompleted,
+                        )
+                    }
+                }
+                loadedResult = loaded
+
+                if (loaded != null && learnedPersistence.isCurrent(generation)) {
+                    // No engine capable of learning is published until learnedDataReady completes.
+                    // Merging the current values as well makes this robust to any future early
+                    // learning path without letting restore erase it.
+                    userDictionary.restore(loaded.words.entries() + userDictionary.entries())
+                    userBigrams.restore(loaded.pairs.entries() + userBigrams.entries())
+                }
+            } finally {
+                val accepted = learnedPersistence.finishLoad(
+                    loadGeneration = generation,
+                    pendingDeletion = loadedResult?.deletionPending,
+                )
+                if (accepted && learnedPersistence.deletionPending) scheduleLearnedDataDelete()
+                if (!learnedDataReady.isCompleted) learnedDataReady.complete(Unit)
+                saveLearnedWords()
+            }
+        }
+    }
+
+    /**
+     * Applies a settings-screen clear to the live model and orders the disk delete after old IO.
+     *
+     * The first settings emission establishes the epoch baseline; only later changes call this.
+     * New learning while deletion is queued remains in memory and is saved after the last clear.
+     */
+    private fun clearLearnedDataFromMemoryAndDisk() {
+        learnedPersistence.requestClear()
+        userDictionary.clear()
+        userBigrams.clear()
+
+        if (composing.isNotEmpty()) updateTypingSuggestions()
+        if (stripMode == StripMode.Prediction) updatePredictions()
+
+        scheduleLearnedDataDelete()
+    }
+
+    /** Starts one bounded-backoff delete sequence; a newer clear gets a follow-up sequence. */
+    private fun scheduleLearnedDataDelete() {
+        val ticket = learnedPersistence.beginDeletion() ?: return
+        scope.launch {
+            val deleted = deleteLearnedDataWithRetry()
+            val current = learnedPersistence.finishDeletion(ticket, deleted)
+            if (!current) {
+                // Another settings request persisted a newer marker while this IO result was on
+                // its way back to the main thread. That marker needs its own proved completion.
+                scheduleLearnedDataDelete()
+                return@launch
+            }
+            if (!deleted) {
+                Log.w(TAG, "Learned-data deletion remains pending after retry attempts")
+            }
+            // If new observations arrived during deletion, persist their clean post-clear snapshot.
+            // A failed delete with no new data waits for the next lifecycle save opportunity rather
+            // than looping forever on storage that may remain unavailable.
+            if (deleted || learnedPersistence.dirty) {
+                saveLearnedWords()
+            }
+        }
+    }
+
+    private suspend fun deleteLearnedDataWithRetry(): Boolean {
+        repeat(LEARNED_DATA_DELETE_ATTEMPTS) { attempt ->
+            val deleted = withContext(Dispatchers.IO) {
+                LEARNED_DATA_IO.withLock { userDictionaryStore.completePendingDeletion() }
+            }
+            if (deleted) return true
+            if (attempt + 1 < LEARNED_DATA_DELETE_ATTEMPTS) {
+                delay(LEARNED_DATA_DELETE_RETRY_MS * (attempt + 1))
+            }
+        }
+        return false
     }
 
     /**
@@ -1242,15 +1511,104 @@ class SlideInputMethodService :
      * very little and quiet enough to cost nothing.
      */
     private fun saveLearnedWords() {
-        if (!learnedSinceSave) return
-        learnedSinceSave = false
+        val ticket = learnedPersistence.beginSave() ?: return
+
+        val words = UserDictionary().also { it.restore(userDictionary.entries()) }
+        val pairs = UserBigrams().also { it.restore(userBigrams.entries()) }
         scope.launch {
-            withContext(Dispatchers.IO) {
-                userDictionaryStore.save(userDictionary)
-                userDictionaryStore.save(userBigrams)
+            val result = withContext(Dispatchers.IO) {
+                LEARNED_DATA_IO.withLock {
+                    if (!learnedPersistence.isCurrent(ticket.generation)) return@withLock null
+                    val deleted =
+                        !ticket.completePendingDeletionFirst ||
+                            userDictionaryStore.completePendingDeletion()
+                    if (!deleted) {
+                        LearnedDataWriteResult(saved = false, pendingDeleteResolved = false)
+                    } else {
+                        val wordsSaved = userDictionaryStore.save(words)
+                        val pairsSaved = userDictionaryStore.save(pairs)
+                        LearnedDataWriteResult(
+                            saved = wordsSaved && pairsSaved,
+                            pendingDeleteResolved = true,
+                        )
+                    }
+                }
+            }
+
+            learnedPersistence.finishSave(
+                ticket = ticket,
+                saved = result?.saved,
+                pendingDeletionResolved = result?.pendingDeleteResolved == true,
+            )
+            if (result?.saved != false) {
+                // A successful snapshot may have raced with newer observations. Flush that newer
+                // dirty state now; failures wait for the next normal save opportunity rather than
+                // spinning on storage that may remain unavailable.
+                saveLearnedWords()
+            } else {
+                Log.w(TAG, "Learned-data snapshot remains dirty after a failed save")
             }
         }
     }
+
+    private data class LearnedDataSnapshot(
+        val words: UserDictionary,
+        val pairs: UserBigrams,
+        val deletionPending: Boolean,
+    )
+
+    private data class LearnedDataWriteResult(
+        val saved: Boolean,
+        val pendingDeleteResolved: Boolean,
+    )
+
+    /** Captures only when destruction could otherwise strand a write or a clear. */
+    private fun captureFinalLearnedData(): FinalLearnedData? {
+        if (!learnedPersistence.needsFinalization) return null
+
+        val words = UserDictionary().also { it.restore(userDictionary.entries()) }
+        val pairs = UserBigrams().also { it.restore(userBigrams.entries()) }
+        return FinalLearnedData(
+            words = words,
+            pairs = pairs,
+            completePendingDeletionFirst = learnedPersistence.clearOutstanding,
+        )
+    }
+
+    /** Lets the final snapshot outlive cancellation of the service's ordinary coroutine scope. */
+    private fun flushFinalLearnedData(data: FinalLearnedData) {
+        val previousFinalizer = LEARNED_DATA_FINALIZER_JOB
+        val finalizer = LEARNED_DATA_FINALIZER_SCOPE.launch {
+            previousFinalizer?.join()
+            val completed = LEARNED_DATA_IO.withLock {
+                val deleted =
+                    !data.completePendingDeletionFirst ||
+                        userDictionaryStore.completePendingDeletion()
+                if (!deleted) {
+                    false
+                } else {
+                    // Persist even an empty snapshot. `deletionPending` is deliberately
+                    // conservative after any failed save, so an empty model can mean the user
+                    // forgot their final word rather than requested a full clear.
+                    val wordsSaved = userDictionaryStore.save(data.words)
+                    val pairsSaved = userDictionaryStore.save(data.pairs)
+                    wordsSaved && pairsSaved
+                }
+            }
+
+            if (!completed) {
+                Log.w(TAG, "Final learned-data flush did not complete successfully")
+            }
+        }
+        // Assigned before onDestroy returns, so a replacement service can join this exact write.
+        LEARNED_DATA_FINALIZER_JOB = finalizer
+    }
+
+    private data class FinalLearnedData(
+        val words: UserDictionary,
+        val pairs: UserBigrams,
+        val completePendingDeletionFirst: Boolean,
+    )
 
     /** The word before the one being typed, for the corrector to weigh candidates against. */
     private fun precedingWord(): String? =
@@ -1277,7 +1635,7 @@ class SlideInputMethodService :
         var corrected = false
 
         if (correction != null && !correction.equals(typed, ignoreCase = true)) {
-            val cased = matchCase(typed, correction)
+            val cased = matchTypedCase(typed, correction)
             connection.setComposingText(cased, 1)
             lastAutocorrect = Autocorrect(original = typed, applied = cased)
             corrected = true
@@ -1358,21 +1716,6 @@ class SlideInputMethodService :
     }
 
     /**
-     * Dresses a correction in the capitalisation of the word it replaces.
-     *
-     * The dictionary is lowercase, but "Teh" at the start of a sentence must come back as "The"
-     * rather than quietly undoing the user's shift key.
-     */
-    private fun matchCase(typed: String, corrected: String): String {
-        val letters = typed.filter(Char::isLetter)
-        return when {
-            letters.length > 1 && letters.all(Char::isUpperCase) -> corrected.uppercase()
-            typed.firstOrNull()?.isUpperCase() == true -> corrected.replaceFirstChar(Char::uppercaseChar)
-            else -> corrected
-        }
-    }
-
-    /**
      * Commits the candidate the user tapped, followed by a space.
      *
      * The space is what makes picking a suggestion worth doing: it saves the separator keypress as
@@ -1387,9 +1730,9 @@ class SlideInputMethodService :
         // A word reopened from the middle of a sentence already has a separator after it. Adding
         // another would turn every correction into a stray double space.
         val appendSpace = !recomposed
-        // The dictionary is lowercase. A word reopened mid-sentence was written with whatever
-        // capitalisation the user chose, and swapping it for a correction must not quietly undo it.
-        val replacement = if (recomposed) matchCase(composing.toString(), word) else word
+        // The dictionary is lowercase. Whether this word is new or reopened, swapping it for a
+        // correction must not quietly undo the capitalization the person typed.
+        val replacement = matchTypedCase(composing.toString(), word)
 
         // Reaching past the keyboard's own first choice to pick out what they wrote is a deliberate
         // choice, and means the same thing as undoing a correction.
@@ -1397,6 +1740,7 @@ class SlideInputMethodService :
             learnWord(word, weight = TRUSTED_AT_ONCE)
         }
 
+        selfEdit = true
         connection.beginBatchEdit()
         connection.setComposingText(replacement, 1)
         connection.finishComposingText()
@@ -1409,6 +1753,7 @@ class SlideInputMethodService :
         lastAutocorrect = null
         recomposed = false
         composingAtEnd = true
+        literalWordInProgress = false
         lastSpaceCommitMs = 0L
         clearSuggestions()
         updateShiftFromCursor()
@@ -1426,7 +1771,7 @@ class SlideInputMethodService :
      */
     private fun updatePredictions() {
         if (composing.isNotEmpty()) return
-        if (!suggestionsAvailable()) return
+        if (!fieldSuggestionsEnabled()) return
         if (searchModeShown || emojiPanelShown || voiceOverlayShown) return
 
         val suggester = typingSuggester ?: return
@@ -1457,6 +1802,7 @@ class SlideInputMethodService :
         val before = connection.getTextBeforeCursor(1, 0)
         val needsSpace = !before.isNullOrEmpty() && isWordCharacter(before[0])
 
+        selfEdit = true
         connection.beginBatchEdit()
         connection.commitText(if (needsSpace) " $word " else "$word ", 1)
         connection.endBatchEdit()
@@ -1465,6 +1811,7 @@ class SlideInputMethodService :
         // exactly as typing it would have been.
         learnPair(previous, word)
         lastAutocorrect = null
+        literalWordInProgress = false
         lastSpaceCommitMs = 0L
         clearSuggestions()
         updateShiftFromCursor()
@@ -1495,23 +1842,33 @@ class SlideInputMethodService :
         val ourEdit = selfEdit
         selfEdit = false
 
-        // Editors that do not report a composing region give -1 here. That is not evidence the
-        // cursor moved, so it must not be treated as such, or suggestions would never survive a
-        // keystroke in those apps.
-        val insideComposing = candidatesStart >= 0 && candidatesEnd >= 0 &&
-            newSelStart >= candidatesStart && newSelEnd <= candidatesEnd
-        val cursorLeftTheWord = newSelStart != newSelEnd ||
-            (candidatesEnd >= 0 && !insideComposing)
+        val update = SelectionUpdate.evaluate(
+            oldSelStart = oldSelStart,
+            oldSelEnd = oldSelEnd,
+            newSelStart = newSelStart,
+            newSelEnd = newSelEnd,
+            candidatesStart = candidatesStart,
+            candidatesEnd = candidatesEnd,
+            selfEdit = ourEdit,
+            hasComposingText = composing.isNotEmpty(),
+        )
 
-        if (composing.isNotEmpty() && !cursorLeftTheWord) {
-            composingAtEnd = candidatesEnd < 0 || newSelEnd == candidatesEnd
+        if (composing.isNotEmpty() && !update.cursorLeftComposing) {
+            update.composingAtEnd?.let { composingAtEnd = it }
             return
         }
         // Dropping one word and reopening another are the same gesture — a tap somewhere else in
         // the sentence — so the tap that ends the first must be allowed to start the second.
         if (composing.isNotEmpty()) abandonComposing()
 
-        if (!ourEdit) reopenWordAtCursor(newSelStart, newSelEnd)
+        if (update.externalSelectionChanged) {
+            // Gesture and prediction candidates describe the old cursor context. Clear first so
+            // the same tap can reopen the newly selected word instead of being blocked by the stale
+            // strip mode.
+            literalWordInProgress = false
+            clearSuggestions()
+            reopenWordAtCursor(newSelStart, newSelEnd)
+        }
     }
 
     /**
@@ -1529,8 +1886,11 @@ class SlideInputMethodService :
     private fun reopenWordAtCursor(selectionStart: Int, selectionEnd: Int) {
         if (selectionStart != selectionEnd || selectionStart < 0) return
         if (stripMode != StripMode.Empty) return
-        if (!suggestionsAvailable()) return
+        if (!fieldSuggestionsEnabled()) return
         if (searchModeShown || emojiPanelShown || voiceOverlayShown) return
+
+        val suggester = typingSuggester ?: return
+        val keys = currentGestureKeyMap() ?: return
 
         val connection = currentInputConnection ?: return
         val before = connection.getTextBeforeCursor(MAX_REOPEN_CHARS, 0)?.toString() ?: return
@@ -1560,7 +1920,8 @@ class SlideInputMethodService :
         composing.append(word)
         recomposed = true
         composingAtEnd = end == 0
-        updateTypingSuggestions()
+        literalWordInProgress = false
+        updateTypingSuggestions(suggester, keys)
     }
 
     /** A word autocorrect changed, and what it changed from. */
@@ -1658,18 +2019,6 @@ class SlideInputMethodService :
         )
     }
 
-    private fun isPasswordField(info: EditorInfo): Boolean {
-        val variation = info.inputType and InputType.TYPE_MASK_VARIATION
-        val klass = info.inputType and InputType.TYPE_MASK_CLASS
-        return when (klass) {
-            InputType.TYPE_CLASS_TEXT -> variation == InputType.TYPE_TEXT_VARIATION_PASSWORD ||
-                variation == InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ||
-                variation == InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD
-            InputType.TYPE_CLASS_NUMBER -> variation == InputType.TYPE_NUMBER_VARIATION_PASSWORD
-            else -> false
-        }
-    }
-
     // endregion
 
     private companion object {
@@ -1677,6 +2026,8 @@ class SlideInputMethodService :
         const val DOUBLE_TAP_WINDOW_MS = 300L
         const val DOUBLE_SPACE_WINDOW_MS = 800L
         const val HAPTIC_DURATION_MS = 12L
+        const val LEARNED_DATA_DELETE_ATTEMPTS = 3
+        const val LEARNED_DATA_DELETE_RETRY_MS = 75L
         const val MAX_WORD_DELETE_CHARS = 2048
         const val MAX_SEARCH_QUERY_LENGTH = 64
         const val MAX_SEARCH_RESULTS = 6
@@ -1716,5 +2067,15 @@ class SlideInputMethodService :
             KeyType.DELETE,
             KeyType.ENTER,
         )
+
+        /** Process-lifetime IO for a final snapshot after an IME service instance is destroyed. */
+        val LEARNED_DATA_FINALIZER_SCOPE = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+        /** Most recently scheduled finalizer; each new finalizer and service startup joins it. */
+        @Volatile
+        var LEARNED_DATA_FINALIZER_JOB: Job? = null
+
+        /** Serializes every learned-data file mutation once lifecycle ordering is established. */
+        val LEARNED_DATA_IO = Mutex()
     }
 }

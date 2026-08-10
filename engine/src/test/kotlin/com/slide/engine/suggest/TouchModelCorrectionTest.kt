@@ -111,7 +111,17 @@ class TouchModelCorrectionTest {
                     ),
             )
             assertTrue("no mis-hits generated at sigma $sigma", cases.size > 200)
-            if (touchRight > blindRight) improvedAt++
+            val rightGain = touchRight - blindRight
+            val wrongIncrease = maxOf(0.0, touchWrong - blindWrong)
+            if (rightGain > 0.0) improvedAt++
+            assertTrue(
+                "touch at sigma $sigma added more wrong corrections than right ones",
+                rightGain > wrongIncrease,
+            )
+            assertTrue(
+                "touch at sigma $sigma corrected %.1f%% to the wrong word".format(touchWrong * 100),
+                touchWrong < 0.13,
+            )
         }
 
         assertEquals(

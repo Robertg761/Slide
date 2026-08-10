@@ -61,7 +61,13 @@ import com.slide.asr.WhisperModel
 import com.slide.core.settings.KeyboardSettings
 import com.slide.core.settings.SettingsRepository
 import com.slide.core.theme.Themes
+import com.slide.engine.lexicon.UserDictionaryStore
+import java.io.IOException
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
@@ -101,6 +107,9 @@ private fun SetupScreen(repository: SettingsRepository) {
     var updateMessage by remember { mutableStateOf<String?>(null) }
     var availableUpdate by remember { mutableStateOf<UpdateInfo?>(null) }
     var downloading by remember { mutableStateOf(false) }
+    var showClearLearnedDataConfirmation by remember { mutableStateOf(false) }
+    var clearingLearnedData by remember { mutableStateOf(false) }
+    var privacyMessage by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(settings.updateChecksEnabled, settings.includeAlphaUpdates) {
         if (settings.updateChecksEnabled) {
@@ -199,10 +208,25 @@ private fun SetupScreen(repository: SettingsRepository) {
                     SettingSwitch("Gesture typing", settings.gestureTypingEnabled) { value ->
                         scope.launch { repository.update { it.copy(gestureTypingEnabled = value) } }
                     }
-                    SettingSwitch("Suggestion strip", settings.suggestionsEnabled) { value ->
+                    SettingSwitch(
+                        label = "Suggestion strip",
+                        checked = settings.suggestionsEnabled,
+                        description = "Shows word candidates and is required for autocorrection.",
+                    ) { value ->
                         scope.launch { repository.update { it.copy(suggestionsEnabled = value) } }
                     }
-                    SettingSwitch("Autocorrection", settings.autocorrectEnabled) { value ->
+                    SettingSwitch(
+                        label = "Autocorrection",
+                        checked = settings.autocorrectEnabled,
+                        description = if (settings.suggestionsEnabled) {
+                            "Corrects likely misspellings when you finish a word."
+                        } else if (settings.autocorrectEnabled) {
+                            "Paused while the suggestion strip is off; it will resume when the strip is on."
+                        } else {
+                            "Turn on the suggestion strip to enable autocorrection."
+                        },
+                        enabled = settings.suggestionsEnabled,
+                    ) { value ->
                         scope.launch { repository.update { it.copy(autocorrectEnabled = value) } }
                     }
                     SettingSwitch("Block offensive words", settings.blockOffensiveWords) { value ->
@@ -222,6 +246,32 @@ private fun SetupScreen(repository: SettingsRepository) {
                     }
                     SettingSwitch("Sound on keypress", settings.soundEnabled) { value ->
                         scope.launch { repository.update { it.copy(soundEnabled = value) } }
+                    }
+                }
+            }
+
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Privacy and learned data", style = MaterialTheme.typography.titleMedium)
+                    SettingSwitch(
+                        label = "Incognito mode",
+                        checked = settings.incognitoModeEnabled,
+                        description = "Stops Slide from learning new words and phrases. Existing learned data stays until you clear it.",
+                    ) { value ->
+                        scope.launch {
+                            repository.update { it.copy(incognitoModeEnabled = value) }
+                        }
+                    }
+                    Text(
+                        "Slide keeps learned words and phrases only on this device.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Button(
+                        enabled = !clearingLearnedData,
+                        onClick = { showClearLearnedDataConfirmation = true },
+                    ) {
+                        Text(if (clearingLearnedData) "Clearing…" else "Clear learned data")
                     }
                 }
             }
@@ -331,6 +381,71 @@ private fun SetupScreen(repository: SettingsRepository) {
         )
     }
     updateMessage?.let { message -> AlertDialog(onDismissRequest = { updateMessage = null }, title = { Text("Updates") }, text = { Text(message) }, confirmButton = { Button(onClick = { updateMessage = null }) { Text("OK") } }) }
+    if (showClearLearnedDataConfirmation) {
+        AlertDialog(
+            onDismissRequest = {
+                if (!clearingLearnedData) showClearLearnedDataConfirmation = false
+            },
+            title = { Text("Clear learned data?") },
+            text = {
+                Text(
+                    "Slide will forget the personal words and word pairs it learned from your " +
+                        "typing. This cannot be undone.",
+                )
+            },
+            confirmButton = {
+                Button(
+                    enabled = !clearingLearnedData,
+                    onClick = {
+                        scope.launch {
+                            clearingLearnedData = true
+                            try {
+                                // Marker creation and epoch publication are one privacy-critical
+                                // operation. Once the user confirms, leaving this screen must not
+                                // cancel between the durable marker and clearing the live IME.
+                                val deletionRequested = withContext(NonCancellable) {
+                                    val requested = withContext(Dispatchers.IO) {
+                                        UserDictionaryStore(context.applicationContext)
+                                            .requestDeletion()
+                                    }
+                                    if (requested) repository.notifyLearnedDataCleared()
+                                    requested
+                                }
+                                if (!deletionRequested) {
+                                    throw IOException("the clear request could not be stored safely")
+                                }
+                                showClearLearnedDataConfirmation = false
+                                privacyMessage = "Learned words and phrases were cleared."
+                            } catch (error: Exception) {
+                                if (error is CancellationException) throw error
+                                showClearLearnedDataConfirmation = false
+                                privacyMessage = "Could not clear learned data: " +
+                                    (error.message ?: "unknown error")
+                            } finally {
+                                clearingLearnedData = false
+                            }
+                        }
+                    },
+                ) { Text(if (clearingLearnedData) "Clearing…" else "Clear") }
+            },
+            dismissButton = {
+                Button(
+                    enabled = !clearingLearnedData,
+                    onClick = { showClearLearnedDataConfirmation = false },
+                ) { Text("Cancel") }
+            },
+        )
+    }
+    privacyMessage?.let { message ->
+        AlertDialog(
+            onDismissRequest = { privacyMessage = null },
+            title = { Text("Learned data") },
+            text = { Text(message) },
+            confirmButton = {
+                Button(onClick = { privacyMessage = null }) { Text("OK") }
+            },
+        )
+    }
 }
 
 @Composable
@@ -394,17 +509,42 @@ private fun StepCard(
 }
 
 @Composable
-private fun SettingSwitch(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+private fun SettingSwitch(
+    label: String,
+    checked: Boolean,
+    description: String? = null,
+    enabled: Boolean = true,
+    onChange: (Boolean) -> Unit,
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { onChange(!checked) }
+            .clickable(enabled = enabled) { onChange(!checked) }
             .padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text(label, style = MaterialTheme.typography.bodyLarge)
-        Switch(checked = checked, onCheckedChange = onChange)
+        Column(Modifier.weight(1f)) {
+            Text(
+                label,
+                style = MaterialTheme.typography.bodyLarge,
+                color = if (enabled) {
+                    MaterialTheme.colorScheme.onSurface
+                } else {
+                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                },
+            )
+            description?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(
+                        alpha = if (enabled) 1f else 0.38f,
+                    ),
+                )
+            }
+        }
+        Switch(checked = checked, onCheckedChange = onChange, enabled = enabled)
     }
 }
 

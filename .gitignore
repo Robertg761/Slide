@@ -1,5 +1,6 @@
 *.iml
 .gradle/
+.kotlin/
 .idea/
 build/
 local.properties
@@ -9,6 +10,8 @@ captures/
 *.apk
 *.aab
 *.hprof
+__pycache__/
+*.pyc
 
 # Downloaded ASR models — never commit these
 /models/

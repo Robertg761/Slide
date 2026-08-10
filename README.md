@@ -30,7 +30,7 @@ is written and compiles but has **not yet run on hardware** — see *Not yet ver
 - Symbols layer, editor-action-aware enter key
 - Nine themes plus Material You dynamic colour, light/dark following the system
 - Key preview popups, key borders, number row, haptics, keypress sound
-- Password and incognito field detection (no learning in those fields)
+- Password, email, URL, no-suggestions, and incognito field policy, with a manual no-learning mode
 - A personal dictionary that learns the words and phrases you use and stops correcting them away
 - Next-word prediction in the strip, from the corpus and from your own repeated phrases
 - **Gesture typing** — SHARK²-derived decoder over a 160k-word lexicon, 95.8% top-1 and 100%
@@ -195,8 +195,9 @@ packaged model. That output is what decides `WhisperModel.Default`.
 
 Nothing leaves the device during typing: speech is recognised locally, and audio is held in memory
 only for as long as it takes to transcribe. The optional update check contacts GitHub only when the
-user enables it when Slide opens. Password and
-incognito fields are excluded from any learning.
+user enables it when Slide opens. Password, email, URL, no-suggestions, and incognito fields are
+excluded from learning. A manual Incognito mode in Slide's settings stops learning in every app
+without hiding ordinary language suggestions.
 
 Slide learns the words you use that its dictionary does not have, so it stops rewriting your own
 name back at you, and the phrases you repeat, so it can offer them. Those live in
@@ -204,7 +205,8 @@ name back at you, and the phrases you repeat, so it can offer them. Those live i
 you can read or delete, and are excluded from cloud backup and device transfer alike —
 the words a person uses that most people do not are the most revealing thing here, and they should
 not leave the phone just because the phone was backed up. Hold a word in the suggestion strip to
-teach it or to take it back.
+teach it or to take it back, or use **Clear learned data** in settings to remove all learned words
+and phrases from both the running keyboard and storage.
 
 ## Licence and provenance
 

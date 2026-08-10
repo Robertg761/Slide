@@ -89,7 +89,7 @@ A 1:1 inventory of Gboard's feature surface, used as the master checklist for Sl
 | D1 | Suggestion strip (3 candidates) | V1 | M | **Built.** Carries swipe and typed candidates. |
 | D2 | Autocorrect on space/punctuation | V1 | L | **Built.** Composing text + single-edit candidates over the key-proximity model. |
 | D3 | Undo autocorrect (backspace right after) | V1 | S | **Built.** Verified against the field's own text before reverting. |
-| D4 | Contextual correction and next-word prediction | V1 | L | **Built.** Tatoeba-derived asset, 393k pairs. Held-out typo correction 84.4% -> 92.2%; swipe top-1 93.8% -> 96.8%. The strip offers the next word between words, right 26% of the time from the corpus alone. |
+| D4 | Contextual correction and next-word prediction | V1 | L | **Built.** Tatoeba-derived asset, 393k pairs. Held-out synthetic nonword typo correction 84.4% -> 92.2%; swipe top-1 93.8% -> 96.8%. The strip offers the next word between words, right 26% of the time from the corpus alone. |
 | D5 | Auto-capitalise sentence starts | V1 | S | |
 | D6 | Double-space → period + space | V1 | S | |
 | D7 | Auto-space after punctuation | V1 | S | |
@@ -98,9 +98,9 @@ A 1:1 inventory of Gboard's feature surface, used as the master checklist for Sl
 | D10 | Learn from what you type | V1 | M | **Built.** Words: committed deliberately twice, or rescued once from an autocorrect, and it is never rewritten again. Pairs: recurring phrases reweigh candidates in their own context. Both excluded from backup. |
 | D11 | Contact name suggestions | V2 | M | Needs `READ_CONTACTS`; make optional. |
 | D12 | Spell check + red squiggle underline | V2 | M | Via `InputConnection` spans. |
-| D13 | Tap a misspelled word → correction menu | V2 | M | |
+| D13 | Tap a misspelled word → correction menu | V2 | M | **Built.** Tapping into a finished word reopens it in the suggestion strip. |
 | D14 | Emoji suggestions in the strip | V2 | S | |
-| D15 | Block offensive words toggle | V2 | S | **Built.** Applies to swipe and typed suggestions alike. |
+| D15 | Block offensive words toggle | V2 | S | **Built.** Applies to swipe, typed, corpus-prediction, and personal-prediction suggestions alike. |
 | D16 | Suggestion strip expand (⌄) → more candidates | V2 | S | |
 | D17 | Clipboard chip suggestions in the strip | V2 | S | |
 | D18 | Grammar check / proofread | Skip | — | Gboard's is a cloud LLM feature. |
@@ -205,10 +205,10 @@ A 1:1 inventory of Gboard's feature surface, used as the master checklist for Sl
 
 | # | Feature | Tier | Effort | Notes |
 |---|---|---|---|---|
-| J1 | Settings app (Material 3) | V1 | M | |
+| J1 | Settings app (Material 3) | V1 | M | **Built.** Setup, appearance, typing, privacy, voice, and update controls. |
 | J2 | In-keyboard quick settings | V2 | S | |
-| J3 | Incognito mode (no learning) | V1 | S | Manual toggle + auto via `IME_FLAG_NO_PERSONALIZED_LEARNING`. |
-| J4 | Clear learned data | V1 | S | |
+| J3 | Incognito mode (no learning) | V1 | S | **Built.** Manual toggle + auto via `IME_FLAG_NO_PERSONALIZED_LEARNING` and sensitive-field policy. |
+| J4 | Clear learned data | V1 | S | **Built.** Confirmed settings action clears live words/pairs and crash-safe private storage. |
 | J5 | Export/import settings + dictionary | V2 | S | Local file, no cloud. |
 | J6 | No telemetry / no network by default | V1 | S | Core positioning. |
 | J7 | Setup wizard (enable IME, set default, grant mic) | V1 | M | Required — IME activation is a confusing flow. |

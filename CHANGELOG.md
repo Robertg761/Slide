@@ -4,6 +4,8 @@
 
 ### Added
 
+- Privacy controls now include a manual Incognito mode and a confirmed **Clear learned data**
+  action for both personal words and repeated phrases.
 - The strip offers the next word between words, where it used to sit empty. Continuations come
   from the corpus and from your own repeated phrases, with yours first — measured against held-out
   text, the next word is one tap away about a quarter of the time from the corpus alone. It stays
@@ -34,9 +36,10 @@
   now resolve.
 - Autocorrect reads the sentence. A bigram language model, built from Tatoeba's English sentence
   corpus and shipped as a 1.3 MB asset, weighs each candidate by how well it follows the word
-  before it. Measured on held-out sentences the model was never trained on, this takes correction
-  of single-edit typos from 84.4% to 92.2% while barely moving wrong corrections: the cases
-  it resolves — "at ocne" to "once", "my hroat" to "throat", "without efort" to "effort" — are
+  before it. On held-out sentences the model was never trained on, with synthetic nonword
+  single-edit typos, this takes correction from 84.4% to 92.2% while barely moving wrong
+  corrections. The cases it resolves — "at ocne" to "once", "my hroat" to "throat", "without
+  efort" to "effort" — are
   exactly the ambiguous ones a wrong correction used to come from. Words the model has never seen
   in sequence are left exactly where spelling alone put them, so its gaps cost nothing.
 - A second symbols page behind `=\<`, carrying the slash, equals sign, brackets, angle brackets,
@@ -47,9 +50,11 @@
 
 ### Changed
 
-- Autocorrect now fires on 85% of single-edit typos, up from 77%, with wrong corrections falling
-  from 1.5% to 1.2%. The confidence margin was measured on a scale it did not fit: because the
-  language score is a log of an already-logarithmic frequency, every word worth correcting to sits
+- Autocorrect now fires on 87.7% of generated nonword single-edit typos, up from 76.6%, with wrong
+  corrections at 0.6%. This benchmark excludes valid-word collisions and final-letter omissions,
+  which the keyboard deliberately refuses to rewrite. The confidence margin was measured on a
+  scale it did not fit: because the language score is a log of an already-logarithmic frequency,
+  every word worth correcting to sits
   in a band about a quarter wide, and the old margin spent more than half of it. Typos of common
   words — "htis", "thjs", "drom", "witth" — had the right answer in the strip and were refused.
 - Restoring a dropped letter is now cheaper than overriding a key you pressed. An insertion only
@@ -73,6 +78,17 @@
 
 ### Fixed
 
+- Password, email, URL, and explicit no-suggestions editors now bypass the entire language path,
+  including gesture decoding; sensitive fields can no longer receive a decoded swipe candidate.
+- Moving the cursor clears stale prediction candidates and can reopen an earlier word even in
+  editors that omit composing bounds. Model readiness can no longer start autocorrect halfway
+  through a word, and tapping a candidate keeps the capitalization that was typed.
+- Personal next-word predictions now honor offensive-word filtering, and learned words and phrases
+  retain evidence-backed useful casing without letting one accidental capital replace an
+  established spelling.
+- Learned-data saves are serialized, failure-aware, and staged outside Android backup. Clearing
+  uses a durable pending marker so interrupted deletion cannot make stale personal data visible
+  again, and the tagged release workflow runs the correction unit suites before packaging.
 - Updates: the downloader checks the HTTP status, the byte count, and the file's magic number, and
   only moves a download into place once it is whole — a truncated APK used to be kept under its
   final name and fail verification on every subsequent attempt. If the signing certificates cannot

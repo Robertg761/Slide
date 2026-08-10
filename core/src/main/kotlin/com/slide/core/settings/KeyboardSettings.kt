@@ -7,11 +7,14 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.slide.core.emoji.EmojiData
 import com.slide.core.theme.Themes
+import java.io.IOException
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 
@@ -42,6 +45,21 @@ data class KeyboardSettings(
      */
     val autocorrectEnabled: Boolean = true,
     /**
+     * Stops Slide from learning new words and word pairs until the user turns it off again.
+     *
+     * This is separate from editor-requested incognito mode so the user can ask for the same
+     * privacy in any app. Existing learned data remains available until it is explicitly cleared.
+     */
+    val incognitoModeEnabled: Boolean = false,
+    /**
+     * Changes whenever the settings app durably requests clearing learned words and word pairs.
+     *
+     * The IME observes this value so it can also discard its live in-memory copies. It is an epoch
+     * rather than a Boolean because every clear action must be observable, including consecutive
+     * requests.
+     */
+    val learnedDataClearEpoch: Long = 0L,
+    /**
      * Withholds slurs and profanity from swipe and suggestion results.
      *
      * On by default, matching Gboard: an accidental obscenity committed into a message is a much
@@ -66,7 +84,11 @@ data class KeyboardSettings(
     val updateChecksEnabled: Boolean = false,
     /** Alpha builds are intentionally opt-in even while Slide itself is pre-1.0. */
     val includeAlphaUpdates: Boolean = true,
-)
+) {
+    /** Autocorrection can only operate while the suggestion pipeline and strip are enabled. */
+    val isAutocorrectionActive: Boolean
+        get() = suggestionsEnabled && autocorrectEnabled
+}
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "slide_settings")
 
@@ -79,7 +101,15 @@ class SettingsRepository(private val context: Context) {
      * picked an emoji, for a change that has nothing to do with either.
      */
     val settings: Flow<KeyboardSettings> =
-        context.dataStore.data.map { it.toSettings() }.distinctUntilChanged()
+        context.dataStore.data
+            .map { it.toSettings() }
+            .catch { error ->
+                if (error !is IOException) throw error
+                // Keep the keyboard usable after a transient preferences read failure, but never
+                // learn while a persisted privacy choice is unavailable.
+                emit(KeyboardSettings(incognitoModeEnabled = true))
+            }
+            .distinctUntilChanged()
 
     /**
      * Emoji the user picked recently, most recent first.
@@ -89,6 +119,10 @@ class SettingsRepository(private val context: Context) {
      */
     val recentEmoji: Flow<List<String>> = context.dataStore.data
         .map { it[Keys.RECENT_EMOJI].orEmpty().split(RECENT_SEPARATOR).filter(String::isNotEmpty) }
+        .catch { error ->
+            if (error !is IOException) throw error
+            emit(emptyList())
+        }
         .distinctUntilChanged()
 
     /**
@@ -128,6 +162,8 @@ class SettingsRepository(private val context: Context) {
             prefs[Keys.GESTURE_TYPING] = updated.gestureTypingEnabled
             prefs[Keys.SUGGESTIONS] = updated.suggestionsEnabled
             prefs[Keys.AUTOCORRECT] = updated.autocorrectEnabled
+            prefs[Keys.INCOGNITO_MODE] = updated.incognitoModeEnabled
+            prefs[Keys.LEARNED_DATA_CLEAR_EPOCH] = updated.learnedDataClearEpoch
             prefs[Keys.BLOCK_OFFENSIVE] = updated.blockOffensiveWords
             prefs[Keys.VOICE_MODEL] = updated.voiceModelId
             prefs[Keys.AUTO_CAPITALIZE] = updated.autoCapitalize
@@ -135,6 +171,15 @@ class SettingsRepository(private val context: Context) {
             prefs[Keys.EMOJI_SKIN_TONE] = updated.emojiSkinTone
             prefs[Keys.UPDATE_CHECKS] = updated.updateChecksEnabled
             prefs[Keys.INCLUDE_ALPHA_UPDATES] = updated.includeAlphaUpdates
+        }
+    }
+
+    /** Notifies a running IME that a durable learned-data clear request is waiting. */
+    suspend fun notifyLearnedDataCleared() {
+        context.dataStore.edit { prefs ->
+            val current = prefs[Keys.LEARNED_DATA_CLEAR_EPOCH] ?: 0L
+            prefs[Keys.LEARNED_DATA_CLEAR_EPOCH] =
+                if (current == Long.MAX_VALUE) 1L else current + 1L
         }
     }
 
@@ -155,6 +200,9 @@ class SettingsRepository(private val context: Context) {
             gestureTypingEnabled = this[Keys.GESTURE_TYPING] ?: defaults.gestureTypingEnabled,
             suggestionsEnabled = this[Keys.SUGGESTIONS] ?: defaults.suggestionsEnabled,
             autocorrectEnabled = this[Keys.AUTOCORRECT] ?: defaults.autocorrectEnabled,
+            incognitoModeEnabled = this[Keys.INCOGNITO_MODE] ?: defaults.incognitoModeEnabled,
+            learnedDataClearEpoch =
+                this[Keys.LEARNED_DATA_CLEAR_EPOCH] ?: defaults.learnedDataClearEpoch,
             blockOffensiveWords = this[Keys.BLOCK_OFFENSIVE] ?: defaults.blockOffensiveWords,
             voiceModelId = this[Keys.VOICE_MODEL] ?: defaults.voiceModelId,
             autoCapitalize = this[Keys.AUTO_CAPITALIZE] ?: defaults.autoCapitalize,
@@ -180,6 +228,8 @@ class SettingsRepository(private val context: Context) {
         val GESTURE_TYPING = booleanPreferencesKey("gesture_typing")
         val SUGGESTIONS = booleanPreferencesKey("suggestions_enabled")
         val AUTOCORRECT = booleanPreferencesKey("autocorrect_enabled")
+        val INCOGNITO_MODE = booleanPreferencesKey("incognito_mode_enabled")
+        val LEARNED_DATA_CLEAR_EPOCH = longPreferencesKey("learned_data_clear_epoch")
         val BLOCK_OFFENSIVE = booleanPreferencesKey("block_offensive_words")
         val VOICE_MODEL = stringPreferencesKey("voice_model")
         val AUTO_CAPITALIZE = booleanPreferencesKey("auto_capitalize")

@@ -8,7 +8,7 @@ import java.io.File
 object TestBigrams {
     val instance: Bigrams by lazy {
         File("src/main/assets/${BigramLoader.ASSET_NAME}").inputStream().use {
-            BigramLoader.read(it, TestLexicon.instance.size)
+            BigramLoader.read(it, TestLexicon.instance)
         }
     }
 }

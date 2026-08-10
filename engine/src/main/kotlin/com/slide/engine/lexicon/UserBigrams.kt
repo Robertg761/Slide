@@ -25,26 +25,41 @@ class UserBigrams(
     private val capacity: Int = 3_000,
 ) {
 
-    private val pairs = ConcurrentHashMap<String, ConcurrentHashMap<String, Int>>()
+    private data class Successor(val surface: SurfaceForm, val count: Int)
+
+    /** Normalised context to its best-known surface form. */
+    private val contextSurfaces = ConcurrentHashMap<String, SurfaceForm>()
+    private val pairs = ConcurrentHashMap<String, ConcurrentHashMap<String, Successor>>()
 
     val size: Int get() = pairs.values.sumOf { it.size }
 
     /** Every pair and its count, for persistence. */
     fun entries(): List<Triple<String, String, Int>> =
         pairs.flatMap { (previous, successors) ->
-            successors.map { (next, count) -> Triple(previous, next, count) }
+            val previousSurface = contextSurfaces[previous]?.value ?: previous
+            successors.values.map { next -> Triple(previousSurface, next.surface.value, next.count) }
         }
 
     fun learn(previous: String, next: String) {
         if (!isUsable(previous) || !isUsable(next)) return
-        val successors = pairs.getOrPut(previous.lowercase()) { ConcurrentHashMap() }
-        successors.merge(next.lowercase(), 1) { old, new -> minOf(old + new, MAX_COUNT) }
+        val previousKey = previous.lowercase()
+        val nextKey = next.lowercase()
+        contextSurfaces.merge(previousKey, SurfaceForm.first(previous)) { old, _ ->
+            old.observe(previous)
+        }
+        val successors = pairs.getOrPut(previousKey) { ConcurrentHashMap() }
+        successors.merge(nextKey, Successor(SurfaceForm.first(next), 1)) { old, new ->
+            Successor(
+                surface = old.surface.observe(next),
+                count = minOf(old.count + new.count, MAX_COUNT),
+            )
+        }
         if (size > capacity) trim()
     }
 
     /** What this person has written after [previous], with counts. Empty when nothing is known. */
     fun successorsOf(previous: String): Map<String, Int> =
-        pairs[previous.lowercase()] ?: emptyMap()
+        pairs[previous.lowercase()]?.values?.associate { it.surface.value to it.count } ?: emptyMap()
 
     /**
      * How strongly this person's own habits predict [next] after [previous], from 0 to 1.
@@ -61,23 +76,50 @@ class UserBigrams(
      * corrections than it bought in right ones; ignoring them keeps the gain and drops the harm.
      */
     fun score(previous: String, next: String): Float {
-        val count = pairs[previous.lowercase()]?.get(next.lowercase()) ?: return 0f
+        val count = pairs[previous.lowercase()]?.get(next.lowercase())?.count ?: return 0f
         if (count < trustThreshold) return 0f
         return minOf(1f, count.toFloat() / CONFIDENT_COUNT)
     }
 
-    fun forget(previous: String) {
-        pairs.remove(previous.lowercase())
+    /** Removes every personal phrase that contains [word], on either side. */
+    fun forget(word: String) {
+        val key = word.lowercase()
+        pairs.remove(key)
+        contextSurfaces.remove(key)
+
+        for ((previous, successors) in pairs) {
+            successors.remove(key)
+            if (successors.isEmpty() && pairs.remove(previous, successors)) {
+                contextSurfaces.remove(previous)
+            }
+        }
     }
 
-    fun clear() = pairs.clear()
+    fun clear() {
+        pairs.clear()
+        contextSurfaces.clear()
+    }
 
     fun restore(saved: List<Triple<String, String, Int>>) {
-        pairs.clear()
+        clear()
         for ((previous, next, count) in saved) {
             if (!isUsable(previous) || !isUsable(next) || count <= 0) continue
-            pairs.getOrPut(previous.lowercase()) { ConcurrentHashMap() }[next.lowercase()] =
-                minOf(count, MAX_COUNT)
+            val previousKey = previous.lowercase()
+            val nextKey = next.lowercase()
+            contextSurfaces.merge(
+                previousKey,
+                SurfaceForm.restored(previous, count),
+            ) { old, new -> old.merge(new) }
+            pairs.getOrPut(previousKey) { ConcurrentHashMap() }
+                .merge(
+                    nextKey,
+                    Successor(SurfaceForm.restored(next, count), minOf(count, MAX_COUNT)),
+                ) { old, new ->
+                    Successor(
+                        surface = old.surface.merge(new.surface),
+                        count = minOf(old.count + new.count, MAX_COUNT),
+                    )
+                }
         }
     }
 
@@ -87,13 +129,18 @@ class UserBigrams(
 
     /** Drops the least-seen quarter, which is where anything typed once and never again will be. */
     private fun trim() {
-        val doomed = entries()
+        val doomed = pairs.flatMap { (previous, successors) ->
+            successors.map { (next, value) -> Triple(previous, next, value.count) }
+        }
             .sortedBy { it.third }
             .take(size - capacity * 3 / 4)
         for ((previous, next, _) in doomed) {
             val successors = pairs[previous] ?: continue
             successors.remove(next)
-            if (successors.isEmpty()) pairs.remove(previous)
+            if (successors.isEmpty()) {
+                pairs.remove(previous)
+                contextSurfaces.remove(previous)
+            }
         }
     }
 

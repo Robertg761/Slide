@@ -63,6 +63,7 @@ android {
 
 dependencies {
     implementation(project(":core"))
+    implementation(project(":engine"))
     implementation(project(":ime"))
 
     implementation(libs.androidx.core.ktx)

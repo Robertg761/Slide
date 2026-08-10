@@ -70,6 +70,14 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           if [[ "$version" == *-* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
 
+      - name: Run unit tests and compile the app
+        run: >-
+          ./gradlew --no-daemon
+          :core:testDebugUnitTest
+          :engine:testDebugUnitTest
+          :ime:testDebugUnitTest
+          :app:compileDebugKotlin
+
       - name: Verify signing secrets
         env:
           KEYSTORE_B64: ${{ secrets.SLIDE_KEYSTORE_B64 }}

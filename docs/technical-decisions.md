@@ -77,8 +77,8 @@ adjacencies reduce to 400k pairs over 24k contexts in a 1.3MB asset, keyed by le
 The context term is added to a candidate's score and never subtracted, so a pair the model has not
 seen leaves that candidate exactly where spelling put it. Only what the model positively knows can
 move anything, which is what makes it safe to consult a model with large gaps — and every model of
-this size is mostly gaps. Measured on held-out sentences, it takes autocorrect from 84.4% to 92.2%
-of single-edit typos, and swipe decoding from 93.8% to 96.8% top-1 — the latter being the only
+this size is mostly gaps. On held-out sentences with synthetic nonword single-edit typos, it takes
+autocorrect from 84.4% to 92.2%. Swipe decoding moves from 93.8% to 96.8% top-1; context is the only
 channel that can separate words tracing an identical path.
 
 A corpus brings its own distortions, and one here was large enough to reach the user. Tatoeba uses

@@ -91,6 +91,22 @@ class PredictionTest {
         assertTrue("nothing actually changed", adapted != ordinary)
     }
 
+    @Test
+    fun `personal prediction keeps its learned surface casing`() {
+        val pairs = UserBigrams()
+        val personal = TypingSuggester(lexicon, bigrams = TestBigrams.instance, userBigrams = pairs)
+        repeat(8) { pairs.learn("Sam", "Whitmore") }
+        pairs.learn("SAM", "WHITMORE")
+
+        assertEquals("Whitmore", personal.predict("sam").first())
+        // Identity remains case-insensitive even though presentation is not flattened.
+        assertEquals("Whitmore", personal.predict("SAM").first())
+        assertTrue(
+            "one shifted pair replaced established casing: ${pairs.entries()}",
+            pairs.entries().any { (previous, next, _) -> previous == "Sam" && next == "Whitmore" },
+        )
+    }
+
     /** Offensive words are withheld from a suggestion nobody asked for, as everywhere else. */
     @Test
     fun `withholds offensive words unless asked for them`() {
@@ -105,5 +121,29 @@ class PredictionTest {
             if (suggester.predict(word).any { it.lowercase() in offensive }) leaked++
         }
         assertEquals("offensive words reached the prediction strip", 0, leaked)
+    }
+
+    @Test
+    fun `personal habits cannot bypass the offensive filter`() {
+        val offensiveIndex = (0 until lexicon.size).first { index ->
+            val word = lexicon.lowercaseAt(index)
+            lexicon.isOffensive(index) && word.length <= 28 &&
+                word.all { it in 'a'..'z' || it == '\'' }
+        }
+        val offensive = lexicon.lowercaseAt(offensiveIndex)
+        val pairs = UserBigrams()
+        repeat(8) { pairs.learn("hello", offensive) }
+        val personal = TypingSuggester(lexicon, bigrams = TestBigrams.instance, userBigrams = pairs)
+
+        assertTrue(
+            "'$offensive' leaked from the personal model",
+            personal.predict("hello", blockOffensive = true)
+                .none { it.equals(offensive, ignoreCase = true) },
+        )
+        assertEquals(
+            "the learned pair did not become available when the filter was disabled",
+            offensive,
+            personal.predict("hello", blockOffensive = false).first().lowercase(),
+        )
     }
 }

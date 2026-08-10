@@ -5,6 +5,7 @@ import com.slide.engine.TestLexicon
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.IOException
+import java.nio.ByteBuffer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertThrows
@@ -80,7 +81,7 @@ class BigramLoaderTest {
     @Test
     fun `rejects a file that is not a bigram model`() {
         val error = assertThrows(IOException::class.java) {
-            BigramLoader.read(ByteArrayInputStream("not a model at all".toByteArray()), lexicon.size)
+            BigramLoader.read(ByteArrayInputStream("not a model at all".toByteArray()), lexicon)
         }
         assertTrue(error.message!!.contains("magic"))
     }
@@ -90,7 +91,7 @@ class BigramLoaderTest {
         val tampered = raw.copyOf()
         tampered[4] = 99
         val error = assertThrows(IOException::class.java) {
-            BigramLoader.read(ByteArrayInputStream(tampered), lexicon.size)
+            BigramLoader.read(ByteArrayInputStream(tampered), lexicon)
         }
         assertTrue(error.message!!.contains("version 99"))
     }
@@ -101,16 +102,36 @@ class BigramLoaderTest {
      */
     @Test
     fun `rejects a model built against a different lexicon`() {
+        val tampered = raw.copyOf()
+        ByteBuffer.wrap(tampered, WORD_COUNT_OFFSET, Int.SIZE_BYTES).putInt(lexicon.size + 1)
         val error = assertThrows(IOException::class.java) {
-            BigramLoader.read(ByteArrayInputStream(raw), lexicon.size + 1)
+            BigramLoader.read(ByteArrayInputStream(tampered), lexicon)
         }
         assertTrue(error.message!!.contains("lexicon"))
     }
 
     @Test
+    fun `rejects a changed lexicon even when its word count is identical`() {
+        val lexiconBytes = File("src/main/assets/${LexiconLoader.ASSET_NAME}").readBytes()
+        val changedBytes = lexiconBytes.copyOf()
+        // The first front-coded word starts after the 17-byte header and its two length bytes.
+        // Changing that byte preserves every header count while changing the index-to-word map.
+        changedBytes[FIRST_WORD_OFFSET] =
+            if (changedBytes[FIRST_WORD_OFFSET] == 'a'.code.toByte()) 'b'.code.toByte()
+            else 'a'.code.toByte()
+        val changedLexicon = LexiconLoader.read(ByteArrayInputStream(changedBytes))
+        assertEquals(lexicon.size, changedLexicon.size)
+
+        val error = assertThrows(IOException::class.java) {
+            BigramLoader.read(ByteArrayInputStream(raw), changedLexicon)
+        }
+        assertTrue(error.message!!.contains("fingerprint"))
+    }
+
+    @Test
     fun `rejects a truncated file`() {
         assertThrows(IOException::class.java) {
-            BigramLoader.read(ByteArrayInputStream(raw.copyOf(raw.size / 2)), lexicon.size)
+            BigramLoader.read(ByteArrayInputStream(raw.copyOf(raw.size / 2)), lexicon)
         }
     }
 
@@ -133,5 +154,10 @@ class BigramLoaderTest {
         // This runs for every candidate on every keystroke, so it has to be nearer a hash lookup
         // than a search. Generous for a desktop JVM; it is here to catch an algorithmic mistake.
         assertTrue("bigram lookup averaged %.1fns".format(perLookupNs), perLookupNs < 2000)
+    }
+
+    private companion object {
+        const val WORD_COUNT_OFFSET = 5
+        const val FIRST_WORD_OFFSET = 19
     }
 }

@@ -5,6 +5,7 @@ import android.util.Log
 import java.io.DataInputStream
 import java.io.IOException
 import java.io.InputStream
+import java.security.MessageDigest
 
 /**
  * Reads the bigram asset produced by `tools/build_bigrams.py`.
@@ -21,7 +22,8 @@ object BigramLoader {
 
     private const val TAG = "SlideBigrams"
     private const val MAGIC = 0x53424947 // "SBIG"
-    private const val SUPPORTED_VERSION = 1
+    private const val SUPPORTED_VERSION = 2
+    private const val LEXICON_FINGERPRINT_BYTES = 32
 
     /**
      * Loads the model, or returns null if the asset is missing, unreadable, or built against a
@@ -31,13 +33,13 @@ object BigramLoader {
      * so the keyboard corrects on spelling alone rather than refusing to correct.
      */
     fun load(context: Context, lexicon: Lexicon): Bigrams? = try {
-        context.assets.open(ASSET_NAME).use { read(it, lexicon.size) }
+        context.assets.open(ASSET_NAME).use { read(it, lexicon) }
     } catch (e: IOException) {
         Log.e(TAG, "Could not read $ASSET_NAME; corrections will not use context", e)
         null
     }
 
-    fun read(input: InputStream, lexiconSize: Int): Bigrams {
+    fun read(input: InputStream, lexicon: Lexicon): Bigrams {
         val data = DataInputStream(input.buffered(BUFFER_SIZE))
 
         val magic = data.readInt()
@@ -52,8 +54,13 @@ object BigramLoader {
         // Indices only mean anything against the lexicon they were built from. Loading a model
         // built against a different one would not fail, it would quietly score the wrong words.
         val wordCount = data.readInt()
-        if (wordCount != lexiconSize) {
-            throw IOException("Bigram model is for a $wordCount-word lexicon, this one has $lexiconSize")
+        if (wordCount != lexicon.size) {
+            throw IOException("Bigram model is for a $wordCount-word lexicon, this one has ${lexicon.size}")
+        }
+        val lexiconFingerprint = ByteArray(LEXICON_FINGERPRINT_BYTES)
+        data.readFully(lexiconFingerprint)
+        if (!matchesLexiconFingerprint(lexicon, lexiconFingerprint)) {
+            throw IOException("Bigram model lexicon fingerprint does not match the loaded lexicon")
         }
 
         val contextCount = data.readInt()
@@ -104,5 +111,35 @@ object BigramLoader {
         return Bigrams(contexts, offsets, successors, scores)
     }
 
+    /**
+     * Hashes the exact index order without allocating a String for each of the 160k words.
+     *
+     * Both asset builders guarantee lowercase ASCII. NUL cannot occur in a word, so delimiting
+     * each one with it keeps sequences such as ("ab", "c") distinct from ("a", "bc").
+     */
+    private fun matchesLexiconFingerprint(lexicon: Lexicon, expected: ByteArray): Boolean {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(FINGERPRINT_BUFFER_BYTES)
+        var buffered = 0
+
+        fun append(value: Byte) {
+            if (buffered == buffer.size) {
+                digest.update(buffer)
+                buffered = 0
+            }
+            buffer[buffered++] = value
+        }
+
+        for (index in 0 until lexicon.size) {
+            for (position in 0 until lexicon.lengthAt(index)) {
+                append(lexicon.charAt(index, position).code.toByte())
+            }
+            append(0)
+        }
+        if (buffered > 0) digest.update(buffer, 0, buffered)
+        return MessageDigest.isEqual(digest.digest(), expected)
+    }
+
     private const val BUFFER_SIZE = 1 shl 16
+    private const val FINGERPRINT_BUFFER_BYTES = 1 shl 12
 }

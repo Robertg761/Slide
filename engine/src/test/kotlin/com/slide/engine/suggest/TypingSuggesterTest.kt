@@ -53,6 +53,20 @@ class TypingSuggesterTest {
         }
     }
 
+    @Test
+    fun `restores only unambiguous short I contractions`() {
+        val im = suggest("im")
+        val ive = suggest("ive")
+        assertEquals("I'm", im.autocorrection)
+        assertEquals("I'm", im.words.first().word)
+        assertEquals("I've", ive.autocorrection)
+        assertEquals("I've", ive.words.first().word)
+
+        // Both are ordinary dictionary words as typed, so guessing a contraction would be wrong.
+        assertNull(suggest("id").autocorrection)
+        assertNull(suggest("ill").autocorrection)
+    }
+
     // endregion
 
     // region Refusing to correct
