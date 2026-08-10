@@ -1,6 +1,7 @@
 package com.slide.engine.gesture
 
 import android.content.Context
+import android.util.Log
 import com.slide.engine.lexicon.Bigrams
 import com.slide.engine.lexicon.Lexicon
 import com.slide.engine.lexicon.Trigrams
@@ -21,7 +22,7 @@ class NeuralGestureDecoder private constructor(
     private val fallback: GestureDecodingEngine?,
 ) : GestureDecodingEngine, AutoCloseable {
     private val beamSearch = CtcSwipeBeamSearch(lexicon, bigrams, userBigrams, trie, trigrams)
-    private var neuralAvailable = true
+    private val failover = GestureDecodeFailover(fallback)
     private var closed = false
 
     @Synchronized
@@ -32,25 +33,21 @@ class NeuralGestureDecoder private constructor(
         previousWord: String?,
         previousPreviousWord: String?,
     ): List<GestureCandidate> {
-        if (neuralAvailable) {
-            try {
-                return decodeNeural(
-                    points,
-                    keys,
-                    blockOffensive,
-                    previousWord,
-                    previousPreviousWord,
-                )
-            } catch (_: RuntimeException) {
-                // A model/runtime mismatch is persistent. Falling through once is harmless;
-                // retrying native inference on every swipe would turn a graceful fallback into
-                // repeated latency and log churn.
-                neuralAvailable = false
-            }
+        return failover.decode(
+            points = points,
+            keys = keys,
+            blockOffensive = blockOffensive,
+            previousWord = previousWord,
+            previousPreviousWord = previousPreviousWord,
+        ) {
+            decodeNeural(
+                points,
+                keys,
+                blockOffensive,
+                previousWord,
+                previousPreviousWord,
+            )
         }
-        return fallback
-            ?.decode(points, keys, blockOffensive, previousWord, previousPreviousWord)
-            .orEmpty()
     }
 
     private fun decodeNeural(
@@ -114,11 +111,20 @@ class NeuralGestureDecoder private constructor(
         )
     }
 
+    private fun passesHealthCheck(): Boolean =
+        decodeNeural(
+            points = NeuralSwipeHealthCheck.points,
+            keys = NeuralSwipeHealthCheck.keys,
+            blockOffensive = true,
+            previousWord = null,
+            previousPreviousWord = null,
+        ).firstOrNull()?.word?.equals(NeuralSwipeHealthCheck.expectedWord, ignoreCase = true) == true
+
     @Synchronized
     override fun close() {
         if (closed) return
         closed = true
-        neuralAvailable = false
+        failover.disablePrimary()
         decoder.destroy()
         encoder.destroy()
     }
@@ -137,7 +143,7 @@ class NeuralGestureDecoder private constructor(
         private const val DECODER_SHA =
             "01eaf16ac4bc0f1ed0698c240807f0e95e6d427bcf6de04983ffc50736744d85"
 
-        /** Returns null only when the packaged runtime or verified model assets cannot load. */
+        /** Returns null when the native runtime, verified assets, or known-trace health check fails. */
         fun createOrNull(
             context: Context,
             lexicon: Lexicon,
@@ -154,7 +160,7 @@ class NeuralGestureDecoder private constructor(
                 try {
                     val decoder = Module.load(decoderFile.absolutePath, Module.LOAD_MODE_MMAP)
                     try {
-                        NeuralGestureDecoder(
+                        val loaded = NeuralGestureDecoder(
                             encoder = encoder,
                             decoder = decoder,
                             lexicon = lexicon,
@@ -164,6 +170,10 @@ class NeuralGestureDecoder private constructor(
                             trigrams = trigrams,
                             fallback = fallback,
                         )
+                        check(loaded.passesHealthCheck()) {
+                            "Packaged swipe model failed its known-trace health check"
+                        }
+                        loaded
                     } catch (failure: Throwable) {
                         decoder.destroy()
                         throw failure
@@ -172,6 +182,62 @@ class NeuralGestureDecoder private constructor(
                     encoder.destroy()
                     throw failure
                 }
+            }.onFailure { failure ->
+                Log.w(TAG, "Neural swipe unavailable; deterministic decoder will be used", failure)
             }.getOrNull()
+
+        private const val TAG = "SlideSwipe"
+    }
+}
+
+/**
+ * Makes the packaged model an accuracy upgrade, never a single point of failure.
+ *
+ * An empty or structurally implausible result is a normal search miss rather than proof that the
+ * runtime is broken, so it falls back for only that trace. A runtime exception disables native
+ * inference for the rest of the process; repeatedly paying for the same broken model call would
+ * make every swipe stall.
+ */
+internal class GestureDecodeFailover(
+    private val fallback: GestureDecodingEngine?,
+) {
+    private var primaryAvailable = true
+
+    fun decode(
+        points: List<GesturePoint>,
+        keys: GestureKeyMap,
+        blockOffensive: Boolean,
+        previousWord: String?,
+        previousPreviousWord: String?,
+        primary: () -> List<GestureCandidate>,
+    ): List<GestureCandidate> {
+        if (primaryAvailable) {
+            try {
+                usable(primary()).takeIf(List<GestureCandidate>::isNotEmpty)?.let { return it }
+            } catch (_: RuntimeException) {
+                primaryAvailable = false
+            }
+        }
+        return usable(
+            fallback
+                ?.decode(points, keys, blockOffensive, previousWord, previousPreviousWord)
+                .orEmpty(),
+        )
+    }
+
+    fun disablePrimary() {
+        primaryAvailable = false
+    }
+
+    private fun usable(candidates: List<GestureCandidate>): List<GestureCandidate> =
+        candidates.filter { candidate ->
+            // One-letter words are taps, not glides. The neural trie can otherwise accept a long
+            // h-e-l-l-o trace as "h" and suppress the deterministic decoder's valid recovery.
+            candidate.word.count(Char::isLetter) >= MIN_GESTURE_WORD_LETTERS &&
+                candidate.score.isFinite()
+        }
+
+    private companion object {
+        const val MIN_GESTURE_WORD_LETTERS = 2
     }
 }

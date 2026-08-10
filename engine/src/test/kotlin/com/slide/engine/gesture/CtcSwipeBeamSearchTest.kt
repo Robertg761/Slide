@@ -62,6 +62,8 @@ class CtcSwipeBeamSearchTest {
         val candidates = search.decode(emissionsFor("computer"), true, null)
 
         assertEquals("computer", candidates.first().word.lowercase())
+        val words = candidates.map { it.word.lowercase() }
+        assertEquals(words.distinct(), words)
     }
 
     @Test
@@ -71,14 +73,27 @@ class CtcSwipeBeamSearchTest {
         assertTrue(candidates.any { it.word.lowercase() == "don't" })
     }
 
-    private fun emissionsFor(word: String): FloatArray {
+    @Test
+    fun `double letters do not require an artificial blank`() {
+        val tiny = tinyLexicon("later", "letter", "litter")
+        val repeatedSearch = CtcSwipeBeamSearch(tiny, null, null)
+        val candidates = repeatedSearch.decode(
+            emissionsFor("letter", blankBetweenLetters = false),
+            true,
+            null,
+        )
+
+        assertEquals("letter", candidates.first().word.lowercase())
+    }
+
+    private fun emissionsFor(word: String, blankBetweenLetters: Boolean = true): FloatArray {
         val output = FloatArray(32 * 27) { -18f }
         for (time in 0 until 32) output[time * 27 + 26] = 0f
         var time = 0
         for (letter in word) {
             output[time * 27 + 26] = -18f
             output[time * 27 + (letter - 'a')] = 0f
-            time += 2
+            time += if (blankBetweenLetters) 2 else 1
         }
         return output
     }

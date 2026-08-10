@@ -1,6 +1,7 @@
 package com.slide.ime
 
 import android.content.Context
+import android.content.Intent
 import android.content.res.Configuration
 import android.inputmethodservice.InputMethodService
 import android.media.AudioManager
@@ -51,6 +52,7 @@ import com.slide.engine.lexicon.UserDictionaryStore
 import com.slide.engine.suggest.SpatialTouchModel
 import com.slide.engine.suggest.TypingSuggester
 import com.slide.ime.text.AndroidGraphemeBoundaries
+import com.slide.ime.text.AutoSpacing
 import com.slide.ime.text.EditorInputPolicy
 import com.slide.ime.text.EditorKeyboardMode
 import com.slide.ime.text.PrecedingWord
@@ -380,16 +382,7 @@ class SlideInputMethodService :
                 val triples = words?.let { TrigramLoader.load(applicationContext, it) }
                 val trie = words?.let(::SwipeLexiconTrie)
                 val loadedDecoder = words?.let {
-                    val fallback = GestureDecoder(it, bigrams = pairs, trigrams = triples)
-                    NeuralGestureDecoder.createOrNull(
-                        context = applicationContext,
-                        lexicon = it,
-                        bigrams = pairs,
-                        userBigrams = userBigrams,
-                        trie = requireNotNull(trie),
-                        trigrams = triples,
-                        fallback = fallback,
-                    ) ?: fallback
+                    GestureDecoder(it, bigrams = pairs, trigrams = triples)
                 }
                 LoadedLanguageResources(words, pairs, triples, loadedDecoder, trie)
             }
@@ -410,12 +403,37 @@ class SlideInputMethodService :
                 )
                 Log.i(
                     TAG,
-                    "${if (decoder is NeuralGestureDecoder) "Neural" else "Fallback"} decoder " +
-                        "and suggester ready with ${lexicon.size} words" +
+                    "Deterministic decoder and suggester ready with ${lexicon.size} words" +
                         (bigrams?.let { ", ${it.pairCount} bigrams" } ?: ", no bigrams") +
                         (trigrams?.let { ", ${it.tripleCount} trigrams" } ?: ", no trigrams"),
                 )
                 updateGestureAvailability()
+
+                // Basic glide typing is ready before native model loading begins. The model is an
+                // optional promotion after it proves the complete tensor/search contract; a slow
+                // first copy or an incompatible runtime must never turn swipes into key slide-off.
+                var neural: NeuralGestureDecoder? = null
+                try {
+                    withContext(Dispatchers.IO) {
+                        neural = NeuralGestureDecoder.createOrNull(
+                            context = applicationContext,
+                            lexicon = lexicon,
+                            bigrams = bigrams,
+                            userBigrams = userBigrams,
+                            trie = requireNotNull(trie),
+                            trigrams = trigrams,
+                            fallback = requireNotNull(decoder),
+                        )
+                    }
+                    val ready = neural ?: return@launch
+                    gestureDecoder = ready
+                    neural = null // Ownership transfers to the service and is released in onDestroy.
+                    Log.i(TAG, "Neural swipe passed its known-trace health check and is ready")
+                } finally {
+                    // Cancellation can arrive while native loading is not interruptible. Keeping
+                    // the candidate in this outer variable ensures that late result is still closed.
+                    neural?.close()
+                }
             }
         }
 
@@ -963,6 +981,17 @@ class SlideInputMethodService :
         }
     }
 
+    override fun onSettingsRequested() {
+        performHaptic()
+        val intent = packageManager.getLaunchIntentForPackage(packageName)
+        if (intent == null) {
+            announce("Slide settings are unavailable")
+            return
+        }
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        startActivity(intent)
+    }
+
     /**
      * Holding a candidate teaches the keyboard a word, or takes one back.
      *
@@ -1065,7 +1094,7 @@ class SlideInputMethodService :
                 passwordField -> "Suggestions are off in password fields"
                 !editorInputPolicy.allowsSuggestions -> "Suggestions are off in this field"
                 !settings.suggestionsEnabled -> "Suggestions are disabled"
-                else -> "Type or swipe for suggestions"
+                else -> ""
             },
         )
     }
@@ -1404,6 +1433,18 @@ class SlideInputMethodService :
         if (composing.isNotEmpty() && !composingAtEnd) abandonComposing()
 
         if (isWordCharacter(text)) {
+            // Delay automatic spacing until a word actually starts. This turns `hello,w` into
+            // `hello, w`, while leaving `hello?!` and a manually entered space exactly as typed.
+            // Non-language editors opt out through the same policy as correction and prediction,
+            // so an address or URL is never rewritten behind the user's back.
+            if (
+                composing.isEmpty() &&
+                editorInputPolicy.allowsSuggestions &&
+                AutoSpacing.beforeWord(connection.getTextBeforeCursor(1, 0)?.lastOrNull())
+            ) {
+                connection.commitText(" ", 1)
+            }
+
             // A cursor can arrive at the edge of existing text without a useful selection callback
             // (notably on initial focus). Starting a one-character composing suffix there is just
             // as unsafe as starting one after an asynchronous model load.

@@ -48,35 +48,35 @@ object Layouts {
 
     val QwertyEn = KeyboardLayout(
         id = "qwerty_en",
-        label = "QWERTY",
+        label = "English (US)",
         languageTag = "en",
         supportsNumberRow = true,
         rows = listOf(
             KeyRow(
                 listOf(
-                    letter("q", "1", hint = "1"),
-                    letter("w", "2", hint = "2"),
-                    letter("e", "3èéêëēėę", hint = "3"),
-                    letter("r", "4", hint = "4"),
-                    letter("t", "5", hint = "5"),
-                    letter("y", "6ÿ", hint = "6"),
-                    letter("u", "7ûüùúū", hint = "7"),
-                    letter("i", "8îïíīįì", hint = "8"),
-                    letter("o", "9ôöòóœøōõ", hint = "9"),
-                    letter("p", "0", hint = "0"),
+                    letter("q", "1%", hint = "1"),
+                    letter("w", "2\\", hint = "2"),
+                    letter("e", "3èéêëēėę|", hint = "3"),
+                    letter("r", "4=", hint = "4"),
+                    letter("t", "5[", hint = "5"),
+                    letter("y", "6ÿ]", hint = "6"),
+                    letter("u", "7ûüùúū<", hint = "7"),
+                    letter("i", "8îïíīįì>", hint = "8"),
+                    letter("o", "9ôöòóœøōõ{", hint = "9"),
+                    letter("p", "0}", hint = "0"),
                 ),
             ),
             KeyRow(
                 listOf(
-                    letter("a", "àáâäæãåā"),
-                    letter("s", "ßśš"),
-                    letter("d"),
-                    letter("f"),
-                    letter("g"),
-                    letter("h"),
-                    letter("j"),
-                    letter("k"),
-                    letter("l", "ł"),
+                    letter("a", "@àáâäæãåā", hint = "@"),
+                    letter("s", "#ßśš", hint = "#"),
+                    letter("d", "$", hint = "$"),
+                    letter("f", "-", hint = "-"),
+                    letter("g", "&", hint = "&"),
+                    letter("h", "_", hint = "_"),
+                    letter("j", "+", hint = "+"),
+                    letter("k", "(", hint = "("),
+                    letter("l", ")ł", hint = ")"),
                 ),
                 leadingGap = 0.5f,
                 trailingGap = 0.5f,
@@ -84,13 +84,13 @@ object Layouts {
             KeyRow(
                 listOf(
                     shift,
-                    letter("z", "žźż"),
-                    letter("x"),
-                    letter("c", "çćč"),
-                    letter("v"),
-                    letter("b"),
-                    letter("n", "ñń"),
-                    letter("m"),
+                    letter("z", "*žźż", hint = "*"),
+                    letter("x", "\"", hint = "\""),
+                    letter("c", "'çćč", hint = "'"),
+                    letter("v", ":", hint = ":"),
+                    letter("b", ";", hint = ";"),
+                    letter("n", "!ñń", hint = "!"),
+                    letter("m", "?", hint = "?"),
                     delete,
                 ),
             ),
@@ -101,7 +101,7 @@ object Layouts {
     /** QWERTY with the characters people need most often in an email address. */
     val EmailEn = QwertyEn.copy(
         id = "email_en",
-        label = "Email",
+        label = "English (US)",
         rows = QwertyEn.rows.dropLast(1) + KeyRow(
             listOf(
                 toSymbols,
@@ -117,7 +117,7 @@ object Layouts {
     /** QWERTY with URL delimiters on the primary layer. */
     val UriEn = QwertyEn.copy(
         id = "uri_en",
-        label = "URL",
+        label = "English (US)",
         rows = QwertyEn.rows.dropLast(1) + KeyRow(
             listOf(
                 toSymbols,

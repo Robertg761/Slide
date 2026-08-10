@@ -3,6 +3,7 @@ package com.slide.ime.view
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import android.os.Bundle
@@ -127,6 +128,7 @@ class EmojiPanelView(context: Context) : View(context) {
     }
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeWidth = dp(1f) }
+    private val iconPath = Path()
 
     private val popupRect = RectF()
 
@@ -515,12 +517,16 @@ class EmojiPanelView(context: Context) : View(context) {
                 fillPaint.color = keyboardTheme.keyPressedOverlay
                 canvas.drawRect(left, 0f, left + tabWidth, bottom, fillPaint)
             }
-            val icon = when {
-                tab == RECENTS_TAB -> RECENTS_ICON
-                tab == searchTab() -> SEARCH_ICON
-                else -> tabIcon(catalogue.categories[tab - 1])
+            if (tab == searchTab()) {
+                drawSearchIcon(canvas, left + tabWidth / 2f, bottom / 2f)
+            } else {
+                val icon = if (tab == RECENTS_TAB) {
+                    RECENTS_ICON
+                } else {
+                    tabIcon(catalogue.categories[tab - 1])
+                }
+                canvas.drawText(icon, left + tabWidth / 2f, baseline, emojiPaint)
             }
-            canvas.drawText(icon, left + tabWidth / 2f, baseline, emojiPaint)
 
             if (tab == selectedTab) {
                 // An underline rather than a filled tab: the icons are colourful enough already,
@@ -539,6 +545,29 @@ class EmojiPanelView(context: Context) : View(context) {
 
         linePaint.color = keyboardTheme.divider
         canvas.drawLine(0f, bottom, width.toFloat(), bottom, linePaint)
+    }
+
+    /** A drawn magnifier stays legible on every theme; Samsung renders the text glyph nearly black. */
+    private fun drawSearchIcon(canvas: Canvas, centreX: Float, centreY: Float) {
+        val oldStyle = linePaint.style
+        val oldStrokeWidth = linePaint.strokeWidth
+        val oldStrokeCap = linePaint.strokeCap
+        linePaint.color = keyboardTheme.specialKeyText
+        linePaint.style = Paint.Style.STROKE
+        linePaint.strokeWidth = dp(1.8f)
+        linePaint.strokeCap = Paint.Cap.ROUND
+        val radius = dp(5f)
+        canvas.drawCircle(centreX - dp(1.5f), centreY - dp(1.5f), radius, linePaint)
+        canvas.drawLine(
+            centreX + dp(2.2f),
+            centreY + dp(2.2f),
+            centreX + dp(7f),
+            centreY + dp(7f),
+            linePaint,
+        )
+        linePaint.style = oldStyle
+        linePaint.strokeWidth = oldStrokeWidth
+        linePaint.strokeCap = oldStrokeCap
     }
 
     private fun drawGrid(canvas: Canvas) {
@@ -633,15 +662,14 @@ class EmojiPanelView(context: Context) : View(context) {
         linePaint.style = Paint.Style.STROKE
         linePaint.strokeWidth = dp(1.6f)
 
-        val path = android.graphics.Path().apply {
-            moveTo(centreX - w, centreY)
-            lineTo(centreX - w * 0.4f, centreY - h)
-            lineTo(centreX + w, centreY - h)
-            lineTo(centreX + w, centreY + h)
-            lineTo(centreX - w * 0.4f, centreY + h)
-            close()
-        }
-        canvas.drawPath(path, linePaint)
+        iconPath.reset()
+        iconPath.moveTo(centreX - w, centreY)
+        iconPath.lineTo(centreX - w * 0.4f, centreY - h)
+        iconPath.lineTo(centreX + w, centreY - h)
+        iconPath.lineTo(centreX + w, centreY + h)
+        iconPath.lineTo(centreX - w * 0.4f, centreY + h)
+        iconPath.close()
+        canvas.drawPath(iconPath, linePaint)
 
         val cross = dp(3.2f)
         val crossX = centreX + w * 0.25f
@@ -1050,7 +1078,6 @@ class EmojiPanelView(context: Context) : View(context) {
         const val EMPTY_RECENTS = "Emoji you pick will show up here"
         const val EMPTY_CATEGORY = "No emoji available"
         const val RECENTS_ICON = "🕐"
-        const val SEARCH_ICON = "⌕"
 
         /** Keyed by the short category names the build script writes into the asset. */
         val TAB_ICONS = mapOf(

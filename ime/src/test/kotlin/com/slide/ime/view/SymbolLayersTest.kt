@@ -59,4 +59,12 @@ class SymbolLayersTest {
         // spell with and would commit confident nonsense.
         assertTrue(second.none { it.key.gestureEligible })
     }
+
+    @Test
+    fun `common symbols are reachable from alpha long press`() {
+        val alternates = keysOf(Layouts.QwertyEn).flatMap { it.alternates }.toSet()
+        for (symbol in listOf("@", "#", "$", "%", "&", "_", "+", "(", ")", "*", "\"", "'", ":", ";", "!", "?")) {
+            assertTrue("$symbol is not reachable from the letter layer", symbol in alternates)
+        }
+    }
 }

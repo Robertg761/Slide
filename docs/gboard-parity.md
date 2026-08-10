@@ -44,16 +44,16 @@ A 1:1 inventory of Gboard's feature surface, used as the master checklist for Sl
 
 | # | Feature | Tier | Effort | Notes |
 |---|---|---|---|---|
-| B1 | Gesture path capture + trail rendering | V1 | S | Smoothed, fading trail. |
+| B1 | Gesture path capture + trail rendering | V1 | S | Built; a Galaxy S24 Ultra / Android 16 visual smoke passed. Broader device coverage remains. |
 | B2 | Gesture-vs-tap discrimination | V1 | S | Distance + time thresholds. |
-| B3 | Word decoding from path | V1 | XL | **The hard problem.** See `technical-decisions.md`. |
-| B4 | Live word preview while still swiping | V1 | M | Gboard shows the leading candidate mid-gesture. |
-| B5 | Top-3 alternates in suggestion strip after gesture | V1 | S | |
+| B3 | Word decoding from path | V1 | XL | The unreleased fail-safe and model-contract repair passed six intended injected S24 Ultra paths. Human-driven and corpus-scale device accuracy remain release gates. |
+| B4 | Live word preview while still swiping | V1 | M | Built; latency and stale-result behaviour still require physical-device validation. |
+| B5 | Top-3 alternates in suggestion strip after gesture | V1 | S | Built; best candidate is centre-aligned. |
 | B6 | Auto-space insertion between glided words | V1 | S | |
 | B7 | Glide through shift → capitalised word | V2 | S | |
 | B8 | Glide to backspace → delete last glided word | V2 | S | |
 | B9 | Glide across symbol/number keys | V3 | M | |
-| B10 | Double-letter handling (no loop required) | V1 | M | Part of decoder scoring. |
+| B10 | Double-letter handling (no loop required) | V1 | M | Covered by model-contract regressions and an on-device `letter` glide without a loop. |
 | B11 | Gesture trail colour follows theme | V1 | S | |
 | B12 | Gesture "fast delete" — swipe left on delete key | V1 | S | Same as A12. |
 | B13 | Gesture dynamic floating preview above finger | V2 | S | |
@@ -92,7 +92,7 @@ A 1:1 inventory of Gboard's feature surface, used as the master checklist for Sl
 | D4 | Contextual correction and next-word prediction | V1 | L | **Built.** Tatoeba-derived asset, 393k pairs. Held-out synthetic nonword typo correction 84.4% -> 92.2%; swipe top-1 93.8% -> 96.8%. The strip offers the next word between words, right 26% of the time from the corpus alone. |
 | D5 | Auto-capitalise sentence starts | V1 | S | |
 | D6 | Double-space → period + space | V1 | S | |
-| D7 | Auto-space after punctuation | V1 | S | |
+| D7 | Auto-space after punctuation | V1 | S | **Built.** The next word is separated lazily, preserving punctuation runs and explicit spaces. |
 | D8 | Personal dictionary (add/remove words) | V1 | M | **Built.** Hold a candidate in the strip to learn or forget it. |
 | D9 | Text shortcuts / expansion (`omw` → `on my way`) | V2 | S | |
 | D10 | Learn from what you type | V1 | M | **Built.** Words: committed deliberately twice, or rescued once from an autocorrect, and it is never rewritten again. Pairs: recurring phrases reweigh candidates in their own context. Both excluded from backup. |
@@ -253,7 +253,8 @@ Three items carried essentially all the risk: **B3** (gesture decoder), **C2/C4*
 Whisper), and **D2/D4** (autocorrect + prediction, which the gesture decoder also depends on).
 Everything else is conventional Android work.
 
-Of those, **B3**, **D2**, and **D4** are built and measured. **C2** is built and its native fixture
-path was benchmarked on one physical phone, but the final 0.2.1 microphone-to-editor flow still
-needs a device run; **C4** streaming is not built. D4's Tatoeba-derived language model is wired into
-both correction and the next-word strip.
+Of those, **D2** and the tap/prediction parts of **D4** are built and measured. **B3** has an
+implemented neural and deterministic path, but the 0.3.0 live-use report exposed a model/search
+contract bug and an empty-result failover bug; the repairs are not complete until they pass on a
+physical phone. **C2** is built and its native fixture path was benchmarked on one physical phone,
+but the final microphone-to-editor flow still needs a device run; **C4** streaming is not built.

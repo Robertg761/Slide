@@ -21,32 +21,47 @@ object MicGlyph {
     fun draw(canvas: Canvas, paint: Paint, centerX: Float, centerY: Float, radius: Float) {
         val style = paint.style
         val strokeWidth = paint.strokeWidth
+        val strokeCap = paint.strokeCap
+        val strokeJoin = paint.strokeJoin
 
-        // The capsule body.
-        val halfWidth = radius * 0.34f
+        // A small filled capsule is legible at toolbar size; the surrounding cradle stays light
+        // so the complete glyph has the same optical weight as the other action icons.
+        val halfWidth = radius * 0.25f
         paint.style = Paint.Style.FILL
+        paint.strokeCap = Paint.Cap.ROUND
+        paint.strokeJoin = Paint.Join.ROUND
         canvas.drawRoundRect(
             centerX - halfWidth,
-            centerY - radius * 0.55f,
+            centerY - radius * 0.68f,
             centerX + halfWidth,
-            centerY + radius * 0.10f,
+            centerY + radius * 0.08f,
             halfWidth,
             halfWidth,
             paint,
         )
 
-        // The cradle under it, and the short stem down to the base.
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = radius * 0.12f
-        val arc = radius * 0.58f
+        val arc = radius * 0.52f
         canvas.drawArc(
-            centerX - arc, centerY - arc, centerX + arc, centerY + arc,
+            centerX - arc,
+            centerY - radius * 0.24f,
+            centerX + arc,
+            centerY + radius * 0.60f,
             0f, 180f, false, paint,
         )
-        canvas.drawLine(centerX, centerY + arc * 0.72f, centerX, centerY + radius * 0.72f, paint)
-        canvas.drawLine(centerX - radius * 0.27f, centerY + radius * 0.72f, centerX + radius * 0.27f, centerY + radius * 0.72f, paint)
+        canvas.drawLine(centerX, centerY + radius * 0.56f, centerX, centerY + radius * 0.76f, paint)
+        canvas.drawLine(
+            centerX - radius * 0.28f,
+            centerY + radius * 0.76f,
+            centerX + radius * 0.28f,
+            centerY + radius * 0.76f,
+            paint,
+        )
 
         paint.style = style
         paint.strokeWidth = strokeWidth
+        paint.strokeCap = strokeCap
+        paint.strokeJoin = strokeJoin
     }
 }

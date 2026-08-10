@@ -241,7 +241,8 @@ backup or device transfer.
 Slide's own source code and documentation are licensed under the
 [Apache License 2.0](LICENSE). This permissive licence includes an explicit patent grant.
 
-Slide clones Gboard's *functionality*, not its implementation. No Gboard code, binaries,
+Slide aims for Gboard-class *functionality*, not its implementation. It has not reached feature,
+accuracy, or polish parity yet. No Gboard code, binaries,
 dictionaries, or assets are used. Dictionaries come from the Apache-2.0 AOSP wordlists; context
 models are derived from [Tatoeba](https://tatoeba.org) sentence data, used and redistributed under
 CC BY 2.0 FR; emoji data and search keywords come from Unicode and CLDR under the Unicode licence;

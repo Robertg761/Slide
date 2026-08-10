@@ -1,5 +1,59 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A neural swipe that produced no terminal candidate now runs the deterministic decoder instead
+  of falling through to the gesture's first key, so the optional model can no longer make basic
+  glide typing less reliable.
+- Neural beam search now follows the packaged model's Viterbi state and repeated-letter contract;
+  words such as `letter` no longer require an artificial blank or finger loop between identical
+  letters.
+- Neural inference must decode the publisher's known trace during keyboard startup or it is
+  disabled before the first user gesture; loading model files alone is no longer considered ready.
+- The deterministic decoder becomes available before native model loading begins, so first-use
+  swipes no longer behave like key slide-off while model files are copied and initialized.
+- A deliberate full-length swipe with no candidate now commits nothing instead of inserting the
+  first key under the finger; short press-wanders still resolve to the intended tap.
+- A one-letter neural result can no longer suppress deterministic recovery for a real gesture;
+  genuine one-letter input remains a tap rather than a glide.
+
+### Changed
+
+- The default borderless keyboard no longer draws a separate tile behind every letter, while
+  action keys retain their stronger surfaces. Keycaps use more consistent rounding and spacing.
+- The best suggestion occupies the centre cell, the idle strip stays visually quiet, the space
+  bar uses a user-facing language label, and the gesture trail is continuous and smoothed.
+- The suggestion strip now has a permanent settings control with full touch and accessibility
+  targets, calmer candidate emphasis, and rounded pressed states alongside the voice control.
+- Key previews stay within the keyboard width, alternate-character selection cancels cleanly when
+  the finger leaves its interaction corridor, and popup surfaces use consistent rounding.
+- Swipe-time drawing reuses action-icon paths, popup geometry, and preview backgrounds instead of
+  allocating replacement objects during interaction.
+- The emoji search tab now uses a theme-colored geometric icon instead of a device-font glyph that
+  rendered nearly black on Samsung's dark keyboard; its footer icon path is reused as well.
+- Starting a word after comma, sentence punctuation, colon, semicolon, or ellipsis now inserts the
+  missing space without doubling an explicit space or breaking punctuation runs such as `?!`.
+- Long-press menus are constrained to the phone width, and the alpha layout exposes the common
+  symbols shown in its key hints without requiring a trip to the symbols page.
+- Settings now expose keyboard height, gesture-navigation padding, haptic strength, keypress
+  volume, auto-capitalization, and double-space punctuation instead of hiding supported controls.
+- Shift, backspace, microphone, search, and emoji now use one compact optical size and rounded
+  stroke system; the shift arrow no longer resembles a house and emoji eyes render as solid dots.
+
+### Verification
+
+- A Galaxy S24 Ultra on Android 16 passed neural startup health, six intended injected glides
+  (`computer`, `keyboard`, `letter`, `perfect`, `swipe`, and `hello`), `dont` / `doesnt`
+  autocorrection, settings navigation, symbol and emoji layers, and screenshot review. Post-lift
+  commit was observed within 91 ms using coarse ADB markers.
+- A follow-up S24 Ultra pass verified `hello. world` auto-spacing from literal key taps, an
+  edge-bounded 11-choice `e` popup, punctuation hints with and without the number row, the new
+  settings controls, and continued multi-point gesture decoding.
+- Broader human-driven testing across varied speeds, angles, apps, and a recorded trace corpus is
+  still required before claiming general accuracy parity or publishing another release.
+
 ## [0.3.0] - 2026-08-10
 
 ### Added

@@ -164,8 +164,8 @@ class KeyboardView @JvmOverloads constructor(
     private val baseRowHeight = dp(52f)
     private val topPadding = dp(4f)
     private val keyGapH = dp(3f)
-    private val keyGapV = dp(5f)
-    private val cornerRadius = dp(8f)
+    private val keyGapV = dp(3.5f)
+    private val cornerRadius = dp(12f)
 
     private var placedKeys: List<PlacedKey> = emptyList()
 
@@ -195,6 +195,7 @@ class KeyboardView @JvmOverloads constructor(
 
     private val reusableRect = RectF()
     private val trailPath = Path()
+    private val iconPath = Path()
 
     private val handler = Handler(Looper.getMainLooper())
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
@@ -444,22 +445,31 @@ class KeyboardView @JvmOverloads constructor(
 
     private fun drawKey(canvas: Canvas, placed: PlacedKey, pressed: Boolean) {
         val key = placed.key
+        val compactSurface =
+            !settings.showKeyBorders && KeySurfaceStyle.usesCompactSurface(key.type)
+        val surfaceInsetV = if (compactSurface) dp(8f) else keyGapV
         reusableRect.set(
             placed.left + keyGapH,
-            placed.top + keyGapV,
+            placed.top + surfaceInsetV,
             placed.right - keyGapH,
-            placed.bottom - keyGapV,
+            placed.bottom - surfaceInsetV,
         )
 
-        fillPaint.color = backgroundColorFor(key)
-        canvas.drawRoundRect(reusableRect, cornerRadius, cornerRadius, fillPaint)
+        // Gboard's "key borders" setting controls the visible keycap, not merely a one-pixel
+        // outline. With it off, letters and standalone glyphs sit directly on the keyboard while
+        // the space, mode, and enter targets retain compact pill surfaces.
+        val drawSurface = KeySurfaceStyle.drawsSurface(key.type, settings.showKeyBorders)
+        if (drawSurface) {
+            fillPaint.color = backgroundColorFor(key)
+            canvas.drawRoundRect(reusableRect, cornerRadius, cornerRadius, fillPaint)
+        }
 
         if (pressed) {
             fillPaint.color = keyboardTheme.keyPressedOverlay
             canvas.drawRoundRect(reusableRect, cornerRadius, cornerRadius, fillPaint)
         }
 
-        if (settings.showKeyBorders) {
+        if (settings.showKeyBorders && drawSurface) {
             borderPaint.color = keyboardTheme.keyBorder
             canvas.drawRoundRect(reusableRect, cornerRadius, cornerRadius, borderPaint)
         }
@@ -469,7 +479,7 @@ class KeyboardView @JvmOverloads constructor(
             return
         }
 
-        if (key.type in setOf(KeyType.SHIFT, KeyType.DELETE, KeyType.ENTER, KeyType.EMOJI)) {
+        if (isActionIcon(key.type)) {
             drawActionIcon(canvas, key.type, placed)
             return
         }
@@ -481,15 +491,15 @@ class KeyboardView @JvmOverloads constructor(
         val baseline = placed.centerY - (metrics.ascent + metrics.descent) / 2f
         canvas.drawText(displayLabel(key), placed.centerX, baseline, labelPaint)
 
-        val hint = key.hint
-        if (hint != null && !settings.showNumberRow) {
+        val hint = KeyHintStyle.visibleHint(key, settings.showNumberRow)
+        if (hint != null) {
             hintPaint.color = keyboardTheme.hintText
             hintPaint.textSize = min(sp(10f), placed.width * 0.24f)
             canvas.drawText(hint, placed.right - keyGapH - dp(8f), placed.top + keyGapV + dp(13f), hintPaint)
         }
     }
 
-    /** Larger geometric icons stay crisp and visually centred at every keyboard height. */
+    /** One compact optical box and stroke weight keeps every action glyph in the same family. */
     private fun drawActionIcon(canvas: Canvas, type: KeyType, placed: PlacedKey) {
         val oldStyle = labelPaint.style
         val oldStroke = labelPaint.strokeWidth
@@ -497,24 +507,71 @@ class KeyboardView @JvmOverloads constructor(
         val oldJoin = labelPaint.strokeJoin
         labelPaint.color = textColorFor(placed.key)
         labelPaint.style = Paint.Style.STROKE
-        labelPaint.strokeWidth = dp(2.1f)
+        labelPaint.strokeWidth = ActionIconStyle.strokeWidth(density)
         labelPaint.strokeCap = Paint.Cap.ROUND
         labelPaint.strokeJoin = Paint.Join.ROUND
-        val r = minOf(placed.width, placed.height) * 0.29f
-        val x = placed.centerX; val y = placed.centerY
+        val r = ActionIconStyle.radius(placed.width, placed.height)
+        val x = placed.centerX
+        val y = placed.centerY
         when (type) {
             KeyType.SHIFT -> {
-                val p = Path().apply { moveTo(x, y-r); lineTo(x-r*.78f, y-r*.1f); lineTo(x-r*.38f, y-r*.1f); lineTo(x-r*.38f, y+r); lineTo(x+r*.38f, y+r); lineTo(x+r*.38f, y-r*.1f); lineTo(x+r*.78f, y-r*.1f); close() }
-                canvas.drawPath(p, labelPaint)
-                if (shiftState == ShiftState.LOCKED) canvas.drawCircle(x, y-r*.42f, dp(1.8f), labelPaint)
-                if (shiftState == ShiftState.SHIFTED) canvas.drawLine(x-r*.35f, y+r*.72f, x+r*.35f, y+r*.72f, labelPaint)
+                // The inactive shift is a compact outline, matching the visual weight of
+                // backspace. Filling the same path communicates the active state without adding
+                // a large rectangular keycap behind it.
+                if (shiftState != ShiftState.OFF && !settings.showKeyBorders) {
+                    labelPaint.style = Paint.Style.FILL
+                }
+                iconPath.reset()
+                iconPath.moveTo(x, y - r * .88f)
+                iconPath.lineTo(x - r * .72f, y - r * .06f)
+                iconPath.lineTo(x - r * .31f, y - r * .06f)
+                iconPath.lineTo(x - r * .31f, y + r * .62f)
+                iconPath.lineTo(x + r * .31f, y + r * .62f)
+                iconPath.lineTo(x + r * .31f, y - r * .06f)
+                iconPath.lineTo(x + r * .72f, y - r * .06f)
+                iconPath.close()
+                canvas.drawPath(iconPath, labelPaint)
+                labelPaint.style = Paint.Style.STROKE
+                if (shiftState == ShiftState.LOCKED) {
+                    canvas.drawLine(
+                        x - r * .32f,
+                        y + r * .88f,
+                        x + r * .32f,
+                        y + r * .88f,
+                        labelPaint,
+                    )
+                }
             }
             KeyType.DELETE -> {
-                val p = Path().apply { moveTo(x-r, y); lineTo(x-r*.42f, y-r*.62f); lineTo(x+r, y-r*.62f); lineTo(x+r, y+r*.62f); lineTo(x-r*.42f, y+r*.62f); close() }
-                canvas.drawPath(p, labelPaint); canvas.drawLine(x-r*.02f, y-r*.25f, x+r*.45f, y+r*.25f, labelPaint); canvas.drawLine(x+r*.45f, y-r*.25f, x-r*.02f, y+r*.25f, labelPaint)
+                iconPath.reset()
+                iconPath.moveTo(x - r * .88f, y)
+                iconPath.lineTo(x - r * .38f, y - r * .52f)
+                iconPath.lineTo(x + r * .82f, y - r * .52f)
+                iconPath.lineTo(x + r * .82f, y + r * .52f)
+                iconPath.lineTo(x - r * .38f, y + r * .52f)
+                iconPath.close()
+                canvas.drawPath(iconPath, labelPaint)
+                canvas.drawLine(x + r * .02f, y - r * .22f, x + r * .40f, y + r * .22f, labelPaint)
+                canvas.drawLine(x + r * .40f, y - r * .22f, x + r * .02f, y + r * .22f, labelPaint)
             }
             KeyType.ENTER -> drawEnterIcon(canvas, x, y, r)
-            KeyType.EMOJI -> { canvas.drawCircle(x, y, r*.78f, labelPaint); canvas.drawCircle(x-r*.28f, y-r*.16f, dp(1.3f), labelPaint); canvas.drawCircle(x+r*.28f, y-r*.16f, dp(1.3f), labelPaint); canvas.drawArc(x-r*.4f, y-r*.1f, x+r*.4f, y+r*.42f, 15f, 150f, false, labelPaint) }
+            KeyType.EMOJI -> {
+                canvas.drawCircle(x, y, r * .68f, labelPaint)
+                labelPaint.style = Paint.Style.FILL
+                canvas.drawCircle(x - r * .24f, y - r * .14f, r * .075f, labelPaint)
+                canvas.drawCircle(x + r * .24f, y - r * .14f, r * .075f, labelPaint)
+                labelPaint.style = Paint.Style.STROKE
+                canvas.drawArc(
+                    x - r * .34f,
+                    y - r * .03f,
+                    x + r * .34f,
+                    y + r * .36f,
+                    12f,
+                    156f,
+                    false,
+                    labelPaint,
+                )
+            }
             else -> Unit
         }
         labelPaint.style = oldStyle
@@ -526,21 +583,23 @@ class KeyboardView @JvmOverloads constructor(
     private fun drawEnterIcon(canvas: Canvas, x: Float, y: Float, r: Float) {
         when (enterAction) {
             EnterAction.RETURN -> {
-                canvas.drawLine(x-r, y, x+r*.65f, y, labelPaint)
-                canvas.drawLine(x-r, y, x-r*.38f, y-r*.38f, labelPaint)
-                canvas.drawLine(x-r, y, x-r*.38f, y+r*.38f, labelPaint)
-                canvas.drawLine(x+r*.65f, y, x+r*.65f, y-r*.68f, labelPaint)
+                canvas.drawLine(x - r * .72f, y + r * .10f, x + r * .52f, y + r * .10f, labelPaint)
+                canvas.drawLine(x - r * .72f, y + r * .10f, x - r * .30f, y - r * .30f, labelPaint)
+                canvas.drawLine(x - r * .72f, y + r * .10f, x - r * .30f, y + r * .50f, labelPaint)
+                canvas.drawLine(x + r * .52f, y + r * .10f, x + r * .52f, y - r * .58f, labelPaint)
             }
             EnterAction.SEARCH -> {
-                canvas.drawCircle(x-r*.18f, y-r*.12f, r*.52f, labelPaint)
-                canvas.drawLine(x+r*.2f, y+r*.26f, x+r*.72f, y+r*.78f, labelPaint)
+                canvas.drawCircle(x - r * .13f, y - r * .13f, r * .46f, labelPaint)
+                canvas.drawLine(x + r * .20f, y + r * .20f, x + r * .67f, y + r * .67f, labelPaint)
             }
             EnterAction.SEND -> {
-                val p = Path().apply {
-                    moveTo(x-r*.85f, y-r*.72f); lineTo(x+r*.85f, y); lineTo(x-r*.85f, y+r*.72f)
-                    lineTo(x-r*.38f, y); close()
-                }
-                canvas.drawPath(p, labelPaint)
+                iconPath.reset()
+                iconPath.moveTo(x - r * .85f, y - r * .72f)
+                iconPath.lineTo(x + r * .85f, y)
+                iconPath.lineTo(x - r * .85f, y + r * .72f)
+                iconPath.lineTo(x - r * .38f, y)
+                iconPath.close()
+                canvas.drawPath(iconPath, labelPaint)
             }
             EnterAction.GO, EnterAction.NEXT -> {
                 canvas.drawLine(x-r*.8f, y, x+r*.62f, y, labelPaint)
@@ -559,6 +618,11 @@ class KeyboardView @JvmOverloads constructor(
         }
     }
 
+    private fun isActionIcon(type: KeyType): Boolean = when (type) {
+        KeyType.SHIFT, KeyType.DELETE, KeyType.ENTER, KeyType.EMOJI -> true
+        else -> false
+    }
+
     private fun drawSpaceLabel(canvas: Canvas, placed: PlacedKey) {
         labelPaint.color = keyboardTheme.hintText
         labelPaint.textSize = min(sp(12f), placed.width * 0.28f)
@@ -570,20 +634,23 @@ class KeyboardView @JvmOverloads constructor(
     private fun drawGestureTrail(canvas: Canvas) {
         if (gesturePoints.size < 2) return
 
-        // Only the recent tail is drawn, and it tapers, so the trail reads as motion rather than
-        // as a static scribble. The full path is still retained for decoding.
-        val visible = gesturePoints.takeLast(TRAIL_POINTS)
+        // Preserve the full visible motion and soften the sampled polyline into one continuous
+        // stroke. Segment-by-segment alpha made fast traces look dashed, while discarding most of
+        // the path made a long glide look as though it had stopped tracking the finger.
+        val start = (gesturePoints.size - TRAIL_POINTS).coerceAtLeast(0)
         trailPaint.color = keyboardTheme.gestureTrail
-
-        for (i in 1 until visible.size) {
-            val progress = i.toFloat() / visible.size
-            trailPath.reset()
-            trailPath.moveTo(visible[i - 1].x, visible[i - 1].y)
-            trailPath.lineTo(visible[i].x, visible[i].y)
-            trailPaint.alpha = (progress * 220f).toInt().coerceIn(0, 255)
-            trailPaint.strokeWidth = dp(2f) + dp(4f) * progress
-            canvas.drawPath(trailPath, trailPaint)
+        trailPaint.alpha = 215
+        trailPaint.strokeWidth = dp(5.5f)
+        trailPath.reset()
+        trailPath.moveTo(gesturePoints[start].x, gesturePoints[start].y)
+        for (i in start + 1 until gesturePoints.lastIndex) {
+            val point = gesturePoints[i]
+            val next = gesturePoints[i + 1]
+            trailPath.quadTo(point.x, point.y, (point.x + next.x) / 2f, (point.y + next.y) / 2f)
         }
+        val end = gesturePoints.last()
+        trailPath.lineTo(end.x, end.y)
+        canvas.drawPath(trailPath, trailPaint)
     }
 
     private fun backgroundColorFor(key: Key): Int = when (key.type) {
@@ -595,7 +662,11 @@ class KeyboardView @JvmOverloads constructor(
 
     private fun textColorFor(key: Key): Int = when (key.type) {
         KeyType.ENTER -> keyboardTheme.accentText
-        KeyType.SHIFT -> if (shiftState != ShiftState.OFF) keyboardTheme.accentText else keyboardTheme.specialKeyText
+        KeyType.SHIFT -> if (settings.showKeyBorders && shiftState != ShiftState.OFF) {
+            keyboardTheme.accentText
+        } else {
+            keyboardTheme.specialKeyText
+        }
         KeyType.CHARACTER, KeyType.SPACE -> keyboardTheme.keyText
         else -> keyboardTheme.specialKeyText
     }
@@ -1041,12 +1112,10 @@ class KeyboardView @JvmOverloads constructor(
     }
 
     /**
-     * Ends a swipe, or falls back to the key it started on when there is nothing to decode.
+     * Ends a deliberate swipe, or treats a short wander as the key press it began as.
      *
-     * A path this short is a press that wandered — the finger crossed the slop threshold and lifted
-     * again. Treating it as a failed gesture discards it, which silently eats a keystroke the user
-     * did make; the thresholds here mirror the decoder's own so that anything it would refuse
-     * becomes a keypress rather than nothing at all.
+     * A full-length gesture with no candidate must not type its first letter: that is surprising,
+     * destructive output and is what made a decoder miss look as though glide typing had vanished.
      */
     private fun finishGesture(pointer: Pointer) {
         val points = ArrayList(gesturePoints)
@@ -1054,8 +1123,9 @@ class KeyboardView @JvmOverloads constructor(
 
         val decodable = points.size >= MIN_GESTURE_POINTS &&
             pathLength(points) >= pointer.placed.width * MIN_GESTURE_PATH_FACTOR
-        val committed = decodable && listener?.onGestureComplete(points) == true
-        if (!committed) {
+        if (decodable) {
+            listener?.onGestureComplete(points)
+        } else {
             listener?.onKeyCommit(
                 pointer.initialPlaced.key,
                 outputFor(pointer.initialPlaced.key),
@@ -1145,7 +1215,7 @@ class KeyboardView @JvmOverloads constructor(
     }
 
     private companion object {
-        const val TRAIL_POINTS = 48
+        const val TRAIL_POINTS = 192
 
         /**
          * The least a swipe must be to be worth decoding, mirroring `DecoderConfig`'s own floors.
@@ -1176,4 +1246,34 @@ class KeyboardView @JvmOverloads constructor(
         const val REPEAT_MIN_DELAY_MS = 25L
         const val REPEAT_ACCELERATION = 0.66f
     }
+}
+
+/** Visual keycap policy separated from Canvas work so theme settings cannot regress silently. */
+internal object KeySurfaceStyle {
+    fun drawsSurface(type: KeyType, showKeyBorders: Boolean): Boolean = showKeyBorders ||
+        type == KeyType.SPACE ||
+        type == KeyType.ENTER ||
+        type == KeyType.SYMBOLS ||
+        type == KeyType.SYMBOLS_ALT ||
+        type == KeyType.ALPHA
+
+    fun usesCompactSurface(type: KeyType): Boolean =
+        type == KeyType.SPACE ||
+            type == KeyType.ENTER ||
+            type == KeyType.SYMBOLS ||
+            type == KeyType.SYMBOLS_ALT ||
+            type == KeyType.ALPHA
+}
+
+/** Digit hints disappear beside a real number row; punctuation hints remain useful. */
+internal object KeyHintStyle {
+    fun visibleHint(key: Key, showNumberRow: Boolean): String? =
+        key.hint?.takeUnless { showNumberRow && it.length == 1 && it[0].isDigit() }
+}
+
+/** Shared optical measurements for the five action icons in the key row and toolbar. */
+internal object ActionIconStyle {
+    fun radius(width: Float, height: Float): Float = minOf(width, height) * 0.235f
+
+    fun strokeWidth(density: Float): Float = 1.65f * density
 }

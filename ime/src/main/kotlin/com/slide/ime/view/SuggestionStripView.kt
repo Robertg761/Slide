@@ -22,9 +22,8 @@ import com.slide.core.theme.Themes
 /**
  * The row of word candidates above the keys.
  *
- * The decoder is right about 96% of the time on its first choice but essentially always has the
- * intended word somewhere in its top five, so the value here is almost entirely in the alternatives:
- * this strip is what turns a wrong decode from a retyped word into a single tap.
+ * The centre cell is the leading candidate and the side cells are alternatives. Keeping that
+ * placement stable turns a wrong decode from a retyped word into one predictable tap.
  *
  * It draws itself rather than nesting TextViews. Three cells is a fixed, tiny layout, and doing it
  * in one onDraw keeps it consistent with [KeyboardView] and avoids a measure pass on every swipe.
@@ -32,6 +31,9 @@ import com.slide.core.theme.Themes
 class SuggestionStripView(context: Context) : View(context) {
 
     interface Listener {
+        /** Opens Slide's keyboard settings. */
+        fun onSettingsRequested()
+
         /** [index] is the position in the list passed to [setSuggestions], 0 being the best. */
         fun onSuggestionPicked(index: Int, word: String)
 
@@ -54,6 +56,7 @@ class SuggestionStripView(context: Context) : View(context) {
             field = value
             pressedIndex = -1
             micPressed = false
+            settingsPressed = false
             refreshAccessibilityDescription()
             invalidate()
         }
@@ -72,6 +75,7 @@ class SuggestionStripView(context: Context) : View(context) {
     private val words = ArrayList<String>(MAX_VISIBLE)
     private var pressedIndex = -1
     private var micPressed = false
+    private var settingsPressed = false
     private var emptyMessage = "Type or swipe for suggestions"
 
     private val handler = Handler(Looper.getMainLooper())
@@ -88,16 +92,21 @@ class SuggestionStripView(context: Context) : View(context) {
         strokeWidth = dp(1f)
     }
     private val pressedPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        strokeCap = Paint.Cap.ROUND
+    }
 
     private val accessibilityHelper = object : ExploreByTouchHelper(this) {
         override fun getVirtualViewAt(x: Float, y: Float): Int {
             if (y !in 0f..height.toFloat()) return INVALID_ID
+            if (isOverSettings(x)) return A11Y_SETTINGS
             if (voiceEnabled && isOverMic(x)) return A11Y_MIC
             val index = indexAt(x)
             return if (index >= 0) A11Y_WORD_BASE + index else INVALID_ID
         }
 
         override fun getVisibleVirtualViews(virtualViewIds: MutableList<Int>) {
+            virtualViewIds += A11Y_SETTINGS
             words.indices.forEach { virtualViewIds += A11Y_WORD_BASE + it }
             if (voiceEnabled) virtualViewIds += A11Y_MIC
         }
@@ -109,6 +118,11 @@ class SuggestionStripView(context: Context) : View(context) {
             node.className = "android.widget.Button"
             node.isClickable = true
             node.addAction(AccessibilityNodeInfoCompat.ACTION_CLICK)
+            if (virtualViewId == A11Y_SETTINGS) {
+                node.contentDescription = "Keyboard settings"
+                node.setBoundsInParent(Rect(0, 0, settingsWidth().toInt(), height))
+                return
+            }
             if (virtualViewId == A11Y_MIC) {
                 node.contentDescription = "Voice typing"
                 node.setBoundsInParent(Rect((width - micWidth()).toInt(), 0, width, height))
@@ -120,8 +134,15 @@ class SuggestionStripView(context: Context) : View(context) {
             node.contentDescription = if (index == 0) "$word, best suggestion" else word
             node.addAction(AccessibilityNodeInfoCompat.ACTION_LONG_CLICK)
             val cellWidth = suggestionWidth() / MAX_VISIBLE
+            val visualSlot = SuggestionPlacement.slotForCandidate(words.size, index)
+            val contentLeft = suggestionLeft()
             node.setBoundsInParent(
-                Rect((index * cellWidth).toInt(), 0, ((index + 1) * cellWidth).toInt(), height),
+                Rect(
+                    (contentLeft + visualSlot * cellWidth).toInt(),
+                    0,
+                    (contentLeft + (visualSlot + 1) * cellWidth).toInt(),
+                    height,
+                ),
             )
         }
 
@@ -130,6 +151,11 @@ class SuggestionStripView(context: Context) : View(context) {
             action: Int,
             arguments: Bundle?,
         ): Boolean {
+            if (virtualViewId == A11Y_SETTINGS) {
+                if (action != AccessibilityNodeInfo.ACTION_CLICK) return false
+                listener?.onSettingsRequested()
+                return true
+            }
             if (virtualViewId == A11Y_MIC) {
                 if (action != AccessibilityNodeInfo.ACTION_CLICK || !voiceEnabled) return false
                 listener?.onVoiceRequested()
@@ -168,6 +194,8 @@ class SuggestionStripView(context: Context) : View(context) {
         words.clear()
         candidates.take(MAX_VISIBLE).forEach(words::add)
         pressedIndex = -1
+        settingsPressed = false
+        micPressed = false
         refreshAccessibilityDescription()
         accessibilityHelper.invalidateRoot()
         invalidate()
@@ -194,18 +222,21 @@ class SuggestionStripView(context: Context) : View(context) {
 
     override fun onDraw(canvas: Canvas) {
         canvas.drawColor(keyboardTheme.background)
+        drawSettingsButton(canvas)
         drawMicButton(canvas)
         if (words.isEmpty()) {
-            textPaint.color = keyboardTheme.hintText
-            textPaint.typeface = Typeface.DEFAULT
-            textPaint.textSize = minOf(sp(12f), suggestionWidth() * 0.04f)
-            val metrics = textPaint.fontMetrics
-            canvas.drawText(
-                emptyMessage,
-                suggestionWidth() / 2f,
-                height / 2f - (metrics.ascent + metrics.descent) / 2f,
-                textPaint,
-            )
+            if (emptyMessage.isNotEmpty()) {
+                textPaint.color = keyboardTheme.hintText
+                textPaint.typeface = Typeface.DEFAULT
+                textPaint.textSize = minOf(sp(12f), suggestionWidth() * 0.04f)
+                val metrics = textPaint.fontMetrics
+                canvas.drawText(
+                    emptyMessage,
+                    suggestionLeft() + suggestionWidth() / 2f,
+                    height / 2f - (metrics.ascent + metrics.descent) / 2f,
+                    textPaint,
+                )
+            }
             return
         }
 
@@ -215,21 +246,29 @@ class SuggestionStripView(context: Context) : View(context) {
         val metrics = textPaint.fontMetrics
         val baseline = height / 2f - (metrics.ascent + metrics.descent) / 2f
 
-        for (index in words.indices) {
-            val left = index * cellWidth
+        // Keep the best candidate in the centre. That stable target is easier to scan and matches
+        // the placement people have learned from mature mobile keyboards.
+        for (slot in 0 until MAX_VISIBLE) {
+            val index = SuggestionPlacement.candidateAtSlot(words.size, slot) ?: continue
+            val left = suggestionLeft() + slot * cellWidth
 
             if (index == pressedIndex) {
                 pressedPaint.color = keyboardTheme.keyPressedOverlay
-                canvas.drawRect(left, 0f, left + cellWidth, height.toFloat(), pressedPaint)
+                val inset = dp(4f)
+                canvas.drawRoundRect(
+                    left + inset,
+                    inset,
+                    left + cellWidth - inset,
+                    height - inset,
+                    dp(10f),
+                    dp(10f),
+                    pressedPaint,
+                )
             }
 
             // The top choice is the one that gets committed, so it is marked as such: the user
             // should be able to tell at a glance whether the keyboard already agrees with them.
-            textPaint.color = if (index == 0) {
-                keyboardTheme.suggestionHighlightText
-            } else {
-                keyboardTheme.suggestionText
-            }
+            textPaint.color = keyboardTheme.suggestionText
             textPaint.typeface = if (index == 0) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
 
             canvas.drawText(
@@ -238,12 +277,45 @@ class SuggestionStripView(context: Context) : View(context) {
                 baseline,
                 textPaint,
             )
+        }
+        val inset = dp(10f)
+        dividerPaint.color = keyboardTheme.divider
+        for (slot in 1 until MAX_VISIBLE) {
+            val x = suggestionLeft() + slot * cellWidth
+            canvas.drawLine(x, inset, x, height - inset, dividerPaint)
+        }
+    }
 
-            if (index > 0) {
-                val inset = dp(10f)
-                dividerPaint.color = keyboardTheme.divider
-                canvas.drawLine(left, inset, left, height - inset, dividerPaint)
+    /** A persistent, thumb-sized route to the app's settings and setup screen. */
+    private fun drawSettingsButton(canvas: Canvas) {
+        val centerX = settingsWidth() / 2f
+        val centerY = height / 2f
+        if (settingsPressed) {
+            pressedPaint.color = keyboardTheme.keyPressedOverlay
+            canvas.drawCircle(centerX, centerY, height * 0.4f, pressedPaint)
+        }
+
+        dividerPaint.color = keyboardTheme.divider
+        val inset = dp(10f)
+        canvas.drawLine(settingsWidth(), inset, settingsWidth(), height - inset, dividerPaint)
+
+        // Three compact sliders read clearly as customization without relying on a font glyph.
+        iconPaint.color = keyboardTheme.suggestionText
+        iconPaint.style = Paint.Style.STROKE
+        iconPaint.strokeWidth = dp(1.8f)
+        val left = centerX - dp(8f)
+        val right = centerX + dp(8f)
+        for (row in 0..2) {
+            val y = centerY + dp((row - 1) * 6f)
+            val knobX = when (row) {
+                0 -> centerX - dp(3f)
+                1 -> centerX + dp(4f)
+                else -> centerX - dp(1f)
             }
+            canvas.drawLine(left, y, right, y, iconPaint)
+            iconPaint.style = Paint.Style.FILL
+            canvas.drawCircle(knobX, y, dp(2.3f), iconPaint)
+            iconPaint.style = Paint.Style.STROKE
         }
     }
 
@@ -259,42 +331,53 @@ class SuggestionStripView(context: Context) : View(context) {
         val centerX = width - micWidth() / 2f
         val centerY = height / 2f
 
+        // A stable circular control separates voice input from suggestions without the hard
+        // vertical divider that made the glyph look bolted onto the edge of the strip.
+        pressedPaint.color = keyboardTheme.specialKeyBackground
+        canvas.drawCircle(centerX, centerY, height * 0.36f, pressedPaint)
         if (micPressed) {
             pressedPaint.color = keyboardTheme.keyPressedOverlay
-            canvas.drawCircle(centerX, centerY, height * 0.4f, pressedPaint)
+            canvas.drawCircle(centerX, centerY, height * 0.40f, pressedPaint)
         }
 
-        dividerPaint.color = keyboardTheme.divider
-        val inset = dp(10f)
-        val boundary = width - micWidth()
-        canvas.drawLine(boundary, inset, boundary, height - inset, dividerPaint)
-
         textPaint.color = keyboardTheme.suggestionText
-        MicGlyph.draw(canvas, textPaint, centerX, centerY, height * 0.34f)
+        MicGlyph.draw(canvas, textPaint, centerX, centerY, height * 0.25f)
     }
 
     /** Width reserved for the microphone button at the right edge. */
     private fun micWidth(): Float = height.toFloat()
 
-    private fun suggestionWidth(): Float = width - if (voiceEnabled) micWidth() else 0f
+    private fun settingsWidth(): Float = height.toFloat()
+
+    private fun suggestionLeft(): Float = SuggestionStripLayout.suggestionLeft(height.toFloat())
+
+    private fun suggestionWidth(): Float =
+        SuggestionStripLayout.suggestionWidth(width.toFloat(), height.toFloat(), voiceEnabled)
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                micPressed = isOverMic(event.x)
-                pressedIndex = if (micPressed) -1 else indexAt(event.x)
+                settingsPressed = isOverSettings(event.x)
+                micPressed = !settingsPressed && isOverMic(event.x)
+                pressedIndex = if (settingsPressed || micPressed) -1 else indexAt(event.x)
                 longPressFired = false
                 if (pressedIndex >= 0) scheduleLongPress(pressedIndex)
                 invalidate()
-                return micPressed || pressedIndex >= 0
+                return settingsPressed || micPressed || pressedIndex >= 0
             }
 
             MotionEvent.ACTION_MOVE -> {
                 // Sliding off cancels the press, matching how the keys behave.
                 val inBounds = event.y in 0f..height.toFloat()
+                val stillOnSettings = settingsPressed && isOverSettings(event.x) && inBounds
                 val stillOnMic = micPressed && isOverMic(event.x) && inBounds
                 val stillOnWord = pressedIndex >= 0 && indexAt(event.x) == pressedIndex && inBounds
-                if (micPressed != stillOnMic || (pressedIndex >= 0 && !stillOnWord)) {
+                if (
+                    settingsPressed != stillOnSettings ||
+                    micPressed != stillOnMic ||
+                    (pressedIndex >= 0 && !stillOnWord)
+                ) {
+                    settingsPressed = stillOnSettings
                     micPressed = stillOnMic
                     if (!stillOnWord) {
                         pressedIndex = -1
@@ -306,14 +389,19 @@ class SuggestionStripView(context: Context) : View(context) {
 
             MotionEvent.ACTION_UP -> {
                 val index = pressedIndex
+                val settings = settingsPressed
                 val mic = micPressed
                 val held = longPressFired
                 pressedIndex = -1
+                settingsPressed = false
                 micPressed = false
                 cancelPendingLongPress()
                 invalidate()
 
-                if (mic) {
+                if (settings) {
+                    announceForAccessibility("Keyboard settings")
+                    listener?.onSettingsRequested()
+                } else if (mic) {
                     announceForAccessibility("Voice typing")
                     listener?.onVoiceRequested()
                 } else if (index in words.indices && !held) {
@@ -325,6 +413,7 @@ class SuggestionStripView(context: Context) : View(context) {
 
             MotionEvent.ACTION_CANCEL -> {
                 pressedIndex = -1
+                settingsPressed = false
                 micPressed = false
                 cancelPendingLongPress()
                 invalidate()
@@ -358,10 +447,18 @@ class SuggestionStripView(context: Context) : View(context) {
 
     private fun isOverMic(x: Float): Boolean = voiceEnabled && x >= width - micWidth()
 
+    private fun isOverSettings(x: Float): Boolean = x >= 0f && x < settingsWidth()
+
     private fun indexAt(x: Float): Int {
-        if (words.isEmpty() || isOverMic(x)) return -1
-        val index = (x / (suggestionWidth() / MAX_VISIBLE)).toInt()
-        return if (index in words.indices) index else -1
+        if (words.isEmpty()) return -1
+        val slot = SuggestionStripLayout.slotAt(
+            x = x,
+            width = width.toFloat(),
+            height = height.toFloat(),
+            voiceEnabled = voiceEnabled,
+            slotCount = MAX_VISIBLE,
+        ) ?: return -1
+        return SuggestionPlacement.candidateAtSlot(words.size, slot) ?: -1
     }
 
     /** Trims a word that will not fit its cell, so it degrades to "extraordi…" rather than clipping. */
@@ -396,19 +493,67 @@ class SuggestionStripView(context: Context) : View(context) {
         accessibilityHelper.invalidateRoot()
     }
 
-    private fun accessibilityDescription(): String = buildString {
-        if (words.isEmpty()) append(emptyMessage)
-        else append("Suggestions: ").append(words.joinToString(", "))
-        if (voiceEnabled) append(". Voice typing button at the right")
-    }
+    private fun accessibilityDescription(): String = buildList {
+        if (words.isNotEmpty()) add("Suggestions: ${words.joinToString(", ")}")
+        else if (emptyMessage.isNotEmpty()) add(emptyMessage)
+        add("Keyboard settings button at the left")
+        if (voiceEnabled) add("Voice typing button at the right")
+    }.joinToString(". ")
 
     private companion object {
         const val MAX_VISIBLE = 3
         const val HEIGHT_DP = 48f
         const val A11Y_WORD_BASE = 0
         const val A11Y_MIC = 100
-
-        /** Leaves the glyph comfortably inside its square without looking lost in it. */
-        const val MIC_GLYPH_FRACTION = 0.30f
+        const val A11Y_SETTINGS = 101
     }
+}
+
+/** Pure toolbar geometry, separated from Android drawing so edge hit targets stay regression-tested. */
+internal object SuggestionStripLayout {
+    fun suggestionLeft(height: Float): Float = height.coerceAtLeast(0f)
+
+    fun suggestionWidth(width: Float, height: Float, voiceEnabled: Boolean): Float =
+        (width - height.coerceAtLeast(0f) * if (voiceEnabled) 2f else 1f).coerceAtLeast(0f)
+
+    fun slotAt(
+        x: Float,
+        width: Float,
+        height: Float,
+        voiceEnabled: Boolean,
+        slotCount: Int,
+    ): Int? {
+        if (slotCount <= 0) return null
+        val left = suggestionLeft(height)
+        val contentWidth = suggestionWidth(width, height, voiceEnabled)
+        if (contentWidth <= 0f || x < left || x >= left + contentWidth) return null
+        return ((x - left) / (contentWidth / slotCount)).toInt().coerceIn(0, slotCount - 1)
+    }
+}
+
+/** Pure candidate-to-cell mapping, kept separate so the centre-first interaction is testable. */
+internal object SuggestionPlacement {
+    private val THREE = intArrayOf(1, 0, 2)
+    private val TWO = intArrayOf(1, 0, NONE)
+    private val ONE = intArrayOf(NONE, 0, NONE)
+
+    fun candidateAtSlot(candidateCount: Int, slot: Int): Int? {
+        if (slot !in 0..2) return null
+        val candidate = when (candidateCount.coerceIn(0, 3)) {
+            1 -> ONE[slot]
+            2 -> TWO[slot]
+            3 -> THREE[slot]
+            else -> NONE
+        }
+        return candidate.takeIf { it != NONE }
+    }
+
+    fun slotForCandidate(candidateCount: Int, candidateIndex: Int): Int {
+        for (slot in 0..2) {
+            if (candidateAtSlot(candidateCount, slot) == candidateIndex) return slot
+        }
+        return 1
+    }
+
+    private const val NONE = -1
 }

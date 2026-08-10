@@ -4,12 +4,10 @@ import com.slide.engine.lexicon.Bigrams
 import com.slide.engine.lexicon.Lexicon
 import com.slide.engine.lexicon.Trigrams
 import com.slide.engine.lexicon.UserBigrams
-import kotlin.math.exp
 import kotlin.math.ln
-import kotlin.math.ln1p
 import kotlin.math.pow
 
-/** Slide-owned prefix beam search. No inference or decoder source from FUTO is included. */
+/** Slide-owned, model-compatible trie/Viterbi beam search. */
 internal class CtcSwipeBeamSearch(
     private val lexicon: Lexicon,
     private val bigrams: Bigrams?,
@@ -19,13 +17,13 @@ internal class CtcSwipeBeamSearch(
     private val beamWidth: Int = 100,
     private val maxResults: Int = 5,
 ) {
-    private val accumulator = BeamAccumulator(beamWidth * CLASSES + 1)
+    private val accumulator = BeamAccumulator(beamWidth * (CLASSES + 1))
     private val beamNodes = IntArray(beamWidth)
-    private val beamBlank = FloatArray(beamWidth)
-    private val beamNonBlank = FloatArray(beamWidth)
+    private val beamScores = FloatArray(beamWidth)
+    private val beamBlankEnded = BooleanArray(beamWidth)
     private val nextNodes = IntArray(beamWidth)
-    private val nextBlank = FloatArray(beamWidth)
-    private val nextNonBlank = FloatArray(beamWidth)
+    private val nextScores = FloatArray(beamWidth)
+    private val nextBlankEnded = BooleanArray(beamWidth)
     private val topIndices = IntArray(beamWidth)
     private val topScores = FloatArray(beamWidth)
 
@@ -40,8 +38,8 @@ internal class CtcSwipeBeamSearch(
         }
         var beamSize = 1
         beamNodes[0] = ROOT
-        beamBlank[0] = 0f
-        beamNonBlank[0] = NEGATIVE_INFINITY
+        beamScores[0] = 0f
+        beamBlankEnded[0] = false
 
         val steps = logProbabilities.size / CLASSES
         for (time in 0 until steps) {
@@ -49,34 +47,41 @@ internal class CtcSwipeBeamSearch(
             val offset = time * CLASSES
             for (slot in 0 until beamSize) {
                 val node = beamNodes[slot]
-                val blank = beamBlank[slot]
-                val nonBlank = beamNonBlank[slot]
-                val total = logAdd(blank, nonBlank)
+                val score = beamScores[slot]
 
-                accumulator.addBlank(node, total + logProbabilities[offset + BLANK])
-                val last = trie.lastLetter(node)
-                for (letter in 0 until LETTERS) {
-                    val probability = logProbabilities[offset + letter]
-                    if (letter == last) {
-                        if (nonBlank != NEGATIVE_INFINITY) {
-                            accumulator.addNonBlank(node, nonBlank + probability)
-                        }
-                        val child = trie.child(node, letter)
-                        if (child >= 0 && blank != NEGATIVE_INFINITY) {
-                            accumulator.addNonBlank(child, blank + probability)
-                        }
-                    } else {
-                        val child = trie.child(node, letter)
-                        if (child >= 0) accumulator.addNonBlank(child, total + probability)
-                    }
+                // The model was trained with a Viterbi-style search state: one best path for
+                // (trie node, blank-ended), not the probability sum used by conventional CTC.
+                accumulator.add(node, blankEnded = true, score + logProbabilities[offset + BLANK])
+
+                var child = trie.firstChild(node)
+                while (child >= 0) {
+                    val letter = trie.lastLetter(child)
+                    accumulator.add(
+                        child,
+                        blankEnded = false,
+                        score + logProbabilities[offset + letter],
+                    )
+                    child = trie.nextSibling(child)
+                }
+
+                // A sustained letter may remain on the current node. Advancing to a same-letter
+                // child does not require an intervening blank; that is how a physical swipe can
+                // produce double letters without drawing an artificial loop.
+                if (!beamBlankEnded[slot] && node != ROOT) {
+                    val repeated = trie.lastLetter(node)
+                    accumulator.add(
+                        node,
+                        blankEnded = false,
+                        score + logProbabilities[offset + repeated],
+                    )
                 }
             }
 
             beamSize = selectTop(accumulator)
             for (i in 0 until beamSize) {
                 beamNodes[i] = nextNodes[i]
-                beamBlank[i] = nextBlank[i]
-                beamNonBlank[i] = nextNonBlank[i]
+                beamScores[i] = nextScores[i]
+                beamBlankEnded[i] = nextBlankEnded[i]
             }
         }
 
@@ -95,7 +100,7 @@ internal class CtcSwipeBeamSearch(
         val board = ResultBoard(maxResults)
         for (slot in 0 until beamSize) {
             val node = beamNodes[slot]
-            val acoustic = logAdd(beamBlank[slot], beamNonBlank[slot])
+            val acoustic = beamScores[slot]
             val length = trie.depth(node).coerceAtLeast(1)
             trie.forEachTerminal(node) { wordIndex ->
                 if (!blockOffensive || !lexicon.isOffensive(wordIndex)) {
@@ -133,9 +138,9 @@ internal class CtcSwipeBeamSearch(
         var size = 0
         for (candidate in 0 until source.size) {
             val node = source.nodes[candidate]
-            val total = logAdd(source.blank[candidate], source.nonBlank[candidate])
             val length = trie.depth(node).coerceAtLeast(1)
-            val pruneScore = total / length.toFloat().pow(PRUNE_LENGTH_NORMALIZATION) +
+            val pruneScore = source.scores[candidate] /
+                length.toFloat().pow(PRUNE_LENGTH_NORMALIZATION) +
                 PRUNE_LENGTH_BONUS * trie.depth(node)
             if (size == beamWidth && pruneScore <= topScores[size - 1]) continue
 
@@ -152,16 +157,16 @@ internal class CtcSwipeBeamSearch(
         for (slot in 0 until size) {
             val sourceIndex = topIndices[slot]
             nextNodes[slot] = source.nodes[sourceIndex]
-            nextBlank[slot] = source.blank[sourceIndex]
-            nextNonBlank[slot] = source.nonBlank[sourceIndex]
+            nextScores[slot] = source.scores[sourceIndex]
+            nextBlankEnded[slot] = source.blankEnded[sourceIndex]
         }
         return size
     }
 
     private class BeamAccumulator(maxEntries: Int) {
         val nodes = IntArray(maxEntries)
-        val blank = FloatArray(maxEntries)
-        val nonBlank = FloatArray(maxEntries)
+        val scores = FloatArray(maxEntries)
+        val blankEnded = BooleanArray(maxEntries)
         private val table = IntArray(tableSize(maxEntries)) { EMPTY }
         var size = 0
             private set
@@ -171,30 +176,24 @@ internal class CtcSwipeBeamSearch(
             size = 0
         }
 
-        fun addBlank(node: Int, score: Float) {
-            val index = index(node)
-            blank[index] = logAdd(blank[index], score)
-        }
-
-        fun addNonBlank(node: Int, score: Float) {
-            val index = index(node)
-            nonBlank[index] = logAdd(nonBlank[index], score)
-        }
-
-        private fun index(node: Int): Int {
-            var bucket = node * -0x61c88647 and (table.size - 1)
+        fun add(node: Int, blankEnded: Boolean, score: Float) {
+            val state = node * 2 + if (blankEnded) 1 else 0
+            var bucket = state * -0x61c88647 and (table.size - 1)
             while (true) {
                 val existing = table[bucket]
                 if (existing == EMPTY) {
                     check(size < nodes.size) { "CTC beam accumulator capacity exceeded" }
                     val added = size++
                     nodes[added] = node
-                    blank[added] = NEGATIVE_INFINITY
-                    nonBlank[added] = NEGATIVE_INFINITY
+                    this.blankEnded[added] = blankEnded
+                    scores[added] = score
                     table[bucket] = added
-                    return added
+                    return
                 }
-                if (nodes[existing] == node) return existing
+                if (nodes[existing] == node && this.blankEnded[existing] == blankEnded) {
+                    if (score > scores[existing]) scores[existing] = score
+                    return
+                }
                 bucket = (bucket + 1) and (table.size - 1)
             }
         }
@@ -216,6 +215,23 @@ internal class CtcSwipeBeamSearch(
         private var size = 0
 
         fun offer(index: Int, score: Float) {
+            // Blank-ended and character-ended states can finish on the same trie node. Keep only
+            // the better score for a word so duplicate states cannot consume the five result slots.
+            var existing = -1
+            for (slot in 0 until size) {
+                if (indices[slot] == index) {
+                    existing = slot
+                    break
+                }
+            }
+            if (existing >= 0) {
+                if (score <= scores[existing]) return
+                for (slot in existing until size - 1) {
+                    indices[slot] = indices[slot + 1]
+                    scores[slot] = scores[slot + 1]
+                }
+                size--
+            }
             if (size == capacity && score <= scores[size - 1]) return
             var at = minOf(size, capacity - 1)
             while (at > 0 && score > scores[at - 1]) {
@@ -237,7 +253,6 @@ internal class CtcSwipeBeamSearch(
         const val LETTERS = 26
         const val BLANK = 26
         const val CLASSES = 27
-        const val NEGATIVE_INFINITY = Float.NEGATIVE_INFINITY
 
         // Tuned by the FUTO model authors for this exact encoder/decoder pair. Slide's search and
         // language integration are independent implementations; these numeric model parameters
@@ -250,13 +265,5 @@ internal class CtcSwipeBeamSearch(
         const val CONTEXT_WEIGHT = 1.5f
         const val PERSONAL_CONTEXT_WEIGHT = 0.8f
         const val TRIGRAM_CONTEXT_WEIGHT = 0.75f
-
-        fun logAdd(a: Float, b: Float): Float {
-            if (a == NEGATIVE_INFINITY) return b
-            if (b == NEGATIVE_INFINITY) return a
-            val high = maxOf(a, b)
-            val low = minOf(a, b)
-            return high + ln1p(exp((low - high).toDouble())).toFloat()
-        }
     }
 }

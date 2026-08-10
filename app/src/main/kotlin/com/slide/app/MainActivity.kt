@@ -31,6 +31,7 @@ import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
@@ -42,6 +43,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -66,6 +68,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
 
@@ -99,6 +102,13 @@ private fun SetupScreen(repository: SettingsRepository) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val settings by repository.settings.collectAsState(initial = KeyboardSettings())
+
+    // Sliders update visually under the finger and persist once the gesture settles. Writing
+    // DataStore on every pixel of movement makes an otherwise simple settings screen feel laggy.
+    var keyHeight by remember(settings.keyHeightScale) { mutableFloatStateOf(settings.keyHeightScale) }
+    var bottomPadding by remember(settings.bottomPaddingDp) { mutableFloatStateOf(settings.bottomPaddingDp) }
+    var hapticStrength by remember(settings.hapticStrength) { mutableFloatStateOf(settings.hapticStrength) }
+    var soundVolume by remember(settings.soundVolume) { mutableFloatStateOf(settings.soundVolume) }
 
     var enabled by remember { mutableStateOf(isKeyboardEnabled(context)) }
     var selected by remember { mutableStateOf(isKeyboardSelected(context)) }
@@ -240,9 +250,45 @@ private fun SetupScreen(repository: SettingsRepository) {
                     SettingSwitch("Block offensive words", settings.blockOffensiveWords) { value ->
                         scope.launch { repository.update { it.copy(blockOffensiveWords = value) } }
                     }
+                    SettingSwitch("Auto-capitalization", settings.autoCapitalize) { value ->
+                        scope.launch { repository.update { it.copy(autoCapitalize = value) } }
+                    }
+                    SettingSwitch(
+                        label = "Double-space period",
+                        checked = settings.doubleSpacePeriod,
+                        description = "Press Space twice to finish a sentence with a period.",
+                    ) { value ->
+                        scope.launch { repository.update { it.copy(doubleSpacePeriod = value) } }
+                    }
                     SettingSwitch("Number row", settings.showNumberRow) { value ->
                         scope.launch { repository.update { it.copy(showNumberRow = value) } }
                     }
+                    SettingSlider(
+                        label = "Keyboard height",
+                        value = keyHeight,
+                        valueLabel = "${(keyHeight * 100).roundToInt()}%",
+                        valueRange = 0.7f..1.4f,
+                        steps = 6,
+                        onValueChange = { keyHeight = it },
+                        onValueChangeFinished = {
+                            scope.launch {
+                                repository.update { it.copy(keyHeightScale = keyHeight) }
+                            }
+                        },
+                    )
+                    SettingSlider(
+                        label = "Space below keys",
+                        value = bottomPadding,
+                        valueLabel = "${bottomPadding.roundToInt()} dp",
+                        valueRange = 0f..32f,
+                        steps = 7,
+                        onValueChange = { bottomPadding = it },
+                        onValueChangeFinished = {
+                            scope.launch {
+                                repository.update { it.copy(bottomPaddingDp = bottomPadding) }
+                            }
+                        },
+                    )
                     SettingSwitch("Key borders", settings.showKeyBorders) { value ->
                         scope.launch { repository.update { it.copy(showKeyBorders = value) } }
                     }
@@ -252,9 +298,37 @@ private fun SetupScreen(repository: SettingsRepository) {
                     SettingSwitch("Haptic feedback", settings.hapticEnabled) { value ->
                         scope.launch { repository.update { it.copy(hapticEnabled = value) } }
                     }
+                    SettingSlider(
+                        label = "Haptic strength",
+                        value = hapticStrength,
+                        valueLabel = "${(hapticStrength * 100).roundToInt()}%",
+                        valueRange = 0.1f..1f,
+                        steps = 8,
+                        enabled = settings.hapticEnabled,
+                        onValueChange = { hapticStrength = it },
+                        onValueChangeFinished = {
+                            scope.launch {
+                                repository.update { it.copy(hapticStrength = hapticStrength) }
+                            }
+                        },
+                    )
                     SettingSwitch("Sound on keypress", settings.soundEnabled) { value ->
                         scope.launch { repository.update { it.copy(soundEnabled = value) } }
                     }
+                    SettingSlider(
+                        label = "Keypress volume",
+                        value = soundVolume,
+                        valueLabel = "${(soundVolume * 100).roundToInt()}%",
+                        valueRange = 0.1f..1f,
+                        steps = 8,
+                        enabled = settings.soundEnabled,
+                        onValueChange = { soundVolume = it },
+                        onValueChangeFinished = {
+                            scope.launch {
+                                repository.update { it.copy(soundVolume = soundVolume) }
+                            }
+                        },
+                    )
                 }
             }
 
@@ -559,6 +633,55 @@ private fun SettingSwitch(
             }
         }
         Switch(checked = checked, onCheckedChange = onChange, enabled = enabled)
+    }
+}
+
+@Composable
+private fun SettingSlider(
+    label: String,
+    value: Float,
+    valueLabel: String,
+    valueRange: ClosedFloatingPointRange<Float>,
+    steps: Int,
+    enabled: Boolean = true,
+    onValueChange: (Float) -> Unit,
+    onValueChangeFinished: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 2.dp, vertical = 6.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                label,
+                style = MaterialTheme.typography.bodyLarge,
+                color = if (enabled) {
+                    MaterialTheme.colorScheme.onSurface
+                } else {
+                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                },
+            )
+            Text(
+                valueLabel,
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(
+                    alpha = if (enabled) 1f else 0.38f,
+                ),
+            )
+        }
+        Slider(
+            value = value.coerceIn(valueRange),
+            onValueChange = onValueChange,
+            onValueChangeFinished = onValueChangeFinished,
+            valueRange = valueRange,
+            steps = steps,
+            enabled = enabled,
+        )
     }
 }
 
