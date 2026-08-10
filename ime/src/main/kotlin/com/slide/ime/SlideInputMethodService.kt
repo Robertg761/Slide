@@ -13,6 +13,7 @@ import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.ExtractedTextRequest
 import android.view.inputmethod.InputConnection
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
@@ -54,9 +55,20 @@ import com.slide.ime.text.AndroidGraphemeBoundaries
 import com.slide.ime.text.AutoSpacing
 import com.slide.ime.text.EditorInputPolicy
 import com.slide.ime.text.EditorKeyboardMode
+import com.slide.ime.text.EditorSelection
+import com.slide.ime.text.ExpectedSelectionTracker
+import com.slide.ime.text.GestureDeleteTransaction
+import com.slide.ime.text.GestureEditorSnapshot
+import com.slide.ime.text.GestureEditTransaction
+import com.slide.ime.text.GestureUndoState
+import com.slide.ime.text.OrderedInputQueue
+import com.slide.ime.text.OrderedInputRequest
 import com.slide.ime.text.PrecedingWord
 import com.slide.ime.text.SelectionUpdate
+import com.slide.ime.text.cursorAfterReplacement
+import com.slide.ime.text.isCaseableCharacter
 import com.slide.ime.text.matchTypedCase
+import com.slide.ime.text.resolveCharacterCase
 import com.slide.ime.view.EmojiGlyphs
 import com.slide.ime.view.EmojiPanelView
 import com.slide.ime.view.EnterAction
@@ -67,6 +79,7 @@ import com.slide.ime.view.ShiftState
 import com.slide.ime.view.SuggestionStripView
 import com.slide.ime.view.VoiceOverlayView
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -256,6 +269,9 @@ class SlideInputMethodService :
      */
     private var selfEdit = false
 
+    /** Exact cursor positions expected from ordered edits whose callbacks may arrive much later. */
+    private val expectedSelections = ExpectedSelectionTracker()
+
     /** The last word autocorrect changed, so the next backspace can put it back. */
     private var lastAutocorrect: Autocorrect? = null
 
@@ -277,10 +293,19 @@ class SlideInputMethodService :
     /** Context and candidate whose observation must be repaired if an alternative is selected. */
     private var lastGestureLearnedPair: Pair<String, String>? = null
 
+    /** One-shot whole-word Backspace, intentionally independent of suggestion-strip visibility. */
+    private val gestureUndoState = GestureUndoState()
+
     /** Coalesces partial traces so model inference never queues behind the user's finger. */
     private var pendingGesturePreview: List<GesturePoint>? = null
     private var gesturePreviewJob: Job? = null
     private var gesturePreviewGeneration = 0L
+
+    /** Completed swipes and following edits are chained so off-thread inference cannot reorder input. */
+    private val gestureInputQueue = OrderedInputQueue(scope) { editorGeneration }
+
+    /** Canceled native inference is not interruptible; one gate prevents canceled work piling up. */
+    private val gestureDecodeMutex = Mutex()
 
     private val vibrator: Vibrator? by lazy {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -338,6 +363,12 @@ class SlideInputMethodService :
                     previous.suggestionsEnabled != updated.suggestionsEnabled ||
                         previous.autocorrectEnabled != updated.autocorrectEnabled ||
                         previous.blockOffensiveWords != updated.blockOffensiveWords
+                if (
+                    previous.gestureTypingEnabled != updated.gestureTypingEnabled ||
+                    previous.blockOffensiveWords != updated.blockOffensiveWords
+                ) {
+                    cancelGestureInputSequence()
+                }
                 if (!fieldSuggestionsEnabled()) {
                     if (composing.isNotEmpty()) {
                         // The already-entered prefix is now committed literally. Keep the rest of
@@ -545,12 +576,18 @@ class SlideInputMethodService :
         // This callback precedes the visual input-view transition, so it closes the small window in
         // which an old speech result could otherwise see the framework's new InputConnection.
         editorGeneration++
+        cancelGestureInputSequence()
+        expectedSelections.invalidate()
+        gestureUndoState.invalidate()
         cancelVoiceForEditorTransition()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
     }
 
     override fun onFinishInput() {
         editorGeneration++
+        cancelGestureInputSequence()
+        expectedSelections.invalidate()
+        gestureUndoState.invalidate()
         cancelVoiceForEditorTransition()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
         super.onFinishInput()
@@ -559,6 +596,9 @@ class SlideInputMethodService :
     override fun onStartInputView(info: EditorInfo, restarting: Boolean) {
         super.onStartInputView(info, restarting)
         editorGeneration++
+        cancelGestureInputSequence()
+        expectedSelections.invalidate()
+        gestureUndoState.invalidate()
         cancelVoiceForEditorTransition()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
         exitEmojiSearch(showPicker = false)
@@ -630,6 +670,9 @@ class SlideInputMethodService :
     override fun onWindowHidden() {
         super.onWindowHidden()
         editorGeneration++
+        cancelGestureInputSequence()
+        expectedSelections.invalidate()
+        gestureUndoState.invalidate()
         cancelVoiceForEditorTransition()
         exitEmojiSearch(showPicker = false)
         hideEmojiPanel()
@@ -649,6 +692,9 @@ class SlideInputMethodService :
     override fun onFinishInputView(finishingInput: Boolean) {
         super.onFinishInputView(finishingInput)
         editorGeneration++
+        cancelGestureInputSequence()
+        expectedSelections.invalidate()
+        gestureUndoState.invalidate()
         cancelVoiceForEditorTransition()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
         literalWordInProgress = false
@@ -743,6 +789,8 @@ class SlideInputMethodService :
     override fun onEvaluateFullscreenMode(): Boolean = false
 
     override fun onDestroy() {
+        cancelGestureInputSequence()
+        expectedSelections.invalidate()
         cancelVoiceForEditorTransition()
         if (voiceClientDelegate.isInitialized()) voiceClient.unbind()
         val finalLearnedData = captureFinalLearnedData()
@@ -768,6 +816,12 @@ class SlideInputMethodService :
     }
 
     override fun onKeyCommit(key: Key, text: String, touchX: Float, touchY: Float) {
+        if (queueBehindGestureInput { processKeyCommit(key, text, touchX, touchY) }) return
+        processKeyCommit(key, text, touchX, touchY)
+    }
+
+    private fun processKeyCommit(key: Key, text: String, touchX: Float, touchY: Float) {
+        if (key.type != KeyType.DELETE) gestureUndoState.invalidate()
         if (key.type != KeyType.SHIFT) lastShiftTapMs = 0L
         if (keyboardView?.searchMode == true) {
             handleSearchKey(key, text)
@@ -793,6 +847,14 @@ class SlideInputMethodService :
         // backspace. Anything else the user does means they have accepted it.
         if (key.type != KeyType.DELETE) lastAutocorrect = null
 
+        // A key may have been rendered while a preceding swipe was still decoding. Resolve its
+        // case now, after any queued Shift event ahead of it has actually changed the state.
+        val appliedText = if (key.type == KeyType.CHARACTER && isCaseableCharacter(text)) {
+            resolveCharacterCase(text, shifted = shiftState() != ShiftState.OFF)
+        } else {
+            text
+        }
+
         when (key.type) {
             KeyType.SHIFT -> handleShiftTap()
             KeyType.DELETE -> handleDelete(connection)
@@ -801,44 +863,117 @@ class SlideInputMethodService :
             KeyType.SYMBOLS_ALT -> switchLayer(Layer.SYMBOLS_ALT)
             KeyType.ALPHA -> switchLayer(Layer.ALPHA)
             KeyType.SPACE -> handleSpace(connection, text)
-            KeyType.MIC -> onVoiceRequested()
+            KeyType.MIC -> processVoiceRequested()
             KeyType.EMOJI -> showEmojiPanel()
             KeyType.GLOBE, KeyType.SETTINGS -> Unit
-            KeyType.CHARACTER -> handleCharacter(connection, text, touchX, touchY)
+            KeyType.CHARACTER -> handleCharacter(connection, appliedText, touchX, touchY)
         }
     }
 
-    override fun onGestureComplete(points: List<GesturePoint>): Boolean {
+    override fun onGestureComplete(points: List<GesturePoint>) {
         if (!settings.gestureTypingEnabled || !editorInputPolicy.allowsSuggestions) {
             clearSuggestions()
-            return false
+            return
         }
         if (
             searchModeShown || emojiPanelShown || voiceOverlayShown ||
             keyboardSettingsPanelShown || layer != Layer.ALPHA
-        ) return false
+        ) return
 
-        val decoder = gestureDecoder ?: return false
-        val connection = currentInputConnection ?: return false
-        val keys = currentGestureKeyMap() ?: return false
+        // Keep a live preview visible while final inference runs. If this trace never produced a
+        // preview, clear older candidates now so they cannot rewrite the wrong swipe.
+        if (stripMode != StripMode.GesturePreview) clearSuggestions()
+        enqueueGestureInput { request -> decodeAndCommitGesture(points, request) }
+    }
 
+    private suspend fun decodeAndCommitGesture(
+        points: List<GesturePoint>,
+        request: OrderedInputRequest,
+    ) {
+        if (!gestureInputIsCurrent(request) || !gestureModeAvailable()) {
+            if (gestureInputIsCurrent(request)) clearGesturePreview()
+            return
+        }
+
+        // This executes after all earlier queued input, so both language context and undo state
+        // describe the text that is actually in the editor, including a preceding rapid swipe.
+        gestureUndoState.invalidate()
+        if (stripMode != StripMode.GesturePreview) clearSuggestions()
+        val decoder = gestureDecoder ?: return clearGesturePreview()
+        val connection = currentInputConnection ?: return clearGesturePreview()
+        val keys = currentGestureKeyMap() ?: return clearGesturePreview()
+        val editorSnapshot = gestureEditorSnapshot(connection)
         val context = precedingContextForSwipe()
-        val candidates = decoder.decode(
-            points = points,
-            keys = keys,
-            blockOffensive = settings.blockOffensiveWords,
-            previousWord = context.previous,
-            previousPreviousWord = context.older,
-        )
-        val best = candidates.firstOrNull() ?: return false
+        val blockOffensive = settings.blockOffensiveWords
+        val candidates = try {
+            withContext(Dispatchers.Default) {
+                gestureDecodeMutex.withLock {
+                    decoder.decode(
+                        points = points,
+                        keys = keys,
+                        blockOffensive = blockOffensive,
+                        previousWord = context.previous,
+                        previousPreviousWord = context.older,
+                    )
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            Log.w(TAG, "Final swipe decode failed", failure)
+            if (gestureInputIsCurrent(request)) clearGesturePreview()
+            return
+        }
+
+        if (
+            !gestureInputIsCurrent(request) ||
+            currentInputConnection !== connection ||
+            !gestureModeAvailable()
+        ) return
+        if (!editorSnapshot.matches(gestureEditorSnapshot(connection))) {
+            clearGesturePreview()
+            return
+        }
+
+        val best = candidates.firstOrNull() ?: return clearGesturePreview()
 
         // Only settle a typed prefix once decoding has definitely produced replacement input. A
-        // rejected path falls back to its starting key in KeyboardView and must not mutate state.
-        if (composing.isNotEmpty()) selfEdit = true
-        finishComposing(connection)
+        // length-changing autocorrection moves the cursor before the swipe is inserted, so record
+        // that intermediate position as well as the final commit. Editors are allowed to coalesce
+        // both callbacks; ExpectedSelectionTracker deliberately handles that case.
+        val composingBefore = composing.toString()
+        val selectionBeforeFinish = readEditorSelection(connection) ?: collapsedCursorPosition()?.let {
+            EditorSelection(it, it)
+        }
+        val corrected = finishComposing(connection)
+        if (composingBefore.isNotEmpty()) {
+            val selectionAfterFinish = readEditorSelection(connection) ?: run {
+                val applied = lastAutocorrect?.applied.takeIf { corrected }
+                val cursor = selectionBeforeFinish?.takeIf { it.start == it.end }?.start
+                if (applied != null && cursor != null) {
+                    val adjusted = cursorAfterReplacement(
+                        cursor,
+                        originalLength = composingBefore.length,
+                        replacementLength = applied.length,
+                    )
+                    EditorSelection(adjusted, adjusted)
+                } else {
+                    selectionBeforeFinish
+                }
+            }
+            if (selectionAfterFinish != null) {
+                cachedSelectionStart = selectionAfterFinish.start
+                cachedSelectionEnd = selectionAfterFinish.end
+                if (selectionAfterFinish != selectionBeforeFinish) {
+                    expectedSelections.expect(selectionBeforeFinish, selectionAfterFinish)
+                }
+            }
+        }
 
-        selfEdit = true
-        commitGestureWord(connection, best.word)
+        if (!commitGestureWord(connection, best.word)) {
+            clearGesturePreview()
+            return
+        }
         literalWordInProgress = false
         if (settings.suggestionsEnabled) {
             stripMode = StripMode.Gesture
@@ -846,7 +981,69 @@ class SlideInputMethodService :
         } else {
             clearSuggestions()
         }
-        return true
+    }
+
+    private fun gestureModeAvailable(): Boolean =
+        settings.gestureTypingEnabled &&
+            editorInputPolicy.allowsSuggestions &&
+            !searchModeShown &&
+            !emojiPanelShown &&
+            !voiceOverlayShown &&
+            !keyboardSettingsPanelShown &&
+            layer == Layer.ALPHA
+
+    private fun clearGesturePreview() {
+        if (stripMode == StripMode.GesturePreview) clearSuggestions()
+    }
+
+    private fun enqueueGestureInput(action: suspend (OrderedInputRequest) -> Unit) =
+        gestureInputQueue.enqueue(action)
+
+    private fun queueBehindGestureInput(action: () -> Unit): Boolean =
+        gestureInputQueue.enqueueIfPending { processOrderedFollowup(action) }
+
+    /**
+     * Reads the editor back after a deferred edit before allowing the next queued action to run.
+     *
+     * The synchronous read is rare (only input released while final swipe inference is pending)
+     * and closes two races at once: later cursor gestures see the real position, and delayed
+     * updateSelection callbacks are matched to exact positions rather than one shared Boolean.
+     */
+    private fun processOrderedFollowup(action: () -> Unit) {
+        val connection = currentInputConnection
+        val before = connection?.let(::readEditorSelection) ?: cachedEditorSelection()
+        try {
+            action()
+        } finally {
+            if (connection == null || currentInputConnection !== connection) {
+                cachedSelectionStart = -1
+                cachedSelectionEnd = -1
+                selfEdit = false
+            } else {
+                val after = readEditorSelection(connection)
+                if (after != null) {
+                    cachedSelectionStart = after.start
+                    cachedSelectionEnd = after.end
+                    if (after != before) expectedSelections.expect(before, after)
+                    selfEdit = false
+                }
+                // If this editor does not support extracted text, retain the existing one-shot
+                // fallback so its eventual callback is still recognized as ours.
+            }
+        }
+    }
+
+    private fun gestureInputPending(): Boolean = gestureInputQueue.hasPending
+
+    private fun gestureInputIsCurrent(request: OrderedInputRequest): Boolean =
+        gestureInputQueue.isCurrent(request)
+
+    private fun cancelGestureInputSequence() {
+        gestureInputQueue.cancel()
+        gesturePreviewGeneration++
+        pendingGesturePreview = null
+        gesturePreviewJob?.cancel()
+        gesturePreviewJob = null
     }
 
     override fun onGesturePreview(points: List<GesturePoint>) {
@@ -857,6 +1054,11 @@ class SlideInputMethodService :
         ) return
         if (gestureDecoder == null || currentGestureKeyMap() == null) return
 
+        gestureUndoState.invalidate()
+        if (!settings.suggestionsEnabled) return
+        // A completed gesture has priority. Native inference cannot be interrupted once entered,
+        // so starting previews here would only queue work ahead of ordered final input.
+        if (gestureInputPending()) return
         pendingGesturePreview = points
         if (gesturePreviewJob?.isActive == true) return
         val generation = gesturePreviewGeneration
@@ -868,19 +1070,32 @@ class SlideInputMethodService :
                 val keys = currentGestureKeyMap() ?: break
                 val blockOffensive = settings.blockOffensiveWords
                 val context = precedingContextForSwipe()
-                val candidates = withContext(Dispatchers.Default) {
-                    decoder.decode(
-                        trace,
-                        keys,
-                        blockOffensive,
-                        context.previous,
-                        context.older,
-                    )
+                val candidates = try {
+                    withContext(Dispatchers.Default) {
+                        gestureDecodeMutex.withLock {
+                            decoder.decode(
+                                trace,
+                                keys,
+                                blockOffensive,
+                                context.previous,
+                                context.older,
+                            )
+                        }
+                    }
+                } catch (_: CancellationException) {
+                    break
+                } catch (failure: Throwable) {
+                    Log.w(TAG, "Swipe preview decode failed", failure)
+                    break
                 }
                 if (generation != gesturePreviewGeneration) break
                 // A newer trace will be decoded immediately; avoid flashing a result that is
                 // already stale while the finger is still moving.
-                if (pendingGesturePreview == null && candidates.isNotEmpty()) {
+                if (
+                    pendingGesturePreview == null &&
+                    settings.suggestionsEnabled &&
+                    candidates.isNotEmpty()
+                ) {
                     stripMode = StripMode.GesturePreview
                     lastGestureCommit = null
                     suggestionStrip?.setSuggestions(candidates.map { it.word })
@@ -889,16 +1104,22 @@ class SlideInputMethodService :
         }
     }
 
-    override fun onGesturePreviewCancelled() {
+    override fun onGesturePreviewCancelled(clearCandidates: Boolean) {
         gesturePreviewGeneration++
         pendingGesturePreview = null
         gesturePreviewJob?.cancel()
         gesturePreviewJob = null
-        if (stripMode == StripMode.GesturePreview) clearSuggestions()
+        if (clearCandidates && stripMode == StripMode.GesturePreview) clearSuggestions()
     }
 
     override fun onCursorMove(steps: Int) {
         if (steps == 0) return
+        if (queueBehindGestureInput { processCursorMove(steps) }) return
+        processCursorMove(steps)
+    }
+
+    private fun processCursorMove(steps: Int) {
+        gestureUndoState.invalidate()
         val connection = currentInputConnection ?: return
         selfEdit = true
         val start = cachedSelectionStart
@@ -954,6 +1175,12 @@ class SlideInputMethodService :
     }
 
     override fun onDeleteWordGesture() {
+        if (queueBehindGestureInput(::processDeleteWordGesture)) return
+        processDeleteWordGesture()
+    }
+
+    private fun processDeleteWordGesture() {
+        gestureUndoState.invalidate()
         val connection = currentInputConnection ?: return
         selfEdit = true
         finishComposing(connection)
@@ -981,24 +1208,61 @@ class SlideInputMethodService :
      * so words do not run together, but not at the very start of a field or straight after
      * existing whitespace or an opening bracket.
      */
-    private fun commitGestureWord(connection: InputConnection, word: String) {
+    private fun commitGestureWord(connection: InputConnection, word: String): Boolean {
+        val selectionBeforeCommit = readEditorSelection(connection) ?: cachedEditorSelection()
         val before = connection.getTextBeforeCursor(1, 0)
         val needsSpace = !before.isNullOrEmpty() && before[0].let { it.isLetterOrDigit() || it in ".,!?;:'\")" }
 
         val previousWord = precedingWordForSwipe()
-        learnPair(previousWord, word)
-        lastGestureLearnedPair = previousWord?.let { it to word }
+        val learnablePair = if (!incognito && !previousWord.isNullOrEmpty() && word.isNotEmpty()) {
+            previousWord to word
+        } else {
+            null
+        }
 
         val shifted = shiftState()
         val text = (if (needsSpace) " " else "") + applyShift(word, shifted)
 
-        connection.commitText(text, 1)
-        lastGestureCommit = text
+        val committed = connection.commitText(text, 1)
+        lastGestureCommit = text.takeIf { committed }
         lastGestureShift = shifted
+        if (committed) {
+            val liveSelection = readEditorSelection(connection)
+            if (liveSelection != null) {
+                cachedSelectionStart = liveSelection.start
+                cachedSelectionEnd = liveSelection.end
+                if (liveSelection != selectionBeforeCommit) {
+                    expectedSelections.expect(selectionBeforeCommit, liveSelection)
+                }
+            } else {
+                val insertionStart = minOf(cachedSelectionStart, cachedSelectionEnd)
+                    .takeIf { cachedSelectionStart >= 0 && cachedSelectionEnd >= 0 }
+                if (insertionStart != null) {
+                    cachedSelectionStart = insertionStart + text.length
+                    cachedSelectionEnd = cachedSelectionStart
+                    expectedSelections.expect(
+                        selectionBeforeCommit,
+                        EditorSelection(cachedSelectionStart, cachedSelectionEnd),
+                    )
+                }
+            }
+            learnPair(previousWord, word)
+            lastGestureLearnedPair = learnablePair
+            gestureUndoState.arm(
+                text,
+                editorGeneration,
+                collapsedCursorPosition(),
+                learnablePair,
+            )
+        } else {
+            lastGestureLearnedPair = null
+            gestureUndoState.invalidate()
+        }
         lastAutocorrect = null
 
         if (shifted == ShiftState.SHIFTED) setShift(ShiftState.OFF)
         updateShiftFromCursor()
+        return committed
     }
 
     /**
@@ -1011,6 +1275,7 @@ class SlideInputMethodService :
      */
     override fun onSuggestionPicked(index: Int, word: String) {
         performHaptic()
+        if (stripMode != StripMode.Gesture) gestureUndoState.invalidate()
         when (stripMode) {
             StripMode.Gesture -> pickGestureAlternative(index, word)
             StripMode.Typing -> pickTypedSuggestion(word)
@@ -1020,6 +1285,12 @@ class SlideInputMethodService :
     }
 
     override fun onSettingsRequested() {
+        if (queueBehindGestureInput(::processSettingsRequested)) return
+        processSettingsRequested()
+    }
+
+    private fun processSettingsRequested() {
+        gestureUndoState.invalidate()
         performHaptic()
         if (keyboardSettingsPanelShown) {
             hideKeyboardSettingsPanel(restoreEditorUi = true)
@@ -1131,8 +1402,22 @@ class SlideInputMethodService :
 
         val connection = currentInputConnection ?: return
         val previous = lastGestureCommit ?: return
+        val originalUndo = gestureUndoState.snapshot() ?: return
+        val liveSelection = connection.getSelectedText(0)
+        val hasCachedSelection = cachedSelectionStart >= 0 &&
+            cachedSelectionEnd >= 0 &&
+            cachedSelectionStart != cachedSelectionEnd
 
-        if (connection.getTextBeforeCursor(previous.length, 0)?.toString() != previous) {
+        if (
+            !liveSelection.isNullOrEmpty() ||
+            hasCachedSelection ||
+            !gestureUndoState.matchesEditorAndCursor(
+                editorGeneration,
+                collapsedCursorPosition(),
+            ) ||
+            connection.getTextBeforeCursor(previous.length, 0)?.toString() != previous
+        ) {
+            gestureUndoState.invalidate()
             clearSuggestions()
             return
         }
@@ -1140,11 +1425,68 @@ class SlideInputMethodService :
         val prefix = if (previous.startsWith(" ")) " " else ""
         val replacement = prefix + applyShift(word, lastGestureShift)
 
-        selfEdit = true
+        val selectionBefore = readEditorSelection(connection) ?: cachedEditorSelection()
         connection.beginBatchEdit()
-        connection.deleteSurroundingText(previous.length, 0)
-        connection.commitText(replacement, 1)
-        connection.endBatchEdit()
+        val transaction = try {
+            GestureEditTransaction.replace(
+                original = previous,
+                replacement = replacement,
+                deleteBeforeCursor = { connection.deleteSurroundingText(it, 0) },
+                commit = { connection.commitText(it, 1) },
+            )
+        } finally {
+            connection.endBatchEdit()
+        }
+        if (!transaction.replaced) {
+            val selectionAfter = readEditorSelection(connection)
+            if (selectionAfter != null) {
+                cachedSelectionStart = selectionAfter.start
+                cachedSelectionEnd = selectionAfter.end
+                if (selectionAfter != selectionBefore) {
+                    expectedSelections.expect(selectionBefore, selectionAfter)
+                }
+            } else if (transaction.deleted) {
+                if (transaction.restoredOriginal) {
+                    cachedSelectionStart = originalUndo.cursorPosition ?: -1
+                    cachedSelectionEnd = originalUndo.cursorPosition ?: -1
+                } else {
+                    cachedSelectionStart = -1
+                    cachedSelectionEnd = -1
+                }
+            }
+            when {
+                !transaction.deleted -> Unit // The original text and undo record are unchanged.
+                transaction.restoredOriginal -> gestureUndoState.arm(
+                    originalUndo.committedText,
+                    originalUndo.editorGeneration,
+                    originalUndo.cursorPosition,
+                    originalUndo.learnedPair,
+                )
+                else -> {
+                    rollbackGestureLearning(originalUndo.learnedPair)
+                    gestureUndoState.invalidate()
+                }
+            }
+            selfEdit = false
+            clearSuggestions()
+            updateShiftFromCursor()
+            return
+        }
+        val selectionAfter = readEditorSelection(connection)
+        if (selectionAfter != null) {
+            cachedSelectionStart = selectionAfter.start
+            cachedSelectionEnd = selectionAfter.end
+            if (selectionAfter != selectionBefore) {
+                expectedSelections.expect(selectionBefore, selectionAfter)
+            }
+        } else if (cachedSelectionStart == cachedSelectionEnd && cachedSelectionStart >= 0) {
+            cachedSelectionStart += replacement.length - previous.length
+            cachedSelectionEnd = cachedSelectionStart
+            expectedSelections.expect(
+                selectionBefore,
+                EditorSelection(cachedSelectionStart, cachedSelectionEnd),
+            )
+        }
 
         // The first-ranked word was only a machine guess. Selecting another candidate is direct
         // evidence: remove the wrong observation and teach the chosen pair instead.
@@ -1154,13 +1496,21 @@ class SlideInputMethodService :
                 userBigrams.learn(context, word)
                 learnedPersistence.markDirty()
                 saveLearnedWords()
+                lastGestureLearnedPair = context to word
+            } else {
+                lastGestureLearnedPair = null
             }
-            lastGestureLearnedPair = context to word
         }
 
         // The strip stays up, and keeps its order, so a second wrong guess is also one tap away
         // and the candidates do not move under the user's thumb.
         lastGestureCommit = replacement
+        gestureUndoState.arm(
+            replacement,
+            editorGeneration,
+            collapsedCursorPosition(),
+            lastGestureLearnedPair,
+        )
         updateShiftFromCursor()
     }
 
@@ -1302,6 +1652,12 @@ class SlideInputMethodService :
      * for the microphone during setup, before the user has any reason to say yes.
      */
     override fun onVoiceRequested() {
+        if (queueBehindGestureInput(::processVoiceRequested)) return
+        processVoiceRequested()
+    }
+
+    private fun processVoiceRequested() {
+        gestureUndoState.invalidate()
         if (voiceCancellationPending) {
             announce("Voice typing is still closing")
             return
@@ -1473,6 +1829,12 @@ class SlideInputMethodService :
         get() = emojiPanel?.visibility == View.VISIBLE
 
     override fun onEmojiPicked(emoji: String) {
+        if (queueBehindGestureInput { processEmojiPicked(emoji) }) return
+        processEmojiPicked(emoji)
+    }
+
+    private fun processEmojiPicked(emoji: String) {
+        gestureUndoState.invalidate()
         performHaptic()
         val connection = currentInputConnection ?: return
         selfEdit = true
@@ -1643,6 +2005,7 @@ class SlideInputMethodService :
     }
 
     private fun handleDelete(connection: InputConnection) {
+        if (deleteLastGestureCommit(connection)) return
         if (revertAutocorrect(connection)) return
 
         // Same reasoning as typing: with the cursor inside a reopened word, shortening the region
@@ -1693,6 +2056,116 @@ class SlideInputMethodService :
         literalWordInProgress = cursorTouchesWord(connection)
         updateShiftFromCursor()
     }
+
+    /** Deletes the exact text from the immediately preceding swipe as one atomic Backspace. */
+    private fun deleteLastGestureCommit(connection: InputConnection): Boolean {
+        val expectedLength = gestureUndoState.expectedTextLength ?: return false
+        val selected = connection.getSelectedText(0)
+        val hasSelection = !selected.isNullOrEmpty() ||
+            (cachedSelectionStart >= 0 &&
+                cachedSelectionEnd >= 0 &&
+                cachedSelectionStart != cachedSelectionEnd)
+        val before = if (hasSelection) {
+            null
+        } else {
+            connection.getTextBeforeCursor(expectedLength, 0)?.toString()
+        }
+        val undo = gestureUndoState.consume(
+            editorGeneration,
+            hasSelection,
+            before,
+            collapsedCursorPosition(),
+        ) ?: return false
+
+        val selectionBefore = readEditorSelection(connection) ?: cachedEditorSelection()
+        connection.beginBatchEdit()
+        val deletion = try {
+            GestureDeleteTransaction.delete(
+                units = undo.committedText.length,
+                deleteRange = { connection.deleteSurroundingText(it, 0) },
+                deleteUnit = { connection.deleteSurroundingText(1, 0) },
+            )
+        } finally {
+            connection.endBatchEdit()
+        }
+        // The verified immediate Backspace rejects the guessed phrase even when an unusual editor
+        // refuses both the range delete and its bounded one-unit fallback.
+        rollbackGestureLearning(undo.learnedPair)
+        if (!deletion.changedEditor) return false
+
+        var selectionTracked = false
+        val liveSelection = readEditorSelection(connection)
+        if (liveSelection != null) {
+            cachedSelectionStart = liveSelection.start
+            cachedSelectionEnd = liveSelection.end
+            if (liveSelection != selectionBefore) {
+                expectedSelections.expect(selectionBefore, liveSelection)
+                selectionTracked = true
+            }
+        } else {
+            val cursorAfterDelete = undo.cursorPosition?.minus(deletion.deletedUnits)
+            if (cursorAfterDelete != null) {
+                cachedSelectionStart = cursorAfterDelete.coerceAtLeast(0)
+                cachedSelectionEnd = cachedSelectionStart
+                expectedSelections.expect(
+                    selectionBefore,
+                    EditorSelection(cachedSelectionStart, cachedSelectionEnd),
+                )
+                selectionTracked = true
+            } else {
+                cachedSelectionStart = -1
+                cachedSelectionEnd = -1
+            }
+        }
+        if (selectionTracked) selfEdit = false
+        lastAutocorrect = null
+        literalWordInProgress = !deletion.fullyDeleted && cursorTouchesWord(connection)
+        clearSuggestions()
+        updateShiftFromCursor()
+        updatePredictions()
+        return true
+    }
+
+    private fun rollbackGestureLearning(pair: Pair<String, String>?) {
+        pair ?: return
+        userBigrams.unlearn(pair.first, pair.second)
+        learnedPersistence.markDirty()
+        saveLearnedWords()
+    }
+
+    private fun collapsedCursorPosition(): Int? = cachedSelectionStart.takeIf {
+        it >= 0 && it == cachedSelectionEnd
+    }
+
+    private fun cachedEditorSelection(): EditorSelection? =
+        if (cachedSelectionStart >= 0 && cachedSelectionEnd >= 0) {
+            EditorSelection(cachedSelectionStart, cachedSelectionEnd)
+        } else {
+            null
+        }
+
+    private fun readEditorSelection(connection: InputConnection): EditorSelection? {
+        val extracted = connection.getExtractedText(ExtractedTextRequest(), 0) ?: return null
+        if (extracted.selectionStart < 0 || extracted.selectionEnd < 0) return null
+        val offset = extracted.startOffset.coerceAtLeast(0)
+        return EditorSelection(
+            start = offset + extracted.selectionStart,
+            end = offset + extracted.selectionEnd,
+        )
+    }
+
+    private fun gestureEditorSnapshot(connection: InputConnection): GestureEditorSnapshot =
+        GestureEditorSnapshot(
+            cursor = readEditorSelection(connection) ?: collapsedCursorPosition()?.let {
+                EditorSelection(it, it)
+            },
+            textBeforeCursor = connection
+                .getTextBeforeCursor(GESTURE_CONTEXT_GUARD_CHARS, 0)
+                ?.toString(),
+            textAfterCursor = connection
+                .getTextAfterCursor(GESTURE_CONTEXT_GUARD_CHARS, 0)
+                ?.toString(),
+        )
 
     private fun handleEnter(connection: InputConnection) {
         finishComposing(connection)
@@ -2348,8 +2821,15 @@ class SlideInputMethodService :
         cachedSelectionStart = newSelStart
         cachedSelectionEnd = newSelEnd
 
-        val ourEdit = selfEdit
-        selfEdit = false
+        val expectedEdit = expectedSelections.consume(
+            from = EditorSelection(oldSelStart, oldSelEnd),
+            to = EditorSelection(newSelStart, newSelEnd),
+        )
+        val ourEdit = expectedEdit || selfEdit
+        // A matching earlier callback can arrive while a later queued mutation is using the
+        // one-shot fallback (for an editor without extracted-text support). Preserve that later
+        // fallback until its own callback; exact tracked edits clear selfEdit when registered.
+        if (!expectedEdit) selfEdit = false
 
         val update = SelectionUpdate.evaluate(
             oldSelStart = oldSelStart,
@@ -2361,6 +2841,12 @@ class SlideInputMethodService :
             selfEdit = ourEdit,
             hasComposingText = composing.isNotEmpty(),
         )
+
+        if (update.externalSelectionChanged) {
+            cancelGestureInputSequence()
+            expectedSelections.invalidate()
+            gestureUndoState.invalidate()
+        }
 
         if (composing.isNotEmpty() && !update.cursorLeftComposing) {
             update.composingAtEnd?.let { composingAtEnd = it }
@@ -2583,6 +3069,9 @@ class SlideInputMethodService :
 
         /** Above this it is not a word, and the suggester would refuse it anyway. */
         const val MAX_REOPEN_LENGTH = 28
+
+        /** Enough surrounding editor text to detect a cursor/context move during native decode. */
+        const val GESTURE_CONTEXT_GUARD_CHARS = 48
 
         /** The key types that change the field, and so expect a selection update of their own. */
         val EDITING_KEYS = setOf(

@@ -45,16 +45,21 @@ class CtcSwipeBeamSearchTest {
     }
 
     private fun tinyLexicon(vararg words: String): Lexicon {
-        val sorted = words.sorted()
-        val chars = sorted.joinToString("").toCharArray()
+        return tinyLexicon(*words.map { it to 100 }.toTypedArray())
+    }
+
+    private fun tinyLexicon(vararg words: Pair<String, Int>): Lexicon {
+        val sorted = words.sortedBy { it.first }
+        val chars = sorted.joinToString("") { it.first }.toCharArray()
         val offsets = IntArray(sorted.size + 1)
         var cursor = 0
-        sorted.forEachIndexed { index, word ->
+        sorted.forEachIndexed { index, (word, _) ->
             offsets[index] = cursor
             cursor += word.length
         }
         offsets[sorted.size] = cursor
-        return Lexicon(chars, offsets, ByteArray(sorted.size) { 100 }, ByteArray(sorted.size))
+        val frequencies = ByteArray(sorted.size) { index -> sorted[index].second.toByte() }
+        return Lexicon(chars, offsets, frequencies, ByteArray(sorted.size))
     }
 
     @Test
@@ -71,6 +76,25 @@ class CtcSwipeBeamSearchTest {
         val candidates = search.decode(emissionsFor("dont"), true, null)
 
         assertTrue(candidates.any { it.word.lowercase() == "don't" })
+    }
+
+    @Test
+    fun `neural language prior uses raw vocabulary frequency`() {
+        val commonFrequency = 160
+        val uncommonFrequency = 93
+        val tiny = tinyLexicon("that's" to commonFrequency, "thats" to uncommonFrequency)
+        val candidates = CtcSwipeBeamSearch(tiny, null, null)
+            .decode(emissionsFor("thats"), true, null)
+            .associateBy { it.word.lowercase() }
+
+        val common = requireNotNull(candidates["that's"])
+        val uncommon = requireNotNull(candidates["thats"])
+        assertEquals(
+            0.0134f * (commonFrequency - uncommonFrequency),
+            common.score - uncommon.score,
+            0.0001f,
+        )
+        assertTrue(common.score > uncommon.score)
     }
 
     @Test

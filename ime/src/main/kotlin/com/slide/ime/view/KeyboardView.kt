@@ -9,6 +9,7 @@ import android.graphics.RectF
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.AttributeSet
 import android.util.TypedValue
 import android.view.MotionEvent
@@ -62,14 +63,14 @@ class KeyboardView @JvmOverloads constructor(
          */
         fun onKeyCommit(key: Key, text: String, touchX: Float = Float.NaN, touchY: Float = Float.NaN)
 
-        /** Returns true only when the swipe produced committed input. */
-        fun onGestureComplete(points: List<GesturePoint>): Boolean
+        /** Hands a deliberate swipe to the decoder; full-length misses intentionally type nothing. */
+        fun onGestureComplete(points: List<GesturePoint>)
 
         /** A throttled partial trace, used to preview the likely word before finger-up. */
         fun onGesturePreview(points: List<GesturePoint>) = Unit
 
-        /** Invalidates preview work when the current trace ends or is abandoned. */
-        fun onGesturePreviewCancelled() = Unit
+        /** Invalidates preview work; a normal lift can keep its latest candidates until final. */
+        fun onGesturePreviewCancelled(clearCandidates: Boolean = true) = Unit
 
         /** Fired while the user slides horizontally across the space bar. */
         fun onCursorMove(steps: Int) = Unit
@@ -108,6 +109,7 @@ class KeyboardView @JvmOverloads constructor(
         set(value) {
             if (field == value) return
             field = value
+            completedGesturePoints.clear()
             requestLayout()
             // A layer switch normally keeps the same bounds. Recompute immediately as well as
             // requesting layout; otherwise the old layer's cells remain in the hit-test map until
@@ -224,6 +226,8 @@ class KeyboardView @JvmOverloads constructor(
     /** Pointer id that owns the current gesture, or null when not gesturing. */
     private var gesturePointerId: Int? = null
     private val gesturePoints = ArrayList<GesturePoint>()
+    private val completedGesturePoints = ArrayList<GesturePoint>(TRAIL_POINTS)
+    private var completedGestureTime = 0L
     private var gestureStartTime = 0L
     private var lastGesturePreviewTime = 0L
 
@@ -437,10 +441,31 @@ class KeyboardView @JvmOverloads constructor(
         if (searchMode) drawSearchHeader(canvas)
 
         placedKeys.forEach { placed ->
-            drawKey(canvas, placed, pressed = pointers.values.any { it.placed === placed })
+            drawKey(
+                canvas,
+                placed,
+                pressed = pointers.any { (pointerId, pointer) ->
+                    pointerId != gesturePointerId && pointer.placed === placed
+                },
+            )
         }
 
-        if (gesturePointerId != null) drawGestureTrail(canvas)
+        if (gesturePointerId != null) {
+            drawGestureTrail(canvas, gesturePoints, alpha = 215)
+        } else if (completedGesturePoints.isNotEmpty()) {
+            val elapsed = SystemClock.uptimeMillis() - completedGestureTime
+            if (elapsed < COMPLETED_TRAIL_FADE_MS) {
+                val progress = elapsed.toFloat() / COMPLETED_TRAIL_FADE_MS
+                drawGestureTrail(
+                    canvas,
+                    completedGesturePoints,
+                    alpha = (215f * (1f - progress)).toInt(),
+                )
+                postInvalidateOnAnimation()
+            } else {
+                completedGesturePoints.clear()
+            }
+        }
     }
 
     private fun drawKey(canvas: Canvas, placed: PlacedKey, pressed: Boolean) {
@@ -631,26 +656,36 @@ class KeyboardView @JvmOverloads constructor(
         canvas.drawText(keyboardLayout.label, placed.centerX, baseline, labelPaint)
     }
 
-    private fun drawGestureTrail(canvas: Canvas) {
-        if (gesturePoints.size < 2) return
+    private fun drawGestureTrail(
+        canvas: Canvas,
+        points: List<GesturePoint>,
+        alpha: Int,
+    ) {
+        if (points.size < 2 || alpha <= 0) return
 
         // Preserve the full visible motion and soften the sampled polyline into one continuous
         // stroke. Segment-by-segment alpha made fast traces look dashed, while discarding most of
         // the path made a long glide look as though it had stopped tracking the finger.
-        val start = (gesturePoints.size - TRAIL_POINTS).coerceAtLeast(0)
+        val start = (points.size - TRAIL_POINTS).coerceAtLeast(0)
         trailPaint.color = keyboardTheme.gestureTrail
-        trailPaint.alpha = 215
+        trailPaint.alpha = alpha
         trailPaint.strokeWidth = dp(5.5f)
         trailPath.reset()
-        trailPath.moveTo(gesturePoints[start].x, gesturePoints[start].y)
-        for (i in start + 1 until gesturePoints.lastIndex) {
-            val point = gesturePoints[i]
-            val next = gesturePoints[i + 1]
+        trailPath.moveTo(points[start].x, points[start].y)
+        for (i in start + 1 until points.lastIndex) {
+            val point = points[i]
+            val next = points[i + 1]
             trailPath.quadTo(point.x, point.y, (point.x + next.x) / 2f, (point.y + next.y) / 2f)
         }
-        val end = gesturePoints.last()
+        val end = points.last()
         trailPath.lineTo(end.x, end.y)
         canvas.drawPath(trailPath, trailPaint)
+
+        // Keep a bright head attached to the most recent sample, then fade it with the completed
+        // path after lift. The trail reads as motion instead of a static line left on the keys.
+        trailPaint.style = Paint.Style.FILL
+        canvas.drawCircle(end.x, end.y, dp(3.7f), trailPaint)
+        trailPaint.style = Paint.Style.STROKE
     }
 
     private fun backgroundColorFor(key: Key): Int = when (key.type) {
@@ -859,6 +894,7 @@ class KeyboardView @JvmOverloads constructor(
 
     private fun handlePointerDown(pointerId: Int, x: Float, y: Float, eventTime: Long) {
         val placed = KeyGeometry.hitTest(placedKeys, x, y) ?: return
+        completedGesturePoints.clear()
         val pointer = Pointer(placed, placed, x, y, eventTime)
         pointers[pointerId] = pointer
         cursorRemainderPx = 0f
@@ -1011,6 +1047,7 @@ class KeyboardView @JvmOverloads constructor(
         previewPopup.dismiss()
         alternatesPopup.dismiss()
         abandonGesture()
+        completedGesturePoints.clear()
         invalidate()
     }
 
@@ -1089,6 +1126,7 @@ class KeyboardView @JvmOverloads constructor(
         cancelRepeat()
         previewPopup.dismiss()
         gesturePointerId = pointerId
+        completedGesturePoints.clear()
         gestureStartTime = pointer.downTime
         lastGesturePreviewTime = pointer.downTime
         gesturePoints.clear()
@@ -1104,7 +1142,10 @@ class KeyboardView @JvmOverloads constructor(
 
         if (
             gesturePoints.size >= MIN_GESTURE_POINTS &&
-            eventTime - lastGesturePreviewTime >= GESTURE_PREVIEW_INTERVAL_MS
+            eventTime - lastGesturePreviewTime >= GESTURE_PREVIEW_INTERVAL_MS &&
+            pathLength(gesturePoints) >=
+            (gesturePointerId?.let(pointers::get)?.placed?.width ?: 0f) *
+            MIN_GESTURE_PREVIEW_PATH_FACTOR
         ) {
             lastGesturePreviewTime = eventTime
             listener?.onGesturePreview(ArrayList(gesturePoints))
@@ -1119,11 +1160,14 @@ class KeyboardView @JvmOverloads constructor(
      */
     private fun finishGesture(pointer: Pointer) {
         val points = ArrayList(gesturePoints)
-        abandonGesture()
-
         val decodable = points.size >= MIN_GESTURE_POINTS &&
             pathLength(points) >= pointer.placed.width * MIN_GESTURE_PATH_FACTOR
+        abandonGesture(clearPreviewCandidates = !decodable)
         if (decodable) {
+            val trailStart = (points.size - TRAIL_POINTS).coerceAtLeast(0)
+            completedGesturePoints.clear()
+            completedGesturePoints.addAll(points.subList(trailStart, points.size))
+            completedGestureTime = SystemClock.uptimeMillis()
             listener?.onGestureComplete(points)
         } else {
             listener?.onKeyCommit(
@@ -1143,8 +1187,10 @@ class KeyboardView @JvmOverloads constructor(
         return total
     }
 
-    private fun abandonGesture() {
-        if (gesturePointerId != null) listener?.onGesturePreviewCancelled()
+    private fun abandonGesture(clearPreviewCandidates: Boolean = true) {
+        if (gesturePointerId != null) {
+            listener?.onGesturePreviewCancelled(clearPreviewCandidates)
+        }
         gesturePointerId = null
         gesturePoints.clear()
     }
@@ -1226,7 +1272,9 @@ class KeyboardView @JvmOverloads constructor(
          */
         const val MIN_GESTURE_POINTS = 6
         const val MIN_GESTURE_PATH_FACTOR = 0.9f
-        const val GESTURE_PREVIEW_INTERVAL_MS = 90L
+        const val MIN_GESTURE_PREVIEW_PATH_FACTOR = 1.1f
+        const val GESTURE_PREVIEW_INTERVAL_MS = 100L
+        const val COMPLETED_TRAIL_FADE_MS = 140L
         const val GESTURE_SLOP_FACTOR = 1.4f
         const val MAX_SEARCH_RESULTS = 6
         const val SEARCH_HEADER_DP = 96f

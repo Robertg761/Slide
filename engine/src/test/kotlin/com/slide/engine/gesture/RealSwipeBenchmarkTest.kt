@@ -41,6 +41,9 @@ class RealSwipeBenchmarkTest {
         var inLexiconTopFive = 0
         var totalScored = 0L
         var totalNanos = 0L
+        val marginThresholds = floatArrayOf(0.25f, 0.5f, 1f, 1.5f, 2f, 3f, 4f)
+        val marginTotals = IntArray(marginThresholds.size)
+        val marginCorrect = IntArray(marginThresholds.size)
 
         file.useLines { lines ->
             for (line in lines) {
@@ -49,13 +52,24 @@ class RealSwipeBenchmarkTest {
                 if (record.word.length <= 1 || !record.word.all { it in 'a'..'z' || it == '\'' }) continue
 
                 val start = System.nanoTime()
-                val candidates = decoder.decode(
+                val decoded = decoder.decode(
                     points = record.points,
                     keys = QWERTY,
                     previousWord = record.previousWord,
-                ).map { it.word.lowercase() }
+                )
+                val candidates = decoded.map { it.word.lowercase() }
                 totalNanos += System.nanoTime() - start
                 totalScored += decoder.lastScoredCount
+
+                val margin = if (decoded.size >= 2) decoded[0].score - decoded[1].score else null
+                if (margin != null) {
+                    marginThresholds.forEachIndexed { index, threshold ->
+                        if (margin >= threshold) {
+                            marginTotals[index]++
+                            if (candidates.firstOrNull() == record.word) marginCorrect[index]++
+                        }
+                    }
+                }
 
                 accepted++
                 val known = TestLexicon.instance.contains(record.word)
@@ -80,6 +94,15 @@ class RealSwipeBenchmarkTest {
             totalNanos / accepted / 1_000_000.0,
             totalScored.toDouble() / accepted,
         ))
+        marginThresholds.forEachIndexed { index, threshold ->
+            println(
+                "  margin >= %.2f  precision %s  coverage %s".format(
+                    threshold,
+                    percent(marginCorrect[index], marginTotals[index]),
+                    percent(marginTotals[index], accepted),
+                ),
+            )
+        }
     }
 
     private fun parse(line: String): Record? {

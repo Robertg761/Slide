@@ -31,7 +31,8 @@ and complete microphone-to-editor flow have not yet been rerun on physical hardw
 - QWERTY typing with multi-touch rollover and slide-off correction
 - Long-press alternates (accents) with slide-to-select
 - Shift, caps lock, auto-capitalisation, double-space period
-- Backspace with auto-repeat and correct emoji/surrogate-pair deletion
+- Backspace with auto-repeat, correct emoji/surrogate-pair deletion, and one-tap whole-word undo
+  for the immediately preceding swipe
 - Symbols layer, editor-action-aware enter key
 - Nine explicit theme presets plus Dynamic Material You; only Dynamic follows system light/dark
 - Key preview popups, key borders, number row, haptics, keypress sound
@@ -40,7 +41,8 @@ and complete microphone-to-editor flow have not yet been rerun on physical hardw
 - Next-word prediction in the strip, using one- and two-word corpus context plus repeated phrases
 - **Gesture typing** — an offline neural spatial model with Slide's trie-constrained beam search,
   a deterministic SHARK²-style fallback, live candidates while sliding, and correction-aware
-  local phrase learning
+  local phrase learning. Final inference stays off the IME thread, and one Backspace removes a
+  just-swiped word plus its automatically inserted space as a single reversible action.
 - Suggestion strip showing the decoder's top three candidates, one tap to correct a miss
 - Offensive-word filtering for suggestions (on by default, as in Gboard)
 

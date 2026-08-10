@@ -193,8 +193,10 @@ class SuggestionStripView(context: Context) : View(context) {
      * or to hit reliably, and the fourth and fifth candidates are almost never the intended word.
      */
     fun setSuggestions(candidates: List<String>) {
+        val requested = candidates.take(MAX_VISIBLE)
+        if (words.size == requested.size && words.indices.all { words[it] == requested[it] }) return
         words.clear()
-        candidates.take(MAX_VISIBLE).forEach(words::add)
+        requested.forEach(words::add)
         pressedIndex = -1
         settingsPressed = false
         micPressed = false
@@ -204,6 +206,7 @@ class SuggestionStripView(context: Context) : View(context) {
     }
 
     fun setEmptyMessage(message: String) {
+        if (emptyMessage == message) return
         emptyMessage = message
         refreshAccessibilityDescription()
         invalidate()

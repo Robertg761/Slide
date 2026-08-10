@@ -4,7 +4,6 @@ import com.slide.engine.lexicon.Bigrams
 import com.slide.engine.lexicon.Lexicon
 import com.slide.engine.lexicon.Trigrams
 import com.slide.engine.lexicon.UserBigrams
-import kotlin.math.ln
 import kotlin.math.pow
 
 /** Slide-owned, model-compatible trie/Viterbi beam search. */
@@ -104,7 +103,10 @@ internal class CtcSwipeBeamSearch(
             val length = trie.depth(node).coerceAtLeast(1)
             trie.forEachTerminal(node) { wordIndex ->
                 if (!blockOffensive || !lexicon.isOffensive(wordIndex)) {
-                    val frequency = ln(1f + lexicon.frequencyAt(wordIndex))
+                    // The decoder's calibrated language-model weight expects the vocabulary's
+                    // raw 0..255 frequency byte. Log-normalizing here nearly erased the prior and
+                    // allowed uncommon names to beat everyday words and contractions.
+                    val frequency = lexicon.frequencyAt(wordIndex).toFloat()
                     val context = if (bigrams != null && contextIndex >= 0) {
                         CONTEXT_WEIGHT * bigrams.score(contextIndex, wordIndex)
                     } else {

@@ -46,6 +46,14 @@ class GestureDecoderTest {
     }
 
     @Test
+    fun `deterministic decoder ranks common apostrophe contraction from its alphabetic path`() {
+        val results = topWords("that's", jitter = 9f, smoothing = 3)
+
+        assertEquals("Noisy t-h-a-t-s trace decoded as $results", "that's", results.firstOrNull())
+        assertTrue("Unrelated proper noun should not survive a clear contraction trace: $results", "teresa" !in results)
+    }
+
+    @Test
     fun `decodes a realistic trace`() {
         val missed = corpus.filter { word ->
             topWords(word, jitter = 9f, smoothing = 3).firstOrNull() != word

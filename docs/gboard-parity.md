@@ -51,7 +51,7 @@ A 1:1 inventory of Gboard's feature surface, used as the master checklist for Sl
 | B5 | Top-3 alternates in suggestion strip after gesture | V1 | S | Built; best candidate is centre-aligned. |
 | B6 | Auto-space insertion between glided words | V1 | S | |
 | B7 | Glide through shift → capitalised word | V2 | S | |
-| B8 | Glide to backspace → delete last glided word | V2 | S | |
+| B8 | Glide to backspace → delete last glided word | V2 | S | **Built.** The next Backspace verifies and deletes the exact swipe commit, including auto-spacing, and rolls back its provisional phrase observation. |
 | B9 | Glide across symbol/number keys | V3 | M | |
 | B10 | Double-letter handling (no loop required) | V1 | M | Covered by model-contract regressions and an on-device `letter` glide without a loop. |
 | B11 | Gesture trail colour follows theme | V1 | S | |

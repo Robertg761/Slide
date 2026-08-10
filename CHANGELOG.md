@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Fixed
+
+- Neural swipe ranking now applies the model's calibrated language weight to the lexicon's raw
+  `0..255` frequency value. The previous extra logarithm almost erased the language prior; this
+  removes a concrete scoring cause of everyday contractions losing to much less common names.
+- One Backspace immediately after a swipe now removes the complete committed word as a unit,
+  including Slide's automatic leading space and the word's casing. The deletion is verified
+  against the editor's actual text and also rolls back the provisional learned phrase.
+
+### Changed
+
+- Finger-up decoding runs away from the IME thread. Completed swipes and immediately following
+  keys, cursor gestures, panel requests, or second swipes are applied in release order, while
+  field and gesture-setting invalidation cancels the sequence. A live preview still in native
+  inference can no longer freeze key rendering while the final decode waits for it.
+- The starting key no longer remains visually pressed throughout a swipe. The trail has a clearer
+  fingertip head, fades briefly after lift, starts previews only after meaningful travel, and
+  identical preview candidates no longer redraw the suggestion strip.
+
+### Verification
+
+- Full JVM suites for `:engine` and `:ime` pass, including focused raw-frequency calibration,
+  common-contraction, ordered-input, exact whole-swipe undo, stale-editor, selection, mismatch,
+  transaction-failure, and one-shot tests.
+- The deterministic fallback was measured on 20,000 donated real-finger QWERTY traces as a
+  diagnostic. Its 50.23% top-1 result confirms it must remain failover rather than broadly
+  overriding neural output.
+- The reported `that's` trace has not yet been replayed through the packaged neural model, and a
+  physical install remains pending: no phone was visible to ADB in this pass, and three existing
+  x86_64 AVDs exited during cold boot before instrumentation could run (the last with SIGSEGV).
+
 ## [0.3.1] - 2026-08-10
 
 ### Fixed
