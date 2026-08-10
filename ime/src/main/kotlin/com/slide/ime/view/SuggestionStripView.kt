@@ -3,14 +3,19 @@ package com.slide.ime.view
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.os.Handler
 import android.os.Looper
+import android.os.Bundle
 import android.util.TypedValue
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.accessibility.AccessibilityNodeInfo
+import androidx.core.view.ViewCompat
+import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
+import androidx.customview.widget.ExploreByTouchHelper
 import com.slide.core.theme.KeyboardTheme
 import com.slide.core.theme.Themes
 
@@ -41,6 +46,17 @@ class SuggestionStripView(context: Context) : View(context) {
     }
 
     var listener: Listener? = null
+
+    /** False for password/secure and non-language editors. */
+    var voiceEnabled: Boolean = true
+        set(value) {
+            if (field == value) return
+            field = value
+            pressedIndex = -1
+            micPressed = false
+            refreshAccessibilityDescription()
+            invalidate()
+        }
 
     var keyboardTheme: KeyboardTheme = Themes.Light
         set(value) {
@@ -73,9 +89,72 @@ class SuggestionStripView(context: Context) : View(context) {
     }
     private val pressedPaint = Paint(Paint.ANTI_ALIAS_FLAG)
 
+    private val accessibilityHelper = object : ExploreByTouchHelper(this) {
+        override fun getVirtualViewAt(x: Float, y: Float): Int {
+            if (y !in 0f..height.toFloat()) return INVALID_ID
+            if (voiceEnabled && isOverMic(x)) return A11Y_MIC
+            val index = indexAt(x)
+            return if (index >= 0) A11Y_WORD_BASE + index else INVALID_ID
+        }
+
+        override fun getVisibleVirtualViews(virtualViewIds: MutableList<Int>) {
+            words.indices.forEach { virtualViewIds += A11Y_WORD_BASE + it }
+            if (voiceEnabled) virtualViewIds += A11Y_MIC
+        }
+
+        override fun onPopulateNodeForVirtualView(
+            virtualViewId: Int,
+            node: AccessibilityNodeInfoCompat,
+        ) {
+            node.className = "android.widget.Button"
+            node.isClickable = true
+            node.addAction(AccessibilityNodeInfoCompat.ACTION_CLICK)
+            if (virtualViewId == A11Y_MIC) {
+                node.contentDescription = "Voice typing"
+                node.setBoundsInParent(Rect((width - micWidth()).toInt(), 0, width, height))
+                return
+            }
+
+            val index = virtualViewId - A11Y_WORD_BASE
+            val word = words.getOrNull(index).orEmpty()
+            node.contentDescription = if (index == 0) "$word, best suggestion" else word
+            node.addAction(AccessibilityNodeInfoCompat.ACTION_LONG_CLICK)
+            val cellWidth = suggestionWidth() / MAX_VISIBLE
+            node.setBoundsInParent(
+                Rect((index * cellWidth).toInt(), 0, ((index + 1) * cellWidth).toInt(), height),
+            )
+        }
+
+        override fun onPerformActionForVirtualView(
+            virtualViewId: Int,
+            action: Int,
+            arguments: Bundle?,
+        ): Boolean {
+            if (virtualViewId == A11Y_MIC) {
+                if (action != AccessibilityNodeInfo.ACTION_CLICK || !voiceEnabled) return false
+                listener?.onVoiceRequested()
+                return true
+            }
+            val index = virtualViewId - A11Y_WORD_BASE
+            val word = words.getOrNull(index) ?: return false
+            return when (action) {
+                AccessibilityNodeInfo.ACTION_CLICK -> {
+                    listener?.onSuggestionPicked(index, word)
+                    true
+                }
+                AccessibilityNodeInfo.ACTION_LONG_CLICK -> {
+                    listener?.onSuggestionHeld(index, word)
+                    true
+                }
+                else -> false
+            }
+        }
+    }
+
     init {
         isFocusable = true
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
+        ViewCompat.setAccessibilityDelegate(this, accessibilityHelper)
         refreshAccessibilityDescription()
     }
 
@@ -90,6 +169,7 @@ class SuggestionStripView(context: Context) : View(context) {
         candidates.take(MAX_VISIBLE).forEach(words::add)
         pressedIndex = -1
         refreshAccessibilityDescription()
+        accessibilityHelper.invalidateRoot()
         invalidate()
     }
 
@@ -175,6 +255,7 @@ class SuggestionStripView(context: Context) : View(context) {
      * competes with a letter.
      */
     private fun drawMicButton(canvas: Canvas) {
+        if (!voiceEnabled) return
         val centerX = width - micWidth() / 2f
         val centerY = height / 2f
 
@@ -195,7 +276,7 @@ class SuggestionStripView(context: Context) : View(context) {
     /** Width reserved for the microphone button at the right edge. */
     private fun micWidth(): Float = height.toFloat()
 
-    private fun suggestionWidth(): Float = width - micWidth()
+    private fun suggestionWidth(): Float = width - if (voiceEnabled) micWidth() else 0f
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
@@ -275,7 +356,7 @@ class SuggestionStripView(context: Context) : View(context) {
         cancelPendingLongPress()
     }
 
-    private fun isOverMic(x: Float): Boolean = x >= width - micWidth()
+    private fun isOverMic(x: Float): Boolean = voiceEnabled && x >= width - micWidth()
 
     private fun indexAt(x: Float): Int {
         if (words.isEmpty() || isOverMic(x)) return -1
@@ -298,19 +379,34 @@ class SuggestionStripView(context: Context) : View(context) {
         info.contentDescription = accessibilityDescription()
     }
 
+    override fun dispatchHoverEvent(event: MotionEvent): Boolean =
+        accessibilityHelper.dispatchHoverEvent(event) || super.dispatchHoverEvent(event)
+
+    override fun onFocusChanged(
+        gainFocus: Boolean,
+        direction: Int,
+        previouslyFocusedRect: Rect?,
+    ) {
+        super.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
+        accessibilityHelper.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
+    }
+
     private fun refreshAccessibilityDescription() {
         contentDescription = accessibilityDescription()
+        accessibilityHelper.invalidateRoot()
     }
 
     private fun accessibilityDescription(): String = buildString {
         if (words.isEmpty()) append(emptyMessage)
         else append("Suggestions: ").append(words.joinToString(", "))
-        append(". Voice typing button at the right")
+        if (voiceEnabled) append(". Voice typing button at the right")
     }
 
     private companion object {
         const val MAX_VISIBLE = 3
         const val HEIGHT_DP = 48f
+        const val A11Y_WORD_BASE = 0
+        const val A11Y_MIC = 100
 
         /** Leaves the glyph comfortably inside its square without looking lost in it. */
         const val MIC_GLYPH_FRACTION = 0.30f

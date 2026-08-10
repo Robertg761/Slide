@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item name="accessibility_type_alternate_1" type="id" />
+    <item name="accessibility_type_alternate_2" type="id" />
+    <item name="accessibility_type_alternate_3" type="id" />
+    <item name="accessibility_type_alternate_4" type="id" />
+    <item name="accessibility_type_alternate_5" type="id" />
+    <item name="accessibility_type_alternate_6" type="id" />
+    <item name="accessibility_type_alternate_7" type="id" />
+    <item name="accessibility_type_alternate_8" type="id" />
+    <item name="accessibility_type_alternate_9" type="id" />
+</resources>

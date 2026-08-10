@@ -9,8 +9,9 @@ Companion to `gboard-parity.md`. Covers the three things that decide whether thi
 - **Own gesture decoder.** Distribution is undecided but sharing is likely, so the extracted Gboard
   blob is off the table from day one — adopting it would have to be undone later anyway.
 - **English only for v1.** Layouts and dictionaries stay data-driven so more languages are additive.
-- **Fully offline.** No network permission except explicit model downloads. This removes GIF search
-  (F7) and translate (G11) from v1; neither was a stated priority.
+- **Offline typing and speech.** The model is bundled and typing data is never sent to a service.
+  The app has network permission only for the optional GitHub release checker. This removes GIF
+  search (F7) and translate (G11) from v1; neither was a stated priority.
 
 ---
 
@@ -113,55 +114,37 @@ touch logs from a device, which Slide does not collect.
 
 ### Model choice
 
-Recommendation, using `whisper.cpp` GGML quantised weights:
+Slide 0.2.1 packages one model: `ggml-base.en-q5_1.bin` (59,721,011 bytes). A prior Galaxy S24
+Ultra benchmark loaded Base in about 100 ms and decoded an 11-second fixture in about 1.7 seconds.
+The former Small model decoded the same fixture in about 7.4 seconds and added roughly 181 MB to
+every APK and update, so it was removed. This is one device measurement, not a latency promise for
+all supported devices.
 
-| Tier | Model | Size (q5_1) | Use |
-|---|---|---|---|
-| Fast | `base.en` | ~57 MB | Older/mid devices, lowest latency |
-| **Default** | **`small.en`** | **~180 MB** | **Best accuracy/latency balance on modern phones** |
-| Best | `large-v3-turbo` (q5_0) | ~570 MB | Flagships only; optional download |
-| Multilingual | `small` / `large-v3-turbo` | ~190 MB / ~570 MB | When non-English is enabled |
+The build fetch is pinned to immutable whisper.cpp model revision
+`5359861c739e955e79d9a303bcbc70fb988958b1` and verifies SHA-256
+`4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f`. The model is bundled
+and stored uncompressed for direct asset access; the installed app has no model downloader or
+model-choice UI.
 
-`small.en` is the sweet spot: it's where Whisper stops making embarrassing errors, and it's still
-fast enough to feel instant on a recent Snapdragon/Tensor with the optimisations below. `medium` is
-not worth it — roughly 3× the cost of `small` for a small accuracy gain, and `large-v3-turbo` beats
-it anyway. Since you don't care about download size, we offer all four and default to `small.en`.
-
-These throughput expectations need measuring on your actual device before we commit — I'd rather
-benchmark early than design around a guess.
-
-### Making it feel instant
-
-Two optimisations matter more than model choice:
-
-- **Reduced `audio_ctx`.** Whisper's encoder always processes a padded 30-second window, so a
-  2-second utterance costs the same as a 30-second one by default. Shrinking `audio_ctx`
-  proportionally to the actual audio length cuts encoder time several-fold with minimal accuracy
-  loss. This is the single biggest win for dictation latency.
-- **Chunked pseudo-streaming.** Whisper isn't a streaming model. We run a sliding window (~5 s with
-  ~1 s overlap) to emit partial text while the user speaks, then re-decode the final segment at full
-  settings on endpoint. The user perceives near-zero latency because only the last chunk is pending
-  when they stop.
-
-Plus: VAD for endpointing (Silero VAD ONNX, ~2 MB), `n_threads` pinned to the big cores, and
-mmap'd model loading. Vulkan/NNAPI/QNN acceleration is a later optimisation, not a v1 dependency.
+Current transcription is batch-oriented: the user starts and stops recording, then Whisper decodes
+the captured 16 kHz mono audio. Streaming partials, VAD endpointing, and hardware acceleration are
+future work and must not be described as shipped features.
 
 ### Process architecture
 
 **Run the ASR in a separate process** (`:asr`), bound from the IME via a `Service`.
 
-An `InputMethodService` that holds 300–600 MB of model and inference state is a prime candidate for
-the low-memory killer — and when the IME process dies, the keyboard vanishes mid-sentence. A
+An `InputMethodService` that holds a model and native inference state is a prime candidate for the
+low-memory killer — and when the IME process dies, the keyboard vanishes mid-sentence. A
 separate process lets us load on mic-press, unload aggressively, and survive its death without
 taking the keyboard with it.
 
 ### Gotchas
 
-- **`RECORD_AUDIO` cannot be requested from the keyboard view.** An IME has no Activity, so the
-  runtime permission prompt must be launched from a settings/onboarding Activity. Build this into
-  the setup wizard (J7).
+- **`RECORD_AUDIO` cannot be requested from the keyboard view.** Slide launches its transparent
+  `MicPermissionActivity` for the system prompt, then the IME rechecks the result.
 - Use `MediaRecorder.AudioSource.VOICE_RECOGNITION`, 16 kHz mono PCM — that's what Whisper expects.
-- Models ship as **on-demand downloads**, not bundled in the APK, with SHA-256 verification.
+- The model is bundled in the APK and verified during the build; there is no runtime model fetch.
 - Licensing is clean: Whisper weights are MIT, `whisper.cpp` is MIT.
 
 ---
@@ -175,9 +158,9 @@ taking the keyboard with it.
 | Keyboard surface | Custom `View` + Canvas | Precise touch handling and frame budget; Compose is the wrong tool for a key grid |
 | Settings & panels | Jetpack Compose + Material 3 | Fast to build, dynamic colour for free |
 | ASR runtime | `whisper.cpp` via NDK/CMake + JNI | Mature, quantised, mmap, actively maintained |
-| VAD | Silero VAD (ONNX Runtime Mobile) | |
+| Endpointing | Manual stop plus a recording limit | VAD is not yet implemented |
 | Decoder | Kotlin first, native if profiling demands | |
-| Persistence | Room + DataStore | Clipboard, learned words, settings |
+| Persistence | DataStore + private files | Settings, recent emoji, learned words and phrases |
 | Build | Gradle KTS, version catalog | |
 
 **Module layout**
@@ -186,7 +169,7 @@ taking the keyboard with it.
 :app          setup wizard, settings UI
 :ime          InputMethodService, views, touch, themes
 :engine       gesture decoder, autocorrect, prediction, lexicon
-:asr          Whisper service (separate process), model manager, VAD
+:asr          Whisper service (separate process), recorder, bundled-model transcriber
 :core         design tokens, layout schema, shared types
 ```
 

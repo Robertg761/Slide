@@ -3,7 +3,9 @@ package com.slide.ime.view
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.RectF
+import android.os.Bundle
 import android.util.TypedValue
 import android.view.MotionEvent
 import android.view.VelocityTracker
@@ -11,6 +13,9 @@ import android.view.View
 import android.view.ViewConfiguration
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.OverScroller
+import androidx.core.view.ViewCompat
+import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
+import androidx.customview.widget.ExploreByTouchHelper
 import com.slide.core.emoji.EmojiData
 import com.slide.core.theme.KeyboardTheme
 import com.slide.core.theme.Themes
@@ -183,14 +188,167 @@ class EmojiPanelView(context: Context) : View(context) {
             popupTone = if (skinTone in 0 until EmojiData.TONE_COUNT) skinTone else EmojiData.TONE_DEFAULT
             popupAnchorTone = popupTone
             pressedIndex = -1
+            layoutTonePopup()
+            accessibilityHelper.invalidateRoot()
             performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
             invalidate()
+        }
+    }
+
+    private val accessibilityHelper = object : ExploreByTouchHelper(this) {
+        override fun getVirtualViewAt(x: Float, y: Float): Int {
+            if (popupIndex >= 0 && popupRect.contains(x, y)) {
+                val forms = data?.let(::popupForms).orEmpty()
+                if (forms.isNotEmpty()) {
+                    val slot = ((x - popupRect.left) / (popupRect.width() / forms.size)).toInt()
+                    return A11Y_TONE_BASE + slot.coerceIn(0, forms.lastIndex)
+                }
+            }
+            if (popupIndex >= 0) return INVALID_ID
+            if (y < tabHeight()) {
+                val tab = tabAt(x)
+                return if (tab >= 0) A11Y_TAB_BASE + tab else INVALID_ID
+            }
+            if (y >= height - footerHeight()) {
+                return when {
+                    x < backButtonWidth() -> A11Y_BACK
+                    x >= width - backButtonWidth() -> A11Y_BACKSPACE
+                    else -> INVALID_ID
+                }
+            }
+            val position = positionAt(x, y)
+            return if (position >= 0) A11Y_EMOJI_BASE + position else INVALID_ID
+        }
+
+        override fun getVisibleVirtualViews(virtualViewIds: MutableList<Int>) {
+            if (popupIndex >= 0) {
+                val count = data?.let(::popupForms)?.size ?: 0
+                repeat(count) { virtualViewIds += A11Y_TONE_BASE + it }
+                return
+            }
+            repeat(tabCount()) { virtualViewIds += A11Y_TAB_BASE + it }
+            visiblePositions().forEach { virtualViewIds += A11Y_EMOJI_BASE + it }
+            virtualViewIds += A11Y_BACK
+            virtualViewIds += A11Y_BACKSPACE
+        }
+
+        override fun onPopulateNodeForVirtualView(
+            virtualViewId: Int,
+            node: AccessibilityNodeInfoCompat,
+        ) {
+            node.className = "android.widget.Button"
+            node.isClickable = true
+            node.addAction(AccessibilityNodeInfoCompat.ACTION_CLICK)
+            when {
+                virtualViewId == A11Y_BACK -> {
+                    node.contentDescription = "Back to keyboard"
+                    node.setBoundsInParent(
+                        Rect(0, (height - footerHeight()).toInt(), backButtonWidth().toInt(), height),
+                    )
+                }
+                virtualViewId == A11Y_BACKSPACE -> {
+                    node.contentDescription = "Backspace"
+                    node.setBoundsInParent(
+                        Rect((width - backButtonWidth()).toInt(), (height - footerHeight()).toInt(), width, height),
+                    )
+                }
+                virtualViewId >= A11Y_TONE_BASE -> populateToneNode(virtualViewId, node)
+                virtualViewId >= A11Y_EMOJI_BASE -> populateEmojiNode(virtualViewId, node)
+                else -> populateTabNode(virtualViewId, node)
+            }
+        }
+
+        override fun onPerformActionForVirtualView(
+            virtualViewId: Int,
+            action: Int,
+            arguments: Bundle?,
+        ): Boolean {
+            if (
+                virtualViewId >= A11Y_TONE_BASE &&
+                virtualViewId < A11Y_BACK &&
+                action == AccessibilityNodeInfo.ACTION_DISMISS
+            ) {
+                closeTonePopup()
+                return true
+            }
+            if (virtualViewId >= A11Y_EMOJI_BASE && virtualViewId < A11Y_TONE_BASE) {
+                val position = virtualViewId - A11Y_EMOJI_BASE
+                if (action == AccessibilityNodeInfo.ACTION_LONG_CLICK) return openTonePopup(position)
+                if (action != AccessibilityNodeInfo.ACTION_CLICK) return false
+                val emoji = page().getOrNull(position) ?: return false
+                listener?.onEmojiPicked(emoji)
+                return true
+            }
+            if (action != AccessibilityNodeInfo.ACTION_CLICK) return false
+            return when {
+                virtualViewId == A11Y_BACK -> {
+                    listener?.onEmojiPanelClosed()
+                    true
+                }
+                virtualViewId == A11Y_BACKSPACE -> {
+                    listener?.onEmojiBackspace()
+                    true
+                }
+                virtualViewId >= A11Y_TONE_BASE -> pickAccessibleTone(virtualViewId - A11Y_TONE_BASE)
+                else -> selectAccessibleTab(virtualViewId - A11Y_TAB_BASE)
+            }
+        }
+
+        private fun populateTabNode(id: Int, node: AccessibilityNodeInfoCompat) {
+            val tab = id - A11Y_TAB_BASE
+            node.contentDescription = tabDescription(tab)
+            node.isSelected = tab == selectedTab
+            val tabWidth = width / tabCount().coerceAtLeast(1).toFloat()
+            node.setBoundsInParent(
+                Rect((tab * tabWidth).toInt(), 0, ((tab + 1) * tabWidth).toInt(), tabHeight().toInt()),
+            )
+        }
+
+        private fun populateEmojiNode(id: Int, node: AccessibilityNodeInfoCompat) {
+            val position = id - A11Y_EMOJI_BASE
+            val emoji = page().getOrNull(position).orEmpty()
+            node.contentDescription = "Emoji $emoji"
+            if (data?.hasVariants(entryAt(position)) == true) {
+                node.isLongClickable = true
+                node.addAction(AccessibilityNodeInfoCompat.ACTION_LONG_CLICK)
+            }
+            val cell = cellSize()
+            val row = position / columns()
+            val column = position % columns()
+            val top = gridTop() + row * cell - scrollY
+            node.setBoundsInParent(
+                Rect(
+                    (column * cell).toInt(),
+                    top.coerceAtLeast(gridTop()).toInt(),
+                    ((column + 1) * cell).toInt(),
+                    (top + cell).coerceAtMost(gridTop() + gridHeight()).toInt(),
+                ),
+            )
+        }
+
+        private fun populateToneNode(id: Int, node: AccessibilityNodeInfoCompat) {
+            val index = id - A11Y_TONE_BASE
+            val catalogue = data
+            val forms = catalogue?.let(::popupForms).orEmpty()
+            val emoji = forms.getOrNull(index).orEmpty()
+            node.contentDescription = if (index == 0) "Emoji $emoji, default tone" else "Emoji $emoji, skin tone $index"
+            node.addAction(AccessibilityNodeInfoCompat.ACTION_DISMISS)
+            val slot = popupRect.width() / forms.size.coerceAtLeast(1)
+            node.setBoundsInParent(
+                Rect(
+                    (popupRect.left + index * slot).toInt(),
+                    popupRect.top.toInt(),
+                    (popupRect.left + (index + 1) * slot).toInt(),
+                    popupRect.bottom.toInt(),
+                ),
+            )
         }
     }
 
     init {
         isFocusable = true
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
+        ViewCompat.setAccessibilityDelegate(this, accessibilityHelper)
         refreshAccessibilityDescription()
     }
 
@@ -260,6 +418,71 @@ class EmojiPanelView(context: Context) : View(context) {
     private fun resetScroll() {
         scroller.forceFinished(true)
         scrollY = 0f
+        accessibilityHelper.invalidateRoot()
+    }
+
+    private fun visiblePositions(): IntRange {
+        val entries = page()
+        if (entries.isEmpty() || gridHeight() <= 0f) return IntRange.EMPTY
+        val cell = cellSize()
+        val firstRow = max(0, (scrollY / cell).toInt())
+        val lastRow = min(
+            ceil(entries.size / columns().toFloat()).toInt() - 1,
+            ((scrollY + gridHeight()) / cell).toInt(),
+        )
+        val first = firstRow * columns()
+        val last = min(entries.lastIndex, (lastRow + 1) * columns() - 1)
+        return if (first <= last) first..last else IntRange.EMPTY
+    }
+
+    private fun openTonePopup(position: Int): Boolean {
+        val entry = entryAt(position)
+        val catalogue = data ?: return false
+        if (entry < 0 || !catalogue.hasVariants(entry)) return false
+        popupIndex = entry
+        popupPosition = position
+        popupTone = if (skinTone in 0 until EmojiData.TONE_COUNT) skinTone else EmojiData.TONE_DEFAULT
+        popupAnchorTone = popupTone
+        layoutTonePopup()
+        accessibilityHelper.invalidateRoot()
+        invalidate()
+        return true
+    }
+
+    private fun pickAccessibleTone(index: Int): Boolean {
+        val catalogue = data ?: return false
+        val entry = popupIndex
+        val tone = index - 1
+        if (entry < 0 || tone !in EmojiData.TONE_DEFAULT until EmojiData.TONE_COUNT) return false
+        popupIndex = -1
+        popupPosition = -1
+        listener?.onSkinTonePicked(tone)
+        listener?.onEmojiPicked(catalogue.toned(entry, tone))
+        accessibilityHelper.invalidateRoot()
+        invalidate()
+        return true
+    }
+
+    private fun closeTonePopup() {
+        popupIndex = -1
+        popupPosition = -1
+        popupTone = EmojiData.TONE_DEFAULT
+        accessibilityHelper.invalidateRoot()
+        invalidate()
+    }
+
+    private fun selectAccessibleTab(tab: Int): Boolean {
+        if (tab !in 0 until tabCount()) return false
+        if (tab == searchTab()) {
+            listener?.onEmojiSearchRequested()
+            return true
+        }
+        selectedTab = tab
+        invalidatePage()
+        resetScroll()
+        refreshAccessibilityDescription()
+        invalidate()
+        return true
     }
 
     // endregion
@@ -568,6 +791,7 @@ class EmojiPanelView(context: Context) : View(context) {
             // gesture in a list that the keyboard is sitting on top of.
             scrollY = (scrollY - (event.y - downY)).coerceIn(0f, maxScroll())
             downY = event.y
+            accessibilityHelper.invalidateRoot()
             invalidate()
             return
         }
@@ -675,6 +899,7 @@ class EmojiPanelView(context: Context) : View(context) {
     override fun computeScroll() {
         if (!scroller.computeScrollOffset()) return
         scrollY = scroller.currY.toFloat().coerceIn(0f, maxScroll())
+        accessibilityHelper.invalidateRoot()
         postInvalidateOnAnimation()
     }
 
@@ -732,6 +957,18 @@ class EmojiPanelView(context: Context) : View(context) {
         releaseTracker()
     }
 
+    override fun dispatchHoverEvent(event: MotionEvent): Boolean =
+        accessibilityHelper.dispatchHoverEvent(event) || super.dispatchHoverEvent(event)
+
+    override fun onFocusChanged(
+        gainFocus: Boolean,
+        direction: Int,
+        previouslyFocusedRect: Rect?,
+    ) {
+        super.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
+        accessibilityHelper.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
+    }
+
     /**
      * Returns the picker to how it should look when it opens: top of the page, no popup, and on
      * the recents tab whenever there is anything in it.
@@ -756,6 +993,7 @@ class EmojiPanelView(context: Context) : View(context) {
 
     private fun refreshAccessibilityDescription() {
         contentDescription = accessibilityDescription()
+        accessibilityHelper.invalidateRoot()
     }
 
     private fun tabDescription(tab: Int): String = when {
@@ -801,6 +1039,12 @@ class EmojiPanelView(context: Context) : View(context) {
 
         const val RECENTS_TAB = 0
         const val FIRST_CATEGORY_TAB = 1
+
+        const val A11Y_TAB_BASE = 0
+        const val A11Y_EMOJI_BASE = 1_000
+        const val A11Y_TONE_BASE = 100_000
+        const val A11Y_BACK = 200_000
+        const val A11Y_BACKSPACE = 200_001
 
         const val BACK_LABEL = "ABC"
         const val EMPTY_RECENTS = "Emoji you pick will show up here"

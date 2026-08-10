@@ -1,11 +1,17 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.1] - 2026-08-10
 
 ### Added
 
 - Privacy controls now include a manual Incognito mode and a confirmed **Clear learned data**
   action for both personal words and repeated phrases.
+- Third-party software and language-data notices are packaged in the APK and readable from the
+  settings screen.
+- Slide's first-party source code and documentation are now explicitly licensed under Apache-2.0.
+- Pull requests and `main` now have a JVM-test, lint, and release-packaging workflow. Dependency
+  lockfiles, artifact checksums, pinned Actions, Dependabot, and documented repository controls
+  make dependency and release changes reviewable.
 - The strip offers the next word between words, where it used to sit empty. Continuations come
   from the corpus and from your own repeated phrases, with yours first — measured against held-out
   text, the next word is one tap away about a quarter of the time from the corpus alone. It stays
@@ -50,6 +56,16 @@
 
 ### Changed
 
+- Slide now packages only the 57 MB Base English Whisper model. It was the faster measured option
+  on the test phone, and dropping Small removes about 181 MB from every install and update.
+- The release build now enables code and resource shrinking. The Whisper model remains stored
+  uncompressed so native code can map it directly without allocating a second copy.
+- Release builds are unsigned and unprivileged in Gradle. An approval-gated job signs the exact
+  verified artifact without checking out or running repository code while the key is available,
+  and a separate least-privilege job publishes it.
+- Recent emoji usage now lives under Android's no-backup storage and is migrated out of the legacy
+  settings file. Personal words and phrases remain excluded from backup and device transfer.
+
 - Autocorrect now fires on 87.7% of generated nonword single-edit typos, up from 76.6%, with wrong
   corrections at 0.6%. This benchmark excludes valid-word collisions and final-letter omissions,
   which the keyboard deliberately refuses to rewrite. The confidence margin was measured on a
@@ -67,8 +83,8 @@
   keystroke, so "largee" no longer becomes "larger" or "sidde" "sided". Nothing in that class is
   rewritten to a different word any more, where the corrector previously preferred changing the
   word to un-doubling the key.
-- Backspace deletes on touch-down instead of on release, and its auto-repeat reaches full speed in
-  about a third of the time it used to.
+- Backspace taps commit on release unless key repeat has started, so sliding into delete-word or a
+  selection can cancel the tap cleanly; hold repeat still accelerates quickly.
 - The navigation-bar strip below the keys is painted in the keyboard's own background colour, so
   the keyboard meets the bottom of the screen without a black band and a visible seam.
 - Swipes are reconstructed from every touch sample Android batches into a move event rather than
@@ -78,8 +94,34 @@
 
 ### Fixed
 
+- Voice commands and callbacks now carry a session ID, so a canceled native decode cannot hide,
+  reset, or commit into a replacement dictation session. Binder-failure cleanup is confined to the
+  service main thread, and editor changes still invalidate late transcripts before they can reach a
+  new field.
+- Audio capture now has per-recording ownership and cleanup. The two-minute limit transcribes the
+  captured prefix instead of discarding it, a slow driver cannot leak samples or errors into the
+  next recording, `AudioRecord` is released exactly once, and used PCM buffers are erased after
+  success, cancellation, and failure. Vendor microphone shutdown no longer runs on the service main
+  thread, so its bounded teardown cannot turn into an input-service ANR before the timeout begins.
+- The ASR process closes its native Whisper context when the service is destroyed, can abort an
+  in-flight decode, and converts native allocation failures into ordinary transcription errors.
+  Native libraries now cover all four Android ABIs and use the Armv8.0 baseline instead of
+  unconditionally executing Armv8.2 dot-product instructions.
+- Update selection now compares every eligible GitHub release using complete SemVer precedence,
+  including arbitrarily large numeric identifiers and build metadata, rather than trusting release
+  publication order. Both SemVer and Android's 64-bit version code must increase, and new installs
+  no longer opt into prerelease updates by default.
+- Update downloads now require GitHub's published SHA-256 and asset size, reserve space for both
+  the download and Package Installer staging copy, stop if bytes exceed the published size, and
+  reject short or length-mismatched responses before installation.
+- Release verification now fails if the package, version, signing certificate, model hash,
+  compression method, native ABI set, or pinned Android build-tools version differs from the
+  reviewed contract.
+
 - Password, email, URL, and explicit no-suggestions editors now bypass the entire language path,
   including gesture decoding; sensitive fields can no longer receive a decoded swipe candidate.
+- Date and time editor variations now receive dedicated pads with date separators, time punctuation,
+  and AM/PM keys instead of an unusable digits-only pad.
 - Moving the cursor clears stale prediction candidates and can reopen an earlier word even in
   editors that omit composing bounds. Model readiness can no longer start autocorrect halfway
   through a word, and tapping a candidate keeps the capitalization that was typed.

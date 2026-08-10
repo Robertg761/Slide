@@ -23,16 +23,12 @@ set(GGML_LLAMAFILE OFF CACHE BOOL "" FORCE)
 # It has to be off, or the emitted code targets this laptop rather than the phone.
 set(GGML_NATIVE  OFF CACHE BOOL "" FORCE)
 
-# With GGML_NATIVE off and no arch named, ggml emits no -march at all and the whole library is
-# built for baseline armv8-a. That silently compiles out every dotprod and fp16 kernel path, which
-# is most of the arithmetic in a quantised model, and leaves the scalar fallbacks to do the work.
-#
-# armv8.2-a+dotprod+fp16 is the floor rather than this phone's ceiling: it covers essentially every
-# arm64 Android device since 2018, and the flags select code paths at compile time with no runtime
-# check, so anything named here is a hard requirement on the devices Slide runs on. i8mm and sve are
-# deliberately left out for that reason -- they are recent-flagship-only, and the model is q5_1,
-# which has no i8mm kernel to reach anyway.
-set(GGML_CPU_ARM_ARCH "armv8.2-a+dotprod+fp16" CACHE STRING "" FORCE)
+# Do not set GGML_CPU_ARM_ARCH. Android's arm64-v8a ABI guarantees Armv8.0, while dotprod and fp16
+# vector arithmetic are optional CPU features. The static ggml backend cannot safely select its
+# GGML_CPU_ALL_VARIANTS modules from an APK, so compile its portable baseline instead of making an
+# optional instruction a process-crashing install requirement. Other Android ABIs likewise retain
+# their compiler-defined ABI baseline.
+set(GGML_CPU_ARM_ARCH "" CACHE STRING "" FORCE)
 
 add_subdirectory(${WHISPER_ROOT} ${CMAKE_CURRENT_BINARY_DIR}/whisper.cpp EXCLUDE_FROM_ALL)
 

@@ -4,7 +4,9 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.Rect
 import android.graphics.RectF
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.AttributeSet
@@ -13,6 +15,9 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.accessibility.AccessibilityNodeInfo
+import androidx.core.view.ViewCompat
+import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
+import androidx.customview.widget.ExploreByTouchHelper
 import com.slide.core.layout.Key
 import com.slide.core.layout.KeyType
 import com.slide.core.layout.KeyboardLayout
@@ -29,7 +34,7 @@ import kotlin.math.roundToInt
 
 enum class ShiftState { OFF, SHIFTED, LOCKED }
 
-enum class EnterAction { RETURN, GO, SEARCH, SEND, NEXT, DONE }
+enum class EnterAction { RETURN, GO, SEARCH, SEND, PREVIOUS, NEXT, DONE }
 
 /**
  * The key grid.
@@ -57,8 +62,8 @@ class KeyboardView @JvmOverloads constructor(
          */
         fun onKeyCommit(key: Key, text: String, touchX: Float = Float.NaN, touchY: Float = Float.NaN)
 
-        /** Fired when a swipe completes. The decoder consumes this; see docs/technical-decisions.md. */
-        fun onGestureComplete(points: List<GesturePoint>)
+        /** Returns true only when the swipe produced committed input. */
+        fun onGestureComplete(points: List<GesturePoint>): Boolean
 
         /** Fired while the user slides horizontally across the space bar. */
         fun onCursorMove(steps: Int) = Unit
@@ -73,6 +78,9 @@ class KeyboardView @JvmOverloads constructor(
     }
 
     var listener: Listener? = null
+
+    /** Effective availability, after settings, editor policy, layout and decoder readiness. */
+    var gestureTypingAvailable: Boolean = false
 
     var keyboardTheme: KeyboardTheme = Themes.Light
         set(value) {
@@ -122,10 +130,6 @@ class KeyboardView @JvmOverloads constructor(
         set(value) {
             if (field == value) return
             field = value
-            if (value) {
-                shiftState = ShiftState.OFF
-                keyboardLayout = Layouts.QwertyEn
-            }
             requestLayout()
             if (width > 0 && height > 0) recomputeGeometry(width, height)
             refreshAccessibilityDescription()
@@ -196,16 +200,16 @@ class KeyboardView @JvmOverloads constructor(
     /** State for one active finger. */
     private class Pointer(
         var placed: PlacedKey,
+        val initialPlaced: PlacedKey,
         val downX: Float,
         val downY: Float,
         val downTime: Long,
         var lastX: Float = downX,
         var longPressFired: Boolean = false,
         var repeatFired: Boolean = false,
-        /** Repeatable keys act on touch-down, so the release must not act a second time. */
-        var committedOnDown: Boolean = false,
         var cursorMove: Boolean = false,
         var deleteWordGesture: Boolean = false,
+        var slidOff: Boolean = false,
     )
 
     private val pointers = HashMap<Int, Pointer>()
@@ -223,9 +227,121 @@ class KeyboardView @JvmOverloads constructor(
     private var pressedSearchClose = false
     private var cursorRemainderPx = 0f
 
+    private val accessibilityHelper = object : ExploreByTouchHelper(this) {
+        override fun getVirtualViewAt(x: Float, y: Float): Int {
+            if (searchMode && y < searchHeaderHeight()) {
+                if (searchCloseAt(x, y)) return A11Y_SEARCH_CLOSE
+                val result = searchResultAt(x, y)
+                return if (result >= 0) A11Y_SEARCH_RESULT_BASE + result else INVALID_ID
+            }
+            val index = placedKeys.indexOfFirst { it.contains(x, y) }
+            return if (index >= 0) A11Y_KEY_BASE + index else INVALID_ID
+        }
+
+        override fun getVisibleVirtualViews(virtualViewIds: MutableList<Int>) {
+            placedKeys.indices.forEach { virtualViewIds += A11Y_KEY_BASE + it }
+            if (searchMode) {
+                virtualViewIds += A11Y_SEARCH_CLOSE
+                searchResults.indices.forEach { virtualViewIds += A11Y_SEARCH_RESULT_BASE + it }
+            }
+        }
+
+        override fun onPopulateNodeForVirtualView(
+            virtualViewId: Int,
+            node: AccessibilityNodeInfoCompat,
+        ) {
+            node.className = "android.widget.Button"
+            node.isClickable = true
+            node.addAction(AccessibilityNodeInfoCompat.ACTION_CLICK)
+            when {
+                virtualViewId == A11Y_SEARCH_CLOSE -> {
+                    node.contentDescription = "Close emoji search"
+                    node.setBoundsInParent(
+                        Rect(width - dp(48f).toInt(), 0, width, dp(48f).toInt()),
+                    )
+                }
+                virtualViewId >= A11Y_SEARCH_RESULT_BASE -> {
+                    val index = virtualViewId - A11Y_SEARCH_RESULT_BASE
+                    val emoji = searchResults.getOrNull(index).orEmpty()
+                    node.contentDescription = "Emoji $emoji"
+                    val cellWidth = width / MAX_SEARCH_RESULTS.toFloat()
+                    node.setBoundsInParent(
+                        Rect(
+                            (index * cellWidth).toInt(),
+                            dp(48f).toInt(),
+                            ((index + 1) * cellWidth).toInt(),
+                            searchHeaderHeight().toInt(),
+                        ),
+                    )
+                }
+                else -> {
+                    val index = virtualViewId - A11Y_KEY_BASE
+                    val placed = placedKeys.getOrNull(index)
+                    if (placed == null) {
+                        node.contentDescription = "Unavailable key"
+                        node.setBoundsInParent(Rect(0, 0, 1, 1))
+                        return
+                    }
+                    node.contentDescription = accessibilityLabel(placed.key)
+                    node.setBoundsInParent(
+                        Rect(placed.left.toInt(), placed.top.toInt(), placed.right.toInt(), placed.bottom.toInt()),
+                    )
+                    alternatesFor(placed.key).drop(1)
+                        .take(AlternateAccessibilityActions.size)
+                        .forEachIndexed { alternateIndex, alternate ->
+                        val actionId = AlternateAccessibilityActions.idAt(alternateIndex) ?: return@forEachIndexed
+                        node.addAction(
+                            AccessibilityNodeInfoCompat.AccessibilityActionCompat(
+                                actionId,
+                                "Type $alternate",
+                            ),
+                        )
+                    }
+                    if (placed.key.type == KeyType.SHIFT) {
+                        node.isCheckable = true
+                        node.isChecked = shiftState != ShiftState.OFF
+                    }
+                }
+            }
+        }
+
+        override fun onPerformActionForVirtualView(
+            virtualViewId: Int,
+            action: Int,
+            arguments: Bundle?,
+        ): Boolean {
+            val alternateIndex = AlternateAccessibilityActions.indexOf(action)
+            if (alternateIndex >= 0) {
+                val placed = placedKeys.getOrNull(virtualViewId - A11Y_KEY_BASE) ?: return false
+                val alternate = alternatesFor(placed.key)
+                    .drop(1)
+                    .getOrNull(alternateIndex) ?: return false
+                listener?.onKeyDown(placed.key)
+                listener?.onKeyCommit(placed.key, alternate)
+                return true
+            }
+            if (action != AccessibilityNodeInfo.ACTION_CLICK) return false
+            when {
+                virtualViewId == A11Y_SEARCH_CLOSE -> listener?.onSearchClosed()
+                virtualViewId >= A11Y_SEARCH_RESULT_BASE -> {
+                    val index = virtualViewId - A11Y_SEARCH_RESULT_BASE
+                    val emoji = searchResults.getOrNull(index) ?: return false
+                    listener?.onSearchEmojiPicked(emoji)
+                }
+                else -> {
+                    val placed = placedKeys.getOrNull(virtualViewId - A11Y_KEY_BASE) ?: return false
+                    listener?.onKeyDown(placed.key)
+                    listener?.onKeyCommit(placed.key, outputFor(placed.key))
+                }
+            }
+            return true
+        }
+    }
+
     init {
         isFocusable = true
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
+        ViewCompat.setAccessibilityDelegate(this, accessibilityHelper)
         refreshAccessibilityDescription()
     }
 
@@ -244,13 +360,15 @@ class KeyboardView @JvmOverloads constructor(
         val effective = Layouts.withNumberRow(keyboardLayout, settings.showNumberRow)
         val rowUnits = effective.rows.sumOf { it.heightWeight.toDouble() }.toFloat()
         val contentHeight = rowUnits * baseRowHeight * settings.keyHeightScale
-        val height = topPadding + contentHeight + bottomInset()
+        val header = if (searchMode) searchHeaderHeight() else 0f
+        val height = topPadding + header + contentHeight + bottomInset()
         setMeasuredDimension(width, height.roundToInt())
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         recomputeGeometry(w, h)
+        accessibilityHelper.invalidateRoot()
     }
 
     private fun recomputeGeometry(width: Int, height: Int) {
@@ -263,6 +381,7 @@ class KeyboardView @JvmOverloads constructor(
             contentHeight = contentHeight,
             topOffset = topPadding + header,
         )
+        accessibilityHelper.invalidateRoot()
     }
 
     override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
@@ -421,6 +540,11 @@ class KeyboardView @JvmOverloads constructor(
                 canvas.drawLine(x+r*.62f, y, x+r*.18f, y-r*.42f, labelPaint)
                 canvas.drawLine(x+r*.62f, y, x+r*.18f, y+r*.42f, labelPaint)
             }
+            EnterAction.PREVIOUS -> {
+                canvas.drawLine(x+r*.8f, y, x-r*.62f, y, labelPaint)
+                canvas.drawLine(x-r*.62f, y, x-r*.18f, y-r*.42f, labelPaint)
+                canvas.drawLine(x-r*.62f, y, x-r*.18f, y+r*.42f, labelPaint)
+            }
             EnterAction.DONE -> {
                 canvas.drawLine(x-r*.75f, y, x-r*.15f, y+r*.5f, labelPaint)
                 canvas.drawLine(x-r*.15f, y+r*.5f, x+r*.82f, y-r*.58f, labelPaint)
@@ -481,7 +605,12 @@ class KeyboardView @JvmOverloads constructor(
 
     /** The text a key commits, accounting for shift. */
     private fun outputFor(key: Key): String =
-        if (key.type == KeyType.CHARACTER && shiftState != ShiftState.OFF) {
+        if (
+            key.type == KeyType.CHARACTER &&
+            key.outputText.codePointCount(0, key.outputText.length) == 1 &&
+            key.outputText.firstOrNull()?.isLetter() == true &&
+            shiftState != ShiftState.OFF
+        ) {
             key.outputText.uppercase()
         } else {
             key.outputText
@@ -491,7 +620,7 @@ class KeyboardView @JvmOverloads constructor(
 
     // region Emoji search
 
-    private fun searchHeaderHeight(): Float = dp(68f)
+    private fun searchHeaderHeight(): Float = dp(SEARCH_HEADER_DP)
 
     private fun drawSearchHeader(canvas: Canvas) {
         val header = searchHeaderHeight()
@@ -503,13 +632,18 @@ class KeyboardView @JvmOverloads constructor(
         labelPaint.typeface = android.graphics.Typeface.DEFAULT
         labelPaint.textAlign = Paint.Align.LEFT
         val query = if (searchQuery.isEmpty()) "Search emoji" else searchQuery
-        canvas.drawText(query, dp(16f), dp(24f), labelPaint)
+        val queryBaseline = dp(29f)
+        canvas.drawText(query, dp(16f), queryBaseline, labelPaint)
 
         val closeSize = dp(48f)
         labelPaint.textAlign = Paint.Align.CENTER
         labelPaint.color = keyboardTheme.specialKeyText
         labelPaint.textSize = sp(25f)
-        canvas.drawText("×", width - closeSize / 2f, dp(25f), labelPaint)
+        canvas.drawText("×", width - closeSize / 2f, dp(30f), labelPaint)
+
+        linePaint.color = keyboardTheme.divider
+        linePaint.strokeWidth = dp(1f)
+        canvas.drawLine(0f, dp(48f), width.toFloat(), dp(48f), linePaint)
 
         linePaint.color = keyboardTheme.divider
         linePaint.strokeWidth = dp(1f)
@@ -522,14 +656,14 @@ class KeyboardView @JvmOverloads constructor(
             canvas.drawText(
                 if (searchQuery.isBlank()) "Type a word to search" else "No matching emoji",
                 width / 2f,
-                header - dp(18f),
+                dp(76f),
                 labelPaint,
             )
             return
         }
 
         emojiPaint.textSize = min(sp(25f), dp(34f))
-        val rowTop = header - dp(42f)
+        val rowTop = dp(48f)
         val cellWidth = width / MAX_SEARCH_RESULTS.toFloat()
         results.forEachIndexed { index, emoji ->
             if (index == pressedSearchResult) {
@@ -541,13 +675,13 @@ class KeyboardView @JvmOverloads constructor(
                 )
             }
             val metrics = emojiPaint.fontMetrics
-            canvas.drawText(emoji, index * cellWidth + cellWidth / 2f, rowTop + dp(21f) - (metrics.ascent + metrics.descent) / 2f, emojiPaint)
+            canvas.drawText(emoji, index * cellWidth + cellWidth / 2f, rowTop + dp(24f) - (metrics.ascent + metrics.descent) / 2f, emojiPaint)
         }
     }
 
     private fun searchResultAt(x: Float, y: Float): Int {
         val header = searchHeaderHeight()
-        if (y < header - dp(44f) || y >= header) return -1
+        if (y < dp(48f) || y >= header) return -1
         val index = (x / (width / MAX_SEARCH_RESULTS.toFloat())).toInt()
         return index.takeIf { it in searchResults.indices } ?: -1
     }
@@ -611,7 +745,7 @@ class KeyboardView @JvmOverloads constructor(
                     // Replayed for a pointer that could still become a gesture as well as one that
                     // already is, so the run-up between touch-down and the slop threshold is not
                     // the one stretch of the swipe that gets thrown away.
-                    if (gesturePointerId == pointerId || (settings.gestureTypingEnabled && pointers.size == 1)) {
+                    if (gesturePointerId == pointerId || (gestureTypingAvailable && pointers.size == 1)) {
                         for (h in 0 until event.historySize) {
                             handlePointerMove(
                                 pointerId,
@@ -636,7 +770,7 @@ class KeyboardView @JvmOverloads constructor(
 
     private fun handlePointerDown(pointerId: Int, x: Float, y: Float) {
         val placed = KeyGeometry.hitTest(placedKeys, x, y) ?: return
-        val pointer = Pointer(placed, x, y, System.currentTimeMillis())
+        val pointer = Pointer(placed, placed, x, y, System.currentTimeMillis())
         pointers[pointerId] = pointer
         cursorRemainderPx = 0f
 
@@ -644,13 +778,8 @@ class KeyboardView @JvmOverloads constructor(
         showPreviewFor(placed)
         scheduleLongPress(pointerId, placed)
 
-        // A repeatable key — backspace — acts the moment it is touched rather than on release.
-        // Waiting for the lift puts the whole press duration between the tap and the character
-        // disappearing, which is what makes deleting feel sluggish however fast the repeat is.
-        if (placed.key.repeatable) {
-            pointer.committedOnDown = true
-            listener?.onKeyCommit(placed.key, placed.key.outputText)
-        }
+        // Backspace commits on release unless repeat has begun. This preserves the user's selection
+        // while they decide whether the press is a tap, a hold, or the delete-word swipe.
         scheduleRepeat(pointerId, placed)
         invalidate()
     }
@@ -706,7 +835,7 @@ class KeyboardView @JvmOverloads constructor(
         }
 
         // A swipe that starts on a letter key becomes a gesture; anything else stays a key press.
-        if (settings.gestureTypingEnabled &&
+        if (gestureTypingAvailable &&
             gesturePointerId == null &&
             pointers.size == 1 &&
             !pointer.longPressFired &&
@@ -732,9 +861,7 @@ class KeyboardView @JvmOverloads constructor(
                 cancelPendingLongPress()
                 cancelRepeat()
                 pointer.placed = nowOver
-                // Sliding off is how a mis-hit gets corrected, so the key landed on still has to
-                // commit on release even though the key left behind already acted on touch-down.
-                pointer.committedOnDown = false
+                pointer.slidOff = true
                 showPreviewFor(nowOver)
                 invalidate()
             }
@@ -775,16 +902,14 @@ class KeyboardView @JvmOverloads constructor(
             }
         }
 
-        // A press that already acted — a repeatable key handled on touch-down, an auto-repeat that
-        // fired, or an alternates popup dismissed without a selection — must not commit the key a
-        // second time on release.
-        if (!pointer.longPressFired && !pointer.repeatFired && !pointer.committedOnDown) {
+        // A press whose auto-repeat fired must not commit the key a second time on release.
+        if (!pointer.longPressFired && !pointer.repeatFired) {
             announceForAccessibility(accessibilityLabel(pointer.placed.key))
             listener?.onKeyCommit(
                 pointer.placed.key,
                 outputFor(pointer.placed.key),
-                pointer.downX,
-                pointer.downY,
+                if (pointer.slidOff) x else pointer.downX,
+                if (pointer.slidOff) y else pointer.downY,
             )
         }
         invalidate()
@@ -898,12 +1023,11 @@ class KeyboardView @JvmOverloads constructor(
 
         val decodable = points.size >= MIN_GESTURE_POINTS &&
             pathLength(points) >= pointer.placed.width * MIN_GESTURE_PATH_FACTOR
-        if (decodable) {
-            listener?.onGestureComplete(points)
-        } else {
+        val committed = decodable && listener?.onGestureComplete(points) == true
+        if (!committed) {
             listener?.onKeyCommit(
-                pointer.placed.key,
-                outputFor(pointer.placed.key),
+                pointer.initialPlaced.key,
+                outputFor(pointer.initialPlaced.key),
                 pointer.downX,
                 pointer.downY,
             )
@@ -930,6 +1054,18 @@ class KeyboardView @JvmOverloads constructor(
         cancelAllPointers()
     }
 
+    override fun dispatchHoverEvent(event: MotionEvent): Boolean =
+        accessibilityHelper.dispatchHoverEvent(event) || super.dispatchHoverEvent(event)
+
+    override fun onFocusChanged(
+        gainFocus: Boolean,
+        direction: Int,
+        previouslyFocusedRect: Rect?,
+    ) {
+        super.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
+        accessibilityHelper.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
+    }
+
     override fun onInitializeAccessibilityNodeInfo(info: AccessibilityNodeInfo) {
         super.onInitializeAccessibilityNodeInfo(info)
         info.className = "android.inputmethodservice.KeyboardView"
@@ -939,6 +1075,7 @@ class KeyboardView @JvmOverloads constructor(
 
     private fun refreshAccessibilityDescription() {
         contentDescription = accessibilityDescription()
+        accessibilityHelper.invalidateRoot()
     }
 
     private fun accessibilityDescription(): String {
@@ -989,11 +1126,15 @@ class KeyboardView @JvmOverloads constructor(
         const val MIN_GESTURE_PATH_FACTOR = 0.9f
         const val GESTURE_SLOP_FACTOR = 1.4f
         const val MAX_SEARCH_RESULTS = 6
+        const val SEARCH_HEADER_DP = 96f
+        const val A11Y_KEY_BASE = 0
+        const val A11Y_SEARCH_RESULT_BASE = 10_000
+        const val A11Y_SEARCH_CLOSE = 20_000
         /**
          * Auto-repeat pacing for backspace.
          *
-         * The first delete has already happened on touch-down, so this is the pause before the key
-         * starts running, and it has to be long enough that an ordinary tap never repeats. From
+         * This is the pause before the key starts running, and it has to be long enough that an
+         * ordinary tap never repeats. From
          * there it ramps hard: holding backspace is nearly always an intent to clear a whole
          * phrase, and the old ramp needed a dozen deletes and over a second and a half to reach
          * full speed, which is most of a short sentence spent waiting.

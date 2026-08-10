@@ -6,154 +6,296 @@ on:
       - "v*.*.*"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      version_code: ${{ steps.metadata.outputs.version_code }}
+      prerelease: ${{ steps.metadata.outputs.prerelease }}
     steps:
-      - name: Check out the tagged commit
+      - name: Check out the tagged commit without credentials
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Java
         uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v4
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
 
-      - name: Resolve native cache key
-        id: native-cache-key
+      - name: Install pinned Android toolchain
         shell: bash
         run: |
-          set -euo pipefail
-          echo "ndk=28.2.13676358" >> "$GITHUB_OUTPUT"
-          echo "cmake=3.22.1" >> "$GITHUB_OUTPUT"
+          set -eu
+          yes | sdkmanager \
+            "platforms;android-37" \
+            "build-tools;36.0.0" \
+            "ndk;28.2.13676358" \
+            "cmake;3.22.1" >/dev/null
 
-      - name: Restore native CMake intermediates
-        id: native-cache
-        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4
-        with:
-          path: |
-            asr/.cxx
-            asr/build/intermediates/cxx
-          key: native-cmake-${{ runner.os }}-ndk${{ steps.native-cache-key.outputs.ndk }}-cmake${{ steps.native-cache-key.outputs.cmake }}-${{ hashFiles('asr/src/main/cpp/**', 'third_party/whisper.cpp/**', '**/build.gradle.kts', 'gradle/**', 'gradle.properties') }}
-
-      - name: Validate release metadata
+      - name: Validate immutable release metadata
         id: metadata
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Expected a SemVer tag such as v0.1.0-alpha.1; got $RELEASE_TAG" >&2
+          semver='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+)(\.[0-9A-Za-z-]+)*)?(\+([0-9A-Za-z-]+)(\.[0-9A-Za-z-]+)*)?'
+          if [[ ! "$RELEASE_TAG" =~ ^v${semver}$ ]]; then
+            echo "Expected a complete SemVer tag such as v0.2.1 or v0.2.1-alpha.1; got $RELEASE_TAG" >&2
             exit 1
           fi
           version="${RELEASE_TAG#v}"
+          precedence="${version%%+*}"
+          if [[ "$precedence" == *-* ]]; then
+            prerelease_ids="${precedence#*-}"
+            IFS='.' read -ra identifiers <<< "$prerelease_ids"
+            for identifier in "${identifiers[@]}"; do
+              if [[ "$identifier" =~ ^[0-9]+$ && "$identifier" =~ ^0[0-9]+$ ]]; then
+                echo "Numeric prerelease identifiers must not have leading zeroes: $identifier" >&2
+                exit 1
+              fi
+            done
+          fi
           gradle_version="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)"/\1/p' app/build.gradle.kts)"
-          if [ "$gradle_version" != "$version" ]; then
+          version_code="$(sed -nE 's/^[[:space:]]*versionCode[[:space:]]*=[[:space:]]*([0-9]+)/\1/p' app/build.gradle.kts)"
+          [[ "$gradle_version" == "$version" ]] || {
             echo "Tag $RELEASE_TAG does not match app versionName $gradle_version" >&2
             exit 1
-          fi
-          git fetch origin main --depth=1
-          if [ "$(git rev-parse "$GITHUB_SHA")" != "$(git rev-parse origin/main)" ]; then
+          }
+          [[ "$version_code" =~ ^[1-9][0-9]*$ ]] || {
+            echo "versionCode must be a positive integer; got $version_code" >&2
+            exit 1
+          }
+          git fetch --no-tags origin main --depth=1
+          [[ "$(git rev-parse "$GITHUB_SHA")" == "$(git rev-parse FETCH_HEAD)" ]] || {
             echo "Release tag must point to the current main HEAD." >&2
             exit 1
-          fi
+          }
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if [[ "$version" == *-* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
+          echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
+          if [[ "$precedence" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Run unit tests and compile the app
+      - name: Verify monotonic release version history
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+          VERSION_CODE: ${{ steps.metadata.outputs.version_code }}
+        run: bash tools/verify_version_history.sh "$VERSION" "$VERSION_CODE"
+
+      - name: Test release metadata scripts
+        run: bash tools/test_release_scripts.sh
+
+      - name: Fetch and verify the pinned speech model
+        run: bash tools/fetch_model.sh base.en-q5_1
+
+      - name: Run all JVM tests and release lint
         run: >-
-          ./gradlew --no-daemon
+          ./gradlew --no-daemon --no-build-cache --no-configuration-cache
           :core:testDebugUnitTest
           :engine:testDebugUnitTest
+          :asr:testDebugUnitTest
           :ime:testDebugUnitTest
-          :app:compileDebugKotlin
+          :app:testDebugUnitTest
+          :app:lintRelease
 
-      - name: Verify signing secrets
-        env:
-          KEYSTORE_B64: ${{ secrets.SLIDE_KEYSTORE_B64 }}
-          STORE_PASSWORD: ${{ secrets.SLIDE_SIGNING_STORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.SLIDE_SIGNING_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.SLIDE_SIGNING_KEY_PASSWORD }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          for name in KEYSTORE_B64 STORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
-            if [ -z "${!name:-}" ]; then echo "Missing required secret: SLIDE_${name#KEYSTORE_}" >&2; exit 1; fi
-          done
-
-      - name: Fetch speech models
-        run: |
-          bash tools/fetch_model.sh base.en-q5_1
-          bash tools/fetch_model.sh small.en-q5_1
-
-      - name: Decode signing key
-        env:
-          KEYSTORE_B64: ${{ secrets.SLIDE_KEYSTORE_B64 }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          key_path="$RUNNER_TEMP/slide-release.jks"
-          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$key_path"
-          echo "SLIDE_SIGNING_STORE_FILE=$key_path" >> "$GITHUB_ENV"
-          echo "SLIDE_SIGNING_STORE_TYPE=PKCS12" >> "$GITHUB_ENV"
-
-      - name: Build signed release APK
-        env:
-          SLIDE_SIGNING_STORE_PASSWORD: ${{ secrets.SLIDE_SIGNING_STORE_PASSWORD }}
-          SLIDE_SIGNING_KEY_ALIAS: ${{ secrets.SLIDE_SIGNING_KEY_ALIAS }}
-          SLIDE_SIGNING_KEY_PASSWORD: ${{ secrets.SLIDE_SIGNING_KEY_PASSWORD }}
-        run: ./gradlew --no-daemon --configuration-cache :app:assembleRelease
-
-      - name: Save native CMake intermediates
-        if: ${{ success() && steps.native-cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4
-        with:
-          path: |
-            asr/.cxx
-            asr/build/intermediates/cxx
-          key: ${{ steps.native-cache.outputs.cache-primary-key }}
-
-      - name: Prepare release files
-        id: dist
+      - name: Build unsigned release twice reproducibly
         env:
           VERSION: ${{ steps.metadata.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir dist
-          apk="$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' -print -quit)"
-          [ -n "$apk" ] || { echo "Release APK was not found." >&2; exit 1; }
-          output="dist/Slide-${VERSION}.apk"
-          cp "$apk" "$output"
-          awk -v version="$VERSION" '
-            $0 ~ "^## \\[" version "\\]" { found=1 }
-            found { print }
-            found && NR > 1 && $0 ~ "^## \\[" && $0 !~ "^## \\[" version "\\]" { exit }
-          ' CHANGELOG.md > dist/release-notes.md
-          [ -s dist/release-notes.md ] || { echo "No CHANGELOG section found for $VERSION" >&2; exit 1; }
-          echo "apk=$output" >> "$GITHUB_OUTPUT"
+          ./gradlew --no-daemon --no-build-cache --no-configuration-cache clean :app:assembleRelease
+          first="$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' -print -quit)"
+          [[ -n "$first" ]] || { echo "First release APK was not found." >&2; exit 1; }
+          cp "$first" "$RUNNER_TEMP/Slide-first.apk"
+          ./gradlew --no-daemon --no-build-cache --no-configuration-cache clean :app:assembleRelease
+          second="$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' -print -quit)"
+          [[ -n "$second" ]] || { echo "Second release APK was not found." >&2; exit 1; }
+          cmp --silent "$RUNNER_TEMP/Slide-first.apk" "$second" || {
+            sha256sum "$RUNNER_TEMP/Slide-first.apk" "$second" >&2
+            echo "Two clean unsigned builds were not byte-for-byte reproducible." >&2
+            exit 1
+          }
+          mkdir -p dist
+          cp "$second" "dist/Slide-${VERSION}-unsigned.apk"
 
-      - name: Create GitHub release
+      - name: Verify unsigned APK package, model, compression, and ABIs
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+          VERSION_CODE: ${{ steps.metadata.outputs.version_code }}
+        run: >-
+          bash tools/verify_release_apk.sh
+          "dist/Slide-${VERSION}-unsigned.apk"
+          "$VERSION"
+          "$VERSION_CODE"
+          unsigned
+
+      - name: Extract this version's release notes
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: bash tools/extract_release_notes.sh "$VERSION" CHANGELOG.md > dist/release-notes.md
+
+      - name: Include verification tooling in the approval artifact
+        run: cp tools/verify_release_apk.sh dist/verify_release_apk.sh
+
+      - name: Upload unprivileged build for approval-gated signing
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unsigned-release-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  sign:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      apk_sha256: ${{ steps.digest.outputs.apk_sha256 }}
+    steps:
+      - name: Download the exact unprivileged build
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: unsigned-release-${{ github.sha }}
+          path: input
+
+      - name: Install trusted Android signing tools
+        shell: bash
+        run: |
+          set -eu
+          yes | sdkmanager "build-tools;36.0.0" >/dev/null
+
+      - name: Sign without checking out or executing repository code
+        env:
+          KEYSTORE_B64: ${{ secrets.SLIDE_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.SLIDE_SIGNING_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SLIDE_SIGNING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.SLIDE_SIGNING_KEY_PASSWORD }}
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          for name in KEYSTORE_B64 STORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            [[ -n "${!name:-}" ]] || { echo "Missing required release secret: $name" >&2; exit 1; }
+          done
+          key_path="$RUNNER_TEMP/slide-release.p12"
+          trap 'rm -f "$key_path"' EXIT
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$key_path"
+          mkdir -p dist
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" sign \
+            --ks "$key_path" \
+            --ks-type PKCS12 \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:STORE_PASSWORD \
+            --key-pass env:KEY_PASSWORD \
+            --out "dist/Slide-${VERSION}.apk" \
+            "input/Slide-${VERSION}-unsigned.apk"
+          rm -f "$key_path"
+          trap - EXIT
+
+      - name: Verify final APK after signing secrets and key are gone
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          VERSION_CODE: ${{ needs.build.outputs.version_code }}
+          RELEASE_CERT_SHA256: bdf83aa0644badcfacb76f34bffa1c6aa302bfde39769f25e117ac5d5cf5b67e
+        run: >-
+          bash input/verify_release_apk.sh
+          "dist/Slide-${VERSION}.apk"
+          "$VERSION"
+          "$VERSION_CODE"
+          "$RELEASE_CERT_SHA256"
+
+      - name: Record final artifact digest
+        id: digest
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(sha256sum "dist/Slide-${VERSION}.apk" | awk '{print $1}')"
+          echo "apk_sha256=$digest" >> "$GITHUB_OUTPUT"
+          cp input/release-notes.md dist/release-notes.md
+
+      - name: Upload signed release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signed-release-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [build, sign]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download the verified signed artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: signed-release-${{ github.sha }}
+          path: dist
+
+      - name: Recheck artifact identity
+        env:
+          EXPECTED_SHA256: ${{ needs.sign.outputs.apk_sha256 }}
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: echo "$EXPECTED_SHA256  dist/Slide-${VERSION}.apk" | sha256sum --check --strict
+
+      - name: Refuse to mutate an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          status="$(curl --silent --show-error --output "$RUNNER_TEMP/release-lookup.json" \
+            --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")"
+          case "$status" in
+            404) ;;
+            200)
+              echo "Release $RELEASE_TAG already exists; releases are immutable." >&2
+              exit 1
+              ;;
+            *)
+              echo "Could not establish whether release $RELEASE_TAG exists (HTTP $status)." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: ${{ github.ref_name }}
           body_path: dist/release-notes.md
-          files: ${{ steps.dist.outputs.apk }}
-          prerelease: ${{ steps.metadata.outputs.prerelease == 'true' }}
-
-      - name: Upload workflow artifact
-        if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: Slide-${{ steps.metadata.outputs.version }}
-          path: dist/*
+          files: dist/Slide-${{ needs.build.outputs.version }}.apk
+          prerelease: ${{ needs.build.outputs.prerelease == 'true' }}
+          fail_on_unmatched_files: true

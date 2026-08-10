@@ -11,44 +11,25 @@ android {
         applicationId = "com.slide"
         minSdk = 26
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.2.0"
-    }
-
-    val signingStoreFile = providers.environmentVariable("SLIDE_SIGNING_STORE_FILE").orNull
-    val signingStorePassword = providers.environmentVariable("SLIDE_SIGNING_STORE_PASSWORD").orNull
-    val signingKeyAlias = providers.environmentVariable("SLIDE_SIGNING_KEY_ALIAS").orNull
-    val signingKeyPassword = providers.environmentVariable("SLIDE_SIGNING_KEY_PASSWORD").orNull
-    val signingStoreType = providers.environmentVariable("SLIDE_SIGNING_STORE_TYPE").orNull
-    val hasReleaseSigning = listOf(
-        signingStoreFile,
-        signingStorePassword,
-        signingKeyAlias,
-        signingKeyPassword,
-    ).all { !it.isNullOrBlank() }
-
-    signingConfigs {
-        if (hasReleaseSigning) {
-            create("release") {
-                storeFile = file(signingStoreFile!!)
-                storePassword = signingStorePassword
-                keyAlias = signingKeyAlias
-                keyPassword = signingKeyPassword
-                if (!signingStoreType.isNullOrBlank()) {
-                    storeType = signingStoreType
-                }
-            }
-        }
+        versionCode = 8
+        versionName = "0.2.1"
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // Release signing is deliberately outside Gradle. CI builds this unsigned artifact in
+            // an unprivileged job; a separate approval-gated job signs it without checking out or
+            // executing repository code while the keystore is available.
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            if (hasReleaseSigning) {
-                signingConfig = signingConfigs.getByName("release")
-            }
         }
+    }
+
+    androidResources {
+        // Library noCompress declarations do not propagate into the final application APK. Whisper
+        // maps this asset directly, so the application must make the packaging rule itself.
+        noCompress += "bin"
     }
 
     compileOptions {

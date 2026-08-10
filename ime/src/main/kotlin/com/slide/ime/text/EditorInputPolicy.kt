@@ -13,25 +13,46 @@ internal data class EditorInputPolicy(
     val allowsSuggestions: Boolean,
     val allowsPersonalizedLearning: Boolean,
     val isPassword: Boolean,
+    val allowsVoice: Boolean,
+    val keyboardMode: EditorKeyboardMode,
 ) {
     companion object {
         val NaturalText = EditorInputPolicy(
             allowsSuggestions = true,
             allowsPersonalizedLearning = true,
             isPassword = false,
+            allowsVoice = true,
+            keyboardMode = EditorKeyboardMode.TEXT,
         )
 
         fun from(inputType: Int): EditorInputPolicy {
             val inputClass = inputType and InputType.TYPE_MASK_CLASS
             if (inputClass == InputType.TYPE_CLASS_NUMBER) {
                 val variation = inputType and InputType.TYPE_MASK_VARIATION
-                return if (variation == InputType.TYPE_NUMBER_VARIATION_PASSWORD) {
-                    Password
-                } else {
-                    Suppressed
-                }
+                if (variation == InputType.TYPE_NUMBER_VARIATION_PASSWORD) return NumberPassword
+                val signed = (inputType and InputType.TYPE_NUMBER_FLAG_SIGNED) != 0
+                val decimal = (inputType and InputType.TYPE_NUMBER_FLAG_DECIMAL) != 0
+                return suppressed(
+                    when {
+                        signed && decimal -> EditorKeyboardMode.SIGNED_DECIMAL_NUMBER
+                        signed -> EditorKeyboardMode.SIGNED_NUMBER
+                        decimal -> EditorKeyboardMode.DECIMAL_NUMBER
+                        else -> EditorKeyboardMode.NUMBER
+                    },
+                )
             }
-            if (inputClass != InputType.TYPE_CLASS_TEXT) return Suppressed
+            if (inputClass == InputType.TYPE_CLASS_PHONE) return suppressed(EditorKeyboardMode.PHONE)
+            if (inputClass == InputType.TYPE_CLASS_DATETIME) {
+                val mode = when (inputType and InputType.TYPE_MASK_VARIATION) {
+                    InputType.TYPE_DATETIME_VARIATION_DATE -> EditorKeyboardMode.DATE
+                    InputType.TYPE_DATETIME_VARIATION_TIME -> EditorKeyboardMode.TIME
+                    else -> EditorKeyboardMode.DATETIME
+                }
+                return suppressed(mode)
+            }
+            if (inputClass != InputType.TYPE_CLASS_TEXT) {
+                return suppressed(EditorKeyboardMode.TEXT, allowsVoice = false)
+            }
 
             val variation = inputType and InputType.TYPE_MASK_VARIATION
             val password = variation == InputType.TYPE_TEXT_VARIATION_PASSWORD ||
@@ -48,19 +69,50 @@ internal data class EditorInputPolicy(
                 variation == InputType.TYPE_TEXT_VARIATION_FILTER ||
                 variation == InputType.TYPE_TEXT_VARIATION_PHONETIC
 
-            return if (editorRejectsCandidates || nonNaturalVariation) Suppressed else NaturalText
+            val mode = when (variation) {
+                InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS,
+                InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS -> EditorKeyboardMode.EMAIL
+                InputType.TYPE_TEXT_VARIATION_URI -> EditorKeyboardMode.URI
+                else -> EditorKeyboardMode.TEXT
+            }
+
+            return if (editorRejectsCandidates || nonNaturalVariation) suppressed(mode) else NaturalText
         }
 
         private val Password = EditorInputPolicy(
             allowsSuggestions = false,
             allowsPersonalizedLearning = false,
             isPassword = true,
+            allowsVoice = false,
+            keyboardMode = EditorKeyboardMode.TEXT,
         )
 
-        private val Suppressed = EditorInputPolicy(
+        private val NumberPassword = Password.copy(keyboardMode = EditorKeyboardMode.PIN)
+
+        private fun suppressed(
+            mode: EditorKeyboardMode,
+            allowsVoice: Boolean = mode == EditorKeyboardMode.TEXT,
+        ) = EditorInputPolicy(
             allowsSuggestions = false,
             allowsPersonalizedLearning = false,
             isPassword = false,
+            allowsVoice = allowsVoice,
+            keyboardMode = mode,
         )
     }
+}
+
+internal enum class EditorKeyboardMode {
+    TEXT,
+    EMAIL,
+    URI,
+    NUMBER,
+    SIGNED_NUMBER,
+    DECIMAL_NUMBER,
+    SIGNED_DECIMAL_NUMBER,
+    PIN,
+    PHONE,
+    DATE,
+    TIME,
+    DATETIME,
 }

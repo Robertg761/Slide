@@ -50,6 +50,7 @@ object Layouts {
         id = "qwerty_en",
         label = "QWERTY",
         languageTag = "en",
+        supportsNumberRow = true,
         rows = listOf(
             KeyRow(
                 listOf(
@@ -94,6 +95,158 @@ object Layouts {
                 ),
             ),
             KeyRow(listOf(toSymbols, emoji, space, period, enter)),
+        ),
+    )
+
+    /** QWERTY with the characters people need most often in an email address. */
+    val EmailEn = QwertyEn.copy(
+        id = "email_en",
+        label = "Email",
+        rows = QwertyEn.rows.dropLast(1) + KeyRow(
+            listOf(
+                toSymbols,
+                sym("@"),
+                Key(" ", KeyType.SPACE, output = " ", widthWeight = 3.5f, gestureEligible = false),
+                period,
+                Key(".com", KeyType.CHARACTER, output = ".com", widthWeight = 1.5f, gestureEligible = false),
+                enter,
+            ),
+        ),
+    )
+
+    /** QWERTY with URL delimiters on the primary layer. */
+    val UriEn = QwertyEn.copy(
+        id = "uri_en",
+        label = "URL",
+        rows = QwertyEn.rows.dropLast(1) + KeyRow(
+            listOf(
+                toSymbols,
+                sym("/"),
+                Key(" ", KeyType.SPACE, output = " ", widthWeight = 3.5f, gestureEligible = false),
+                period,
+                Key(".com", KeyType.CHARACTER, output = ".com", widthWeight = 1.5f, gestureEligible = false),
+                enter,
+            ),
+        ),
+    )
+
+    private fun digit(value: String, alternates: List<String> = emptyList()) =
+        Key(value, KeyType.CHARACTER, alternates = alternates, gestureEligible = false)
+
+    private fun digitRows(rowGap: Float = 0.5f): List<KeyRow> = listOf(
+        KeyRow(listOf(digit("1"), digit("2"), digit("3")), rowGap, rowGap),
+        KeyRow(listOf(digit("4"), digit("5"), digit("6")), rowGap, rowGap),
+        KeyRow(listOf(digit("7"), digit("8"), digit("9")), rowGap, rowGap),
+    )
+
+    /** Unsigned number/PIN pad. Zero is deliberately a full two-unit thumb target. */
+    val NumberPad = KeyboardLayout(
+        id = "number_pad",
+        label = "Numbers",
+        languageTag = "und",
+        rows = digitRows() + KeyRow(
+            listOf(
+                digit("0").copy(widthWeight = 2f),
+                delete.copy(widthWeight = 1f),
+                enter.copy(widthWeight = 1f),
+            ),
+        ),
+    )
+
+    val SignedNumberPad = NumberPad.copy(
+        id = "signed_number_pad",
+        rows = digitRows() + KeyRow(
+            listOf(sym("-"), digit("0"), delete.copy(widthWeight = 1f), enter.copy(widthWeight = 1f)),
+        ),
+    )
+
+    val DecimalPad = NumberPad.copy(
+        id = "decimal_pad",
+        rows = digitRows() + KeyRow(
+            listOf(sym("."), digit("0"), delete.copy(widthWeight = 1f), enter.copy(widthWeight = 1f)),
+        ),
+    )
+
+    val SignedDecimalPad = NumberPad.copy(
+        id = "signed_decimal_pad",
+        rows = digitRows() + KeyRow(
+            listOf(
+                sym("-").copy(widthWeight = 0.8f),
+                digit("0").copy(widthWeight = 0.8f),
+                sym(".").copy(widthWeight = 0.8f),
+                delete.copy(widthWeight = 0.8f),
+                enter.copy(widthWeight = 0.8f),
+            ),
+        ),
+    )
+
+    /** Dial pad. Long-pressing zero exposes the international-prefix plus sign. */
+    val PhonePad = KeyboardLayout(
+        id = "phone_pad",
+        label = "Phone",
+        languageTag = "und",
+        rows = digitRows() + KeyRow(
+            listOf(
+                sym("*").copy(widthWeight = 0.8f),
+                digit("0", alternates = listOf("+")).copy(widthWeight = 0.8f),
+                sym("#").copy(widthWeight = 0.8f),
+                delete.copy(widthWeight = 0.8f),
+                enter.copy(widthWeight = 0.8f),
+            ),
+        ),
+    )
+
+    /** Date fields need explicit separators because many editors do not insert them themselves. */
+    val DatePad = NumberPad.copy(
+        id = "date_pad",
+        label = "Date",
+        rows = digitRows() + KeyRow(
+            listOf(
+                sym("/").copy(widthWeight = 0.65f),
+                sym("-").copy(widthWeight = 0.65f),
+                digit("0").copy(widthWeight = 0.65f),
+                sym(".").copy(widthWeight = 0.65f),
+                delete.copy(widthWeight = 0.65f),
+                enter.copy(widthWeight = 0.65f),
+            ),
+        ),
+    )
+
+    /** Time fields support 24-hour, fractional, and common 12-hour forms without another layer. */
+    val TimePad = NumberPad.copy(
+        id = "time_pad",
+        label = "Time",
+        rows = digitRows() + KeyRow(
+            listOf(
+                sym(":").copy(widthWeight = 0.58f),
+                digit("0").copy(widthWeight = 0.58f),
+                sym(".").copy(widthWeight = 0.58f),
+                Key("AM", output = "AM", widthWeight = 0.58f, gestureEligible = false),
+                Key("PM", output = "PM", widthWeight = 0.58f, gestureEligible = false),
+                delete.copy(widthWeight = 0.58f),
+                enter.copy(widthWeight = 0.58f),
+            ),
+        ),
+    )
+
+    /** Generic date-time editors get the union of date and time punctuation plus AM/PM. */
+    val DateTimePad = NumberPad.copy(
+        id = "datetime_pad",
+        label = "Date and time",
+        rows = digitRows() + listOf(
+            KeyRow(
+                listOf(sym("/"), sym("-"), digit("0"), sym(":"), sym("."))
+                    .map { it.copy(widthWeight = 0.8f) },
+            ),
+            KeyRow(
+                listOf(
+                    Key("AM", output = "AM", widthWeight = 1f, gestureEligible = false),
+                    Key("PM", output = "PM", widthWeight = 1f, gestureEligible = false),
+                    delete.copy(widthWeight = 1f),
+                    enter.copy(widthWeight = 1f),
+                ),
+                heightWeight = 0.8f,
+            ),
         ),
     )
 
@@ -160,5 +313,9 @@ object Layouts {
 
     /** Inserts the digit row at the top when the setting is enabled. */
     fun withNumberRow(layout: KeyboardLayout, enabled: Boolean): KeyboardLayout =
-        if (!enabled) layout else layout.copy(rows = listOf(numberRow) + layout.rows)
+        if (!enabled || !layout.supportsNumberRow || layout.rows.firstOrNull() == numberRow) {
+            layout
+        } else {
+            layout.copy(rows = listOf(numberRow) + layout.rows)
+        }
 }

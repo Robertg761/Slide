@@ -6,11 +6,14 @@
   person uses that most people do not — names, places, jargon, the odd medical term — and of the
   phrases they habitually write. That is the one thing Slide holds that would be genuinely
   revealing off the device. Everything else about Slide is on-device by design, and a personal
-  dictionary quietly synced to a cloud backup would make that claim untrue.
+  dictionary quietly synced to a cloud backup would make that claim untrue. The legacy settings
+  DataStore is excluded as well because releases before 0.2.1 kept recent emoji usage inside it;
+  current releases move that history into noBackupFilesDir.
 -->
 <full-backup-content>
     <exclude domain="file" path="learned_words.txt" />
     <exclude domain="file" path="learned_words.txt.tmp" />
     <exclude domain="file" path="learned_pairs.txt" />
     <exclude domain="file" path="learned_pairs.txt.tmp" />
+    <exclude domain="file" path="datastore/slide_settings.preferences_pb" />
 </full-backup-content>

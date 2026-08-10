@@ -27,7 +27,24 @@ internal object WhisperNative {
     @JvmStatic
     external fun closeModel(handle: Long)
 
+    /** Allocates a cancellation token for one transcription, or returns 0 on allocation failure. */
+    @JvmStatic
+    external fun createCancellationToken(): Long
+
+    /** Thread-safe. Causes Whisper's abort callback to stop work using [token]. */
+    @JvmStatic
+    external fun cancelTranscription(token: Long)
+
+    /** Safe to call with 0 once no native transcription can still reference [token]. */
+    @JvmStatic
+    external fun closeCancellationToken(token: Long)
+
     /** [samples] is mono 16kHz PCM in -1..1. Returns null if decoding failed. */
     @JvmStatic
-    external fun transcribe(handle: Long, samples: FloatArray, threads: Int): String?
+    external fun transcribe(
+        handle: Long,
+        samples: FloatArray,
+        threads: Int,
+        cancellationToken: Long,
+    ): String?
 }

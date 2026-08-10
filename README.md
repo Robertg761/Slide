@@ -2,9 +2,10 @@
 
 An Android keyboard built around two things Gboard does well and no open keyboard does at all:
 **gesture typing** with its own decoder, and **voice typing that runs entirely on your phone**
-via local Whisper models.
+via a local Whisper model.
 
-English-only and fully offline for v1.
+Slide is English-only. Typing and voice recognition work without a network connection; the optional
+GitHub update checker is the app's only network feature.
 
 ## Downloads and updates
 
@@ -14,13 +15,18 @@ install unknown apps when Android asks. Future APKs signed with the same release
 updates over this one. Slide does not use Google Play.
 
 Update checks are off by default. If enabled in Slide's settings, the app checks public GitHub
-releases (including alpha prereleases when selected), verifies the downloaded APK's version and signing
-certificate, then opens Android's normal installer for your confirmation.
+releases (including prereleases when selected). It verifies the selected asset's published
+size and SHA-256, package, newer SemVer and 64-bit Android version code, and signing certificate
+when Android exposes it, then opens Android's normal installer for confirmation. Android itself
+always enforces the installed app's signing identity.
 
 ## Status
 
-Typing, themes and gesture decoding are verified on a Galaxy S24 Ultra (Android 16). Voice input
-is written and compiles but has **not yet run on hardware** — see *Not yet verified* below.
+Typing, themes, and gesture decoding were verified on a Galaxy S24 Ultra (Android 16). The native
+Base Whisper model also loaded and transcribed an 11-second fixture on that phone in a prior
+benchmark (about 100 ms load and 1.7 seconds decode). The final 0.2.1 app packaging and complete
+microphone-to-editor flow have not been installed or rerun on hardware in this release-hardening
+pass.
 
 **Working**
 - QWERTY typing with multi-touch rollover and slide-off correction
@@ -28,7 +34,7 @@ is written and compiles but has **not yet run on hardware** — see *Not yet ver
 - Shift, caps lock, auto-capitalisation, double-space period
 - Backspace with auto-repeat and correct emoji/surrogate-pair deletion
 - Symbols layer, editor-action-aware enter key
-- Nine themes plus Material You dynamic colour, light/dark following the system
+- Nine explicit theme presets plus Dynamic Material You; only Dynamic follows system light/dark
 - Key preview popups, key borders, number row, haptics, keypress sound
 - Password, email, URL, no-suggestions, and incognito field policy, with a manual no-learning mode
 - A personal dictionary that learns the words and phrases you use and stops correcting them away
@@ -39,10 +45,10 @@ is written and compiles but has **not yet run on hardware** — see *Not yet ver
 - Suggestion strip showing the decoder's top three candidates, one tap to correct a miss
 - Offensive-word filtering for suggestions (on by default, as in Gboard)
 
-**Built, not yet verified on hardware**
+**Built, with hardware verification still incomplete**
 - **Voice typing.** Whisper runs in a separate `:asr` process; audio never crosses the process
-  boundary. The overlay, permission flow, recorder and transcriber are all in place. What is
-  outstanding is a device run — including the benchmark that picks the default model.
+  boundary. The overlay, permission flow, recorder, transcriber, and native fixture benchmark are
+  in place. A release-device run of the real microphone-to-editor flow is still outstanding.
 - **Autocorrect and typed-word suggestions.** The word being typed is held as composing text, so
   a correction replaces a region the editor owns rather than a character count the keyboard
   guessed at. Corrections are generated as single edits over a key-proximity model — transposition,
@@ -76,6 +82,7 @@ is written and compiles but has **not yet run on hardware** — see *Not yet ver
 |---|---|
 | `docs/gboard-parity.md` | Full Gboard feature inventory, tiered V1/V2/V3/Skip |
 | `docs/technical-decisions.md` | Gesture decoder design, Whisper model choice, stack, risks |
+| `docs/repository-governance.md` | Required GitHub rules, signing boundary, and release procedure |
 
 ## Modules
 
@@ -87,25 +94,25 @@ is written and compiles but has **not yet run on hardware** — see *Not yet ver
 :asr      whisper.cpp via JNI, audio capture, out-of-process voice service
 ```
 
-`:asr` runs in its own process (`:asr`). A 182 MB model that gets OOM-killed then takes the
-keyboard down with it would make the keyboard unusable in every app on the phone; isolating it
-means the worst case is dictation failing while typing carries on.
+`:asr` runs in its own process (`:asr`). Isolating the model and native inference state means a
+low-memory kill can stop dictation without taking the keyboard down in every app.
 
 ## Assets
 
-Only the speech models are missing from a fresh clone; the lexicon and the emoji catalogue are
-committed, so everything except voice typing builds with no network.
+Only the speech model is missing from a fresh clone; the lexicon and emoji catalogue are committed.
+The build fetches that model once, verifies an immutable source revision and SHA-256, and packages
+it in the APK. The installed app never downloads model weights.
 
-**Speech models** (gitignored — hundreds of megabytes):
+**Speech model** (gitignored, 59,721,011 bytes):
 
 ```bash
-tools/fetch_model.sh base.en-q5_1     # 57 MB
-tools/fetch_model.sh small.en-q5_1    # 182 MB
+tools/fetch_model.sh base.en-q5_1
 ```
 
-Both are currently bundled so the on-device benchmark can compare them; once
-`WhisperModel.Default` is settled by measurement, the loser is dropped and the APK shrinks by
-roughly its size.
+The fetcher is pinned to Hugging Face revision
+`5359861c739e955e79d9a303bcbc70fb988958b1` and SHA-256
+`4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f`. Base is the only
+packaged and selectable model; settings saved with the former Small choice migrate to Base.
 
 **whisper.cpp** is vendored under `third_party/whisper.cpp` at a pinned commit, stripped of
 bindings, examples, tests, and every backend Android cannot use. To refresh it:
@@ -165,11 +172,17 @@ manager.
 
 ```bash
 export JAVA_HOME=/usr/lib/jvm/temurin-17-jdk
+tools/fetch_model.sh base.en-q5_1
 ./gradlew :app:assembleDebug
 ```
 
-Only `arm64-v8a` is built. Every phone this targets is arm64, and the other ABIs would multiply
-native build time for nothing.
+Gradle transitive versions are locked per module and downloaded artifacts are authenticated by
+`gradle/verification-metadata.xml`. A dependency update must regenerate and review both controls;
+see `docs/repository-governance.md`. Pull requests and `main` run JVM tests, release lint, an
+unsigned R8 build, and the same model/package/ABI assertions used by releases.
+
+Release APKs package `libslide_asr.so` for `armeabi-v7a`, `arm64-v8a`, `x86`, and `x86_64`, matching
+the app's Android 8 minimum rather than silently excluding supported devices.
 
 Install and enable:
 
@@ -188,14 +201,15 @@ The speech tests need a connected device, since they load and run the real model
 ./gradlew :asr:connectedDebugAndroidTest
 ```
 
-`measuresEveryModel` prints load time, decode time and speed relative to realtime for each
-packaged model. That output is what decides `WhisperModel.Default`.
+`measuresEveryModel` prints load time, decode time, and speed relative to realtime for the packaged
+Base model. Instrumented tests are not run by ordinary CI and were not run in this hardening pass.
 
 ## Privacy
 
 Nothing leaves the device during typing: speech is recognised locally, and audio is held in memory
-only for as long as it takes to transcribe. The optional update check contacts GitHub only when the
-user enables it when Slide opens. Password, email, URL, no-suggestions, and incognito fields are
+only for as long as it takes to transcribe. If the user enables update checks, Slide contacts the
+public GitHub Releases API when settings opens and when **Check now** is tapped. Password, email,
+URL, no-suggestions, and incognito fields are
 excluded from learning. A manual Incognito mode in Slide's settings stops learning in every app
 without hiding ordinary language suggestions.
 
@@ -207,12 +221,19 @@ the words a person uses that most people do not are the most revealing thing her
 not leave the phone just because the phone was backed up. Hold a word in the suggestion strip to
 teach it or to take it back, or use **Clear learned data** in settings to remove all learned words
 and phrases from both the running keyboard and storage.
+Recent emoji usage is stored under Android's no-backup directory and is not included in cloud
+backup or device transfer.
 
 ## Licence and provenance
+
+Slide's own source code and documentation are licensed under the
+[Apache License 2.0](LICENSE). This permissive licence includes an explicit patent grant.
 
 Slide clones Gboard's *functionality*, not its implementation. No Gboard code, binaries,
 dictionaries, or assets are used. Dictionaries come from the Apache-2.0 AOSP wordlists; the bigram
 model is derived from [Tatoeba](https://tatoeba.org) sentence data, used and redistributed under
 CC BY 2.0 FR; emoji data and search keywords come from Unicode and CLDR under the Unicode licence;
 Whisper weights and `whisper.cpp` are MIT. Emoji are drawn with the system font, so no glyphs are
-redistributed.
+redistributed. The packaged terms and notices, including attribution and licence links, are
+available under **Licences and notices** in Slide's settings and at
+`app/src/main/assets/THIRD_PARTY_NOTICES.txt`.

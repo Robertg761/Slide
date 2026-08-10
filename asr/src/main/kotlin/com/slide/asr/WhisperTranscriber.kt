@@ -3,8 +3,11 @@ package com.slide.asr
 import android.content.Context
 import android.util.Log
 import kotlin.math.min
+import kotlin.coroutines.resume
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -35,9 +38,11 @@ class WhisperTranscriber(
     }
 
     private val mutex = Mutex()
+    private val cancellationLock = Any()
 
     private var handle = 0L
     private var loaded: WhisperModel? = null
+    private var activeCancellationToken = 0L
 
     val isAvailable: Boolean get() = WhisperNative.isAvailable
 
@@ -48,21 +53,21 @@ class WhisperTranscriber(
      * false if the native library is missing or the model asset could not be read, in which case
      * voice input should be presented as unavailable rather than failing at the moment of use.
      */
-    suspend fun load(model: WhisperModel): Boolean = mutex.withLock {
-        if (!WhisperNative.isAvailable) {
-            Log.w(TAG, "Native speech library is not present on this device")
-            return@withLock false
-        }
-        if (loaded == model && handle != 0L) return@withLock true
+    suspend fun load(model: WhisperModel): Boolean = withContext(dispatcher) {
+        mutex.withLock {
+            if (!WhisperNative.isAvailable) {
+                Log.w(TAG, "Native speech library is not present on this device")
+                return@withLock false
+            }
+            if (loaded == model && handle != 0L) return@withLock true
 
-        withContext(dispatcher) {
             releaseLocked()
 
             val started = System.nanoTime()
             val opened = WhisperNative.openModel(context.assets, model.assetName, threadCount())
             if (opened == 0L) {
                 Log.e(TAG, "Could not load ${model.assetName}")
-                return@withContext false
+                return@withLock false
             }
 
             handle = opened
@@ -79,27 +84,82 @@ class WhisperTranscriber(
      * own hallucinated output on quiet input, and a caller needs to tell "nothing was said" apart
      * from "something went wrong" to say anything useful about it.
      */
-    suspend fun transcribe(samples: FloatArray): Result = mutex.withLock {
-        if (handle == 0L) return@withLock Result.Failed("No speech model loaded")
-        if (samples.isEmpty()) return@withLock Result.NoSpeech
-
+    suspend fun transcribe(samples: FloatArray): Result = try {
         withContext(dispatcher) {
-            val started = System.nanoTime()
-            val text = WhisperNative.transcribe(handle, samples, threadCount())
-            val elapsedMs = (System.nanoTime() - started) / 1_000_000
+            mutex.withLock {
+                if (handle == 0L) return@withLock Result.Failed("No speech model loaded")
+                if (samples.isEmpty()) return@withLock Result.NoSpeech
 
-            val seconds = samples.size.toFloat() / SAMPLE_RATE
-            Log.i(TAG, "Transcribed %.1fs of audio in %dms".format(seconds, elapsedMs))
+                val token = WhisperNative.createCancellationToken()
+                if (token == 0L) return@withLock Result.Failed("Speech recognition failed")
 
-            when {
-                text == null -> Result.Failed("Speech recognition failed")
-                text.isBlank() -> Result.NoSpeech
-                else -> Result.Text(text)
+                synchronized(cancellationLock) { activeCancellationToken = token }
+                try {
+                    val started = System.nanoTime()
+                    val text = suspendCancellableCoroutine { continuation ->
+                        // This handler runs immediately on cancellation, even while the dispatcher
+                        // thread is blocked inside JNI.
+                        continuation.invokeOnCancellation { cancelToken(token) }
+                        val decoded = WhisperNative.transcribe(
+                            handle,
+                            samples,
+                            threadCount(),
+                            token,
+                        )
+                        if (continuation.isActive) continuation.resume(decoded)
+                    }
+                    val elapsedMs = (System.nanoTime() - started) / 1_000_000
+
+                    val seconds = samples.size.toFloat() / SAMPLE_RATE
+                    Log.i(TAG, "Transcribed %.1fs of audio in %dms".format(seconds, elapsedMs))
+
+                    when {
+                        text == null -> Result.Failed("Speech recognition failed")
+                        text.isBlank() -> Result.NoSpeech
+                        else -> Result.Text(text)
+                    }
+                } finally {
+                    closeToken(token)
+                }
+            }
+        }
+    } finally {
+        // The service owns no persistent audio history. Wipe its drain copy on every exit path,
+        // including cancellation and failures before JNI starts.
+        PcmBuffers.wipe(samples)
+    }
+
+    /** Interrupts an in-flight native decode. Safe to call from any thread. */
+    fun cancelTranscription() {
+        synchronized(cancellationLock) {
+            if (activeCancellationToken != 0L) {
+                WhisperNative.cancelTranscription(activeCancellationToken)
             }
         }
     }
 
-    suspend fun close() = mutex.withLock { releaseLocked() }
+    suspend fun close() {
+        cancelTranscription()
+        // Service destruction may wait for this from the main thread. Keep mutex ownership,
+        // native work, unlock, and close on the worker dispatcher so a canceled load/decode never
+        // needs Main in order to release the lock that close() is waiting to acquire.
+        withContext(NonCancellable + dispatcher) {
+            mutex.withLock { releaseLocked() }
+        }
+    }
+
+    private fun cancelToken(token: Long) {
+        synchronized(cancellationLock) {
+            if (activeCancellationToken == token) WhisperNative.cancelTranscription(token)
+        }
+    }
+
+    private fun closeToken(token: Long) {
+        synchronized(cancellationLock) {
+            if (activeCancellationToken == token) activeCancellationToken = 0L
+            WhisperNative.closeCancellationToken(token)
+        }
+    }
 
     private fun releaseLocked() {
         if (handle != 0L) {

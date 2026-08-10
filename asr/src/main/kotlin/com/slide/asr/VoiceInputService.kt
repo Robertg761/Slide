@@ -19,38 +19,52 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 
 /**
  * Records and transcribes on behalf of the keyboard, in its own process.
  *
- * The separation is the point. A loaded speech model is tens to hundreds of megabytes, and an
- * input method is one of the processes Android is most willing to kill when memory runs short —
- * losing the keyboard mid-sentence is far worse than losing a transcription. Here, the worst case
- * is that dictation dies and typing carries on.
- *
- * Audio never crosses the process boundary either. A few seconds of 16kHz float samples is several
- * megabytes, well past what a Binder transaction will carry, so recording happens on this side and
- * only the finished text is sent back.
+ * Every command and callback carries a client-generated session id. Native abort is cooperative,
+ * so a canceled decode can finish after its replacement starts; the id gate ensures the old job
+ * cannot reset shared state, stop the replacement recorder, or send UI events for the new session.
+ * All service state and Messenger sends are confined to the main thread.
  */
 class VoiceInputService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val recorder = AudioRecorder()
-    private val transcriber by lazy { WhisperTranscriber(applicationContext) }
+    private val transcriberDelegate = lazy { WhisperTranscriber(applicationContext) }
+    private val transcriber by transcriberDelegate
+    private val sessions = VoiceServiceSessionGate()
 
     private var client: Messenger? = null
     private var work: Job? = null
 
     private val messenger = Messenger(Handler(Looper.getMainLooper()) { message ->
+        val sessionId = message.data.getLong(
+            VoiceInput.KEY_SESSION_ID,
+            VoiceInput.NO_SESSION_ID,
+        )
         when (message.what) {
             VoiceInput.MSG_START -> {
-                client = message.replyTo
-                start(WhisperModel.fromId(message.data?.getString(VoiceInput.KEY_MODEL)))
+                val reply = message.replyTo
+                if (reply != null) {
+                    client = reply
+                    start(sessionId, WhisperModel.fromId(message.data.getString(VoiceInput.KEY_MODEL)))
+                }
                 true
             }
 
-            VoiceInput.MSG_STOP -> { stop(); true }
-            VoiceInput.MSG_CANCEL -> { cancel(); true }
+            VoiceInput.MSG_STOP -> {
+                stop(sessionId)
+                true
+            }
+
+            VoiceInput.MSG_CANCEL -> {
+                cancel(sessionId)
+                true
+            }
+
             else -> false
         }
     })
@@ -58,108 +72,187 @@ class VoiceInputService : Service() {
     override fun onBind(intent: Intent?): IBinder = messenger.binder
 
     override fun onUnbind(intent: Intent?): Boolean {
-        cancel()
+        val active = sessions.currentSessionId()
+        if (active != VoiceInput.NO_SESSION_ID) abandonSession(active) else recorder.cancel()
+        client = null
         return false
     }
 
     override fun onDestroy() {
-        recorder.cancel()
-        // Deliberately blocking: the process is going away, and leaving hundreds of megabytes of
-        // native allocation to be reclaimed by process death is fine, but leaving the microphone
-        // open is not.
+        val active = sessions.currentSessionId()
+        if (active != VoiceInput.NO_SESSION_ID) abandonSession(active) else recorder.cancel()
+        if (transcriberDelegate.isInitialized()) {
+            // close() first aborts an active decode, then waits for its mutex before freeing the
+            // context. This short blocking handoff prevents use-after-free and a cached-process leak.
+            runBlocking { transcriber.close() }
+        }
         scope.cancel()
         super.onDestroy()
     }
 
-    private fun start(model: WhisperModel) {
-        if (work?.isActive == true) return
+    private fun start(sessionId: Long, model: WhisperModel) {
+        if (!sessions.start(sessionId)) {
+            if (sessionId != VoiceInput.NO_SESSION_ID && !sessions.isCurrent(sessionId)) {
+                sendError(sessionId, "Voice typing is still closing")
+                sendState(sessionId, VoiceInput.State.Idle)
+            }
+            return
+        }
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
-            sendError("Microphone permission is needed for voice typing")
+            finishWithError(sessionId, "Microphone permission is needed for voice typing")
             return
         }
 
         work = scope.launch {
-            sendState(VoiceInput.State.Preparing)
+            sendStateIfCurrent(sessionId, VoiceInput.State.Preparing)
             if (!transcriber.load(model)) {
-                sendError("Speech model could not be loaded")
-                sendState(VoiceInput.State.Idle)
+                finishWithError(sessionId, "Speech model could not be loaded")
                 return@launch
             }
+            if (!sessions.isCurrent(sessionId)) return@launch
 
-            // Start recording only once the model is resident. Recording first would capture the
-            // user's first word during a load that can take hundreds of milliseconds, but they
-            // would be speaking to a UI that had not yet said it was listening.
-            if (!recorder.start { level -> sendLevel(level) }) {
-                sendError("The microphone is not available")
-                sendState(VoiceInput.State.Idle)
+            // Audio callbacks originate on the recorder worker. Marshal them to this main scope
+            // before reading or mutating any service/session state or touching Messenger.
+            val started = recorder.start(
+                listener = { level ->
+                    scope.launch {
+                        if (sessions.isCurrent(sessionId)) sendLevel(sessionId, level)
+                    }
+                },
+                endListener = { reason ->
+                    scope.launch { handleRecorderEnd(sessionId, reason) }
+                },
+            )
+            if (!started) {
+                finishWithError(sessionId, "The microphone is not available")
                 return@launch
             }
-            sendState(VoiceInput.State.Listening)
+            if (!sessions.isCurrent(sessionId)) {
+                recorder.cancel()
+                return@launch
+            }
+            sendState(sessionId, VoiceInput.State.Listening)
         }
     }
 
-    private fun stop() {
+    private fun stop(sessionId: Long) {
+        if (!sessions.beginFinishing(sessionId)) return
+
         val pending = work
         work = scope.launch {
-            pending?.join() // in case stop arrives before the model has finished loading
+            var audio = FloatArray(0)
+            try {
+                pending?.join() // stop may arrive while the model is still loading
+                if (!sessions.isCurrent(sessionId)) return@launch
 
-            if (!recorder.isRecording) {
-                sendState(VoiceInput.State.Idle)
-                return@launch
+                audio = recorder.stop()
+                if (!sessions.isCurrent(sessionId)) return@launch
+                sendState(sessionId, VoiceInput.State.Transcribing)
+
+                when (val result = transcriber.transcribe(audio)) {
+                    is WhisperTranscriber.Result.Text -> sendResultIfCurrent(sessionId, result.value)
+                    WhisperTranscriber.Result.NoSpeech -> sendResultIfCurrent(sessionId, "")
+                    is WhisperTranscriber.Result.Failed -> sendErrorIfCurrent(sessionId, result.reason)
+                }
+            } finally {
+                // WhisperTranscriber also wipes this copy. Keep the service boundary defensive if
+                // its implementation changes or cancellation happens before it is entered.
+                PcmBuffers.wipe(audio)
+                if (sessions.finish(sessionId)) {
+                    work = null
+                    sendState(sessionId, VoiceInput.State.Idle)
+                }
             }
-
-            val audio = recorder.stop()
-            sendState(VoiceInput.State.Transcribing)
-
-            when (val result = transcriber.transcribe(audio)) {
-                is WhisperTranscriber.Result.Text -> sendResult(result.value)
-                WhisperTranscriber.Result.NoSpeech -> sendResult("")
-                is WhisperTranscriber.Result.Failed -> sendError(result.reason)
-            }
-            sendState(VoiceInput.State.Idle)
         }
     }
 
-    private fun cancel() {
-        work?.cancel()
-        work = null
-        recorder.cancel()
-        sendState(VoiceInput.State.Idle)
+    private fun cancel(sessionId: Long) {
+        if (sessions.isCurrent(sessionId)) abandonSession(sessionId)
+        // This is the single cancellation acknowledgement. Any later finalizer for this id is
+        // generation-guarded and therefore cannot send a second Idle into a replacement session.
+        if (sessionId != VoiceInput.NO_SESSION_ID) sendState(sessionId, VoiceInput.State.Idle)
     }
 
-    private fun sendState(state: VoiceInput.State) =
-        send(Message.obtain(null, VoiceInput.MSG_STATE, state.ordinal, 0))
+    private fun handleRecorderEnd(sessionId: Long, reason: AudioRecorder.EndReason) {
+        if (!sessions.isCurrent(sessionId)) return
+        when (reason) {
+            AudioRecorder.EndReason.RecordingLimitReached -> stop(sessionId)
+            AudioRecorder.EndReason.CaptureFailed ->
+                finishWithError(sessionId, "The microphone stopped unexpectedly")
+        }
+    }
 
-    private fun sendLevel(level: Float) =
-        send(Message.obtain(null, VoiceInput.MSG_LEVEL, (level * VoiceInput.LEVEL_SCALE).toInt(), 0))
+    private fun finishWithError(sessionId: Long, reason: String) {
+        if (!sessions.finish(sessionId)) return
+        val abandoned = work
+        work = null
+        abandoned?.cancel()
+        recorder.cancel()
+        sendError(sessionId, reason)
+        sendState(sessionId, VoiceInput.State.Idle)
+    }
 
-    private fun sendResult(text: String) = send(
+    /** Invalidates the id before cancellation so old finally blocks become harmless. */
+    private fun abandonSession(sessionId: Long) {
+        if (!sessions.finish(sessionId)) return
+        if (transcriberDelegate.isInitialized()) transcriber.cancelTranscription()
+        val abandoned = work
+        work = null
+        abandoned?.cancel()
+        recorder.cancel()
+    }
+
+    private fun sendStateIfCurrent(sessionId: Long, state: VoiceInput.State) {
+        if (sessions.isCurrent(sessionId)) sendState(sessionId, state)
+    }
+
+    private fun sendResultIfCurrent(sessionId: Long, text: String) {
+        if (sessions.isCurrent(sessionId)) sendResult(sessionId, text)
+    }
+
+    private fun sendErrorIfCurrent(sessionId: Long, reason: String) {
+        if (sessions.isCurrent(sessionId)) sendError(sessionId, reason)
+    }
+
+    private fun sendState(sessionId: Long, state: VoiceInput.State) =
+        send(sessionId, Message.obtain(null, VoiceInput.MSG_STATE, state.ordinal, 0))
+
+    private fun sendLevel(sessionId: Long, level: Float) = send(
+        sessionId,
+        Message.obtain(null, VoiceInput.MSG_LEVEL, (level * VoiceInput.LEVEL_SCALE).toInt(), 0),
+    )
+
+    private fun sendResult(sessionId: Long, text: String) = send(
+        sessionId,
         Message.obtain(null, VoiceInput.MSG_RESULT).apply {
             data = Bundle().apply { putString(VoiceInput.KEY_TEXT, text) }
         },
     )
 
-    private fun sendError(reason: String) {
+    private fun sendError(sessionId: Long, reason: String) {
         Log.w(TAG, reason)
         send(
+            sessionId,
             Message.obtain(null, VoiceInput.MSG_ERROR).apply {
                 data = Bundle().apply { putString(VoiceInput.KEY_REASON, reason) }
             },
         )
     }
 
-    private fun send(message: Message) {
+    /** Called only on the service main thread. */
+    private fun send(sessionId: Long, message: Message) {
+        val payload = message.data
+        payload.putLong(VoiceInput.KEY_SESSION_ID, sessionId)
+        message.data = payload
         try {
             client?.send(message)
         } catch (e: RemoteException) {
-            // The keyboard went away mid-dictation. Nothing to report to and nothing to do but
-            // stop holding the microphone.
             Log.i(TAG, "Keyboard is gone; abandoning dictation", e)
             client = null
-            recorder.cancel()
+            if (sessions.isCurrent(sessionId)) abandonSession(sessionId)
         }
     }
 

@@ -13,9 +13,9 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
-            // Every Android device Slide targets has been arm64 for years, and each extra ABI is
-            // another full whisper.cpp compile and another copy of the .so in the APK.
-            abiFilters += "arm64-v8a"
+            // Voice input is part of the app, not an optional dynamic feature. Package a native
+            // implementation for every ABI Android supports at this minSdk.
+            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
         }
 
         externalNativeBuild {
@@ -50,6 +50,12 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+
+    testOptions {
+        // Recorder JVM tests inject a fake backend; harmless android.util.Log calls should retain
+        // their normal no-op host behavior rather than throwing from the mockable android.jar.
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -57,8 +63,8 @@ dependencies {
     implementation(libs.kotlinx.coroutines.core)
     testImplementation(libs.junit)
 
-    // The speech path can only be tested where the native library and a real CPU are, so its
-    // tests are instrumented rather than local.
+    // Model inference itself needs a device, but recorder/session ownership is covered on the JVM
+    // through injected fakes and the real native bridge retains its instrumentation suite.
     androidTestImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.test.runner)

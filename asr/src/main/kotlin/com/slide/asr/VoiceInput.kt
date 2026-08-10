@@ -17,6 +17,10 @@ object VoiceInput {
     const val KEY_TEXT = "text"
     const val KEY_REASON = "reason"
     const val KEY_MODEL = "model"
+    const val KEY_SESSION_ID = "session_id"
+
+    /** Zero is never allocated by the client and therefore means "no voice session". */
+    const val NO_SESSION_ID = 0L
 
     /** Microphone level arrives as an int, since [android.os.Message.arg1] is the cheap field. */
     const val LEVEL_SCALE = 1000

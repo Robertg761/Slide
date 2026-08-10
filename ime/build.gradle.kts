@@ -21,6 +21,7 @@ dependencies {
     api(project(":engine"))
     api(project(":asr"))
     implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.customview)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     testImplementation(libs.junit)
 }

@@ -10,9 +10,9 @@ A 1:1 inventory of Gboard's feature surface, used as the master checklist for Sl
 
 **Effort**: S (days) · M (1–2 weeks) · L (3–6 weeks) · XL (2+ months)
 
-> **Scope decisions (locked 2026-08-07):** English-only v1, fully offline, own gesture decoder.
-> Network-dependent features (F7 GIF search, G11 translate) are therefore deferred past v1
-> regardless of the tier shown below. See `technical-decisions.md` §0.
+> **Scope decisions (updated 2026-08-09):** English-only v1, offline typing and speech, own gesture
+> decoder. The optional GitHub update checker is the only network feature. Network-dependent typing
+> features (F7 GIF search, G11 translate) remain deferred. See `technical-decisions.md` §0.
 
 ---
 
@@ -65,20 +65,20 @@ A 1:1 inventory of Gboard's feature surface, used as the master checklist for Sl
 
 | # | Feature | Tier | Effort | Notes |
 |---|---|---|---|---|
-| C1 | Mic key → voice input panel | V1 | S | |
-| C2 | **On-device Whisper transcription** | V1 | XL | Core differentiator. |
-| C3 | Model manager — browse/download/delete models | V1 | M | Size + speed shown per model. |
-| C4 | Streaming partial results while speaking | V1 | L | Chunked window + VAD endpointing. |
-| C5 | Automatic punctuation & casing | V1 | S | Free from Whisper — better than Gboard offline. |
-| C6 | Silence detection → auto-stop | V1 | M | VAD. |
-| C7 | Live waveform / level meter | V1 | S | |
+| C1 | Mic key → voice input panel | V1 | S | **Built.** Permission, listening, transcribing, failure, and cancellation states are wired. |
+| C2 | **On-device Whisper transcription** | V1 | XL | **Built.** One bundled Base English q5_1 model; native fixture transcription was benchmarked on a Galaxy S24 Ultra, while the final 0.2.1 microphone-to-editor flow still needs a device run. |
+| C3 | Model manager — browse/download/delete models | V2 | M | Deliberately not shipped in 0.2.1: one immutable, checksummed Base model is bundled and there is no runtime model download. |
+| C4 | Streaming partial results while speaking | V2 | L | Not built. Current transcription runs after Stop. |
+| C5 | Automatic punctuation & casing | V1 | S | Supplied by the local Whisper decode. |
+| C6 | Silence detection → auto-stop | V2 | M | Not built; current endpointing is manual with a safety recording limit. |
+| C7 | Live waveform / level meter | V1 | S | **Built.** Device-level UX verification is still outstanding. |
 | C8 | Voice commands ("delete", "send", "new line", "comma") | V2 | M | Post-processing on the transcript. |
-| C9 | Continuous dictation (keeps listening) | V1 | M | |
+| C9 | Continuous dictation (keeps listening) | V2 | M | Not built; each session records and decodes once. |
 | C10 | Multilingual voice + language picker | V2 | M | Multilingual Whisper weights. |
 | C11 | Auto language detection | V3 | S | Whisper does this natively. |
 | C12 | Fallback to system `SpeechRecognizer` when no model | V2 | S | |
 | C13 | Dictate into the middle of existing text | V2 | M | Cursor-aware insertion. |
-| C14 | Offline-only guarantee + visible "no network" badge | V1 | S | Selling point vs Gboard. |
+| C14 | Offline typing/voice guarantee + visible status | V1 | S | Audio and transcripts stay on device. The app's separate, opt-in updater contacts GitHub. |
 
 ---
 
@@ -133,7 +133,7 @@ A 1:1 inventory of Gboard's feature surface, used as the master checklist for Sl
 |---|---|---|---|---|
 | F1 | Emoji picker with categories | V1 | M | **Built.** 1,914 emoji, nine categories, CLDR order. |
 | F2 | Recently-used emoji | V1 | S | **Built.** First tab; skipped in incognito and password fields. |
-| F3 | Emoji search by name | V1 | S | Ranked search over CLDR keywords is built and tested; the UI is not, since the query needs the keys the picker covers. |
+| F3 | Emoji search by name | V1 | S | **Built.** Keyboard-backed search with recent and ranked CLDR keyword results plus an empty state. |
 | F4 | Skin-tone selector | V1 | S | **Built.** Chosen from a long-press, then applied everywhere. |
 | F5 | Emoji variant long-press | V1 | S | **Built.** |
 | F6 | System emoji font rendering + version fallback | V1 | M | **Built.** Filtered by `Paint.hasGlyph` off the main thread, so an older font drops emoji rather than drawing tofu. |
@@ -210,7 +210,7 @@ A 1:1 inventory of Gboard's feature surface, used as the master checklist for Sl
 | J3 | Incognito mode (no learning) | V1 | S | **Built.** Manual toggle + auto via `IME_FLAG_NO_PERSONALIZED_LEARNING` and sensitive-field policy. |
 | J4 | Clear learned data | V1 | S | **Built.** Confirmed settings action clears live words/pairs and crash-safe private storage. |
 | J5 | Export/import settings + dictionary | V2 | S | Local file, no cloud. |
-| J6 | No telemetry / no network by default | V1 | S | Core positioning. |
+| J6 | No telemetry / no network by default | V1 | S | **Built.** Update checks are opt-in; typing and speech do not use the network. |
 | J7 | Setup wizard (enable IME, set default, grant mic) | V1 | M | Required — IME activation is a confusing flow. |
 
 ---
@@ -226,7 +226,7 @@ A 1:1 inventory of Gboard's feature surface, used as the master checklist for Sl
 | K5 | Physical keyboard passthrough | V3 | M | |
 | K6 | IME switcher (globe long-press → other keyboards) | V1 | S | |
 | K7 | RTL layout support | V2 | M | |
-| K8 | Accessibility / TalkBack support | V1 | M | Do not skip. |
+| K8 | Accessibility / TalkBack support | V1 | M | **Partly built.** Labels and announcements exist; device-level TalkBack and font-scale verification remain. |
 | K9 | Landscape + foldable/large-screen layouts | V2 | M | |
 | K10 | Per-app remembered language/layout | V3 | S | |
 
@@ -253,8 +253,7 @@ Three items carried essentially all the risk: **B3** (gesture decoder), **C2/C4*
 Whisper), and **D2/D4** (autocorrect + prediction, which the gesture decoder also depends on).
 Everything else is conventional Android work.
 
-Of those, **B3**, **D2** and **D4** are built and measured, and **C2/C4** are built but still owe
-a device run. D4's language model had to be built from an outside corpus in the end: the AOSP
-wordlist the lexicon comes from carries no bigram data at all. It is wired into correction but not
-yet into the strip, so the keyboard reads the sentence to decide what you meant without yet
-offering what you might type next.
+Of those, **B3**, **D2**, and **D4** are built and measured. **C2** is built and its native fixture
+path was benchmarked on one physical phone, but the final 0.2.1 microphone-to-editor flow still
+needs a device run; **C4** streaming is not built. D4's Tatoeba-derived language model is wired into
+both correction and the next-word strip.

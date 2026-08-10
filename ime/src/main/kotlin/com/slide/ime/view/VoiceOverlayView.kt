@@ -4,12 +4,17 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.Rect
 import android.graphics.Typeface
+import android.os.Bundle
 import android.util.TypedValue
 import android.view.MotionEvent
 import android.view.View
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.animation.AnimationUtils
+import androidx.core.view.ViewCompat
+import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
+import androidx.customview.widget.ExploreByTouchHelper
 import com.slide.asr.VoiceInput
 import com.slide.core.theme.KeyboardTheme
 import com.slide.core.theme.Themes
@@ -92,10 +97,73 @@ class VoiceOverlayView(context: Context) : View(context) {
 
     private var cancelBounds = floatArrayOf(0f, 0f, 0f, 0f)
     private var pressedCancel = false
+    private var pressStartedOnCancel = false
+
+    private val accessibilityHelper = object : ExploreByTouchHelper(this) {
+        override fun getVirtualViewAt(x: Float, y: Float): Int =
+            if (isInCancel(x, y)) A11Y_CANCEL else A11Y_MAIN
+
+        override fun getVisibleVirtualViews(virtualViewIds: MutableList<Int>) {
+            virtualViewIds += A11Y_MAIN
+            virtualViewIds += A11Y_CANCEL
+        }
+
+        override fun onPopulateNodeForVirtualView(
+            virtualViewId: Int,
+            node: AccessibilityNodeInfoCompat,
+        ) {
+            if (virtualViewId == A11Y_CANCEL) {
+                updateCancelBounds()
+                node.className = "android.widget.Button"
+                node.contentDescription = "Cancel voice typing"
+                node.isClickable = true
+                node.addAction(AccessibilityNodeInfoCompat.ACTION_CLICK)
+                node.setBoundsInParent(
+                    Rect(cancelBounds[0].toInt(), cancelBounds[1].toInt(), cancelBounds[2].toInt(), cancelBounds[3].toInt()),
+                )
+                return
+            }
+
+            val actionable = state == VoiceInput.State.Listening || state == VoiceInput.State.Idle
+            node.className = if (actionable) "android.widget.Button" else "android.widget.TextView"
+            node.contentDescription = when (state) {
+                VoiceInput.State.Listening -> "Finish voice typing. ${statusText()}"
+                VoiceInput.State.Idle -> "Close voice typing. ${statusText()}"
+                else -> statusText()
+            }
+            node.isClickable = actionable
+            if (actionable) node.addAction(AccessibilityNodeInfoCompat.ACTION_CLICK)
+            node.setBoundsInParent(Rect(0, 0, width, (height * 0.72f).toInt()))
+        }
+
+        override fun onPerformActionForVirtualView(
+            virtualViewId: Int,
+            action: Int,
+            arguments: Bundle?,
+        ): Boolean {
+            if (action != AccessibilityNodeInfo.ACTION_CLICK) return false
+            if (virtualViewId == A11Y_CANCEL) {
+                listener?.onVoiceDismissed(committed = false)
+                return true
+            }
+            return when (state) {
+                VoiceInput.State.Listening -> {
+                    listener?.onVoiceDismissed(committed = true)
+                    true
+                }
+                VoiceInput.State.Idle -> {
+                    listener?.onVoiceDismissed(committed = false)
+                    true
+                }
+                else -> false
+            }
+        }
+    }
 
     init {
         isFocusable = true
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
+        ViewCompat.setAccessibilityDelegate(this, accessibilityHelper)
         refreshAccessibilityDescription()
     }
 
@@ -221,18 +289,10 @@ class VoiceOverlayView(context: Context) : View(context) {
         textPaint.textSize = sp(14f)
         textPaint.color = keyboardTheme.suggestionText
 
-        val textWidth = textPaint.measureText(label)
-        val padding = dp(18f)
+        updateCancelBounds()
         val centerX = width / 2f
         val centerY = height * CANCEL_CENTRE_FRACTION
         val halfHeight = dp(18f)
-
-        cancelBounds = floatArrayOf(
-            centerX - textWidth / 2f - padding,
-            centerY - halfHeight,
-            centerX + textWidth / 2f + padding,
-            centerY + halfHeight,
-        )
 
         fillPaint.color = keyboardTheme.specialKeyBackground
         fillPaint.alpha = 255
@@ -248,6 +308,20 @@ class VoiceOverlayView(context: Context) : View(context) {
         canvas.drawText(label, centerX, centerY - (metrics.ascent + metrics.descent) / 2f, textPaint)
     }
 
+    private fun updateCancelBounds() {
+        textPaint.textSize = sp(14f)
+        val halfWidth = textPaint.measureText("Cancel") / 2f + dp(18f)
+        val centerX = width / 2f
+        val centerY = height * CANCEL_CENTRE_FRACTION
+        val halfHeight = dp(18f)
+        cancelBounds = floatArrayOf(
+            centerX - halfWidth,
+            centerY - halfHeight,
+            centerX + halfWidth,
+            centerY + halfHeight,
+        )
+    }
+
     private fun statusText(): String = errorText ?: when (state) {
         VoiceInput.State.Preparing -> "Getting ready…"
         VoiceInput.State.Listening -> "Listening — tap when you're done"
@@ -259,6 +333,7 @@ class VoiceOverlayView(context: Context) : View(context) {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 pressedCancel = isInCancel(event.x, event.y)
+                pressStartedOnCancel = pressedCancel
                 invalidate()
                 return true
             }
@@ -273,13 +348,16 @@ class VoiceOverlayView(context: Context) : View(context) {
 
             MotionEvent.ACTION_CANCEL -> {
                 pressedCancel = false
+                pressStartedOnCancel = false
                 invalidate()
                 return true
             }
         }
 
-        val cancelled = pressedCancel && isInCancel(event.x, event.y)
+        val cancelled = pressStartedOnCancel && pressedCancel && isInCancel(event.x, event.y)
+        val mainActivated = !pressStartedOnCancel
         pressedCancel = false
+        pressStartedOnCancel = false
         invalidate()
 
         // Tapping anywhere else finishes the dictation. While transcribing there is nothing to
@@ -287,10 +365,10 @@ class VoiceOverlayView(context: Context) : View(context) {
         if (cancelled) {
             announceForAccessibility("Cancel voice typing")
             listener?.onVoiceDismissed(committed = false)
-        } else if (state == VoiceInput.State.Listening) {
+        } else if (mainActivated && state == VoiceInput.State.Listening) {
             announceForAccessibility("Finish voice typing")
             listener?.onVoiceDismissed(committed = true)
-        } else if (state == VoiceInput.State.Idle) {
+        } else if (mainActivated && state == VoiceInput.State.Idle) {
             announceForAccessibility("Close voice typing")
             listener?.onVoiceDismissed(committed = false)
         }
@@ -298,7 +376,10 @@ class VoiceOverlayView(context: Context) : View(context) {
     }
 
     private fun isInCancel(x: Float, y: Float): Boolean =
-        x in cancelBounds[0]..cancelBounds[2] && y in cancelBounds[1]..cancelBounds[3]
+        run {
+            updateCancelBounds()
+            x in cancelBounds[0]..cancelBounds[2] && y in cancelBounds[1]..cancelBounds[3]
+        }
 
     override fun onInitializeAccessibilityNodeInfo(info: AccessibilityNodeInfo) {
         super.onInitializeAccessibilityNodeInfo(info)
@@ -307,8 +388,21 @@ class VoiceOverlayView(context: Context) : View(context) {
         info.contentDescription = accessibilityDescription()
     }
 
+    override fun dispatchHoverEvent(event: MotionEvent): Boolean =
+        accessibilityHelper.dispatchHoverEvent(event) || super.dispatchHoverEvent(event)
+
+    override fun onFocusChanged(
+        gainFocus: Boolean,
+        direction: Int,
+        previouslyFocusedRect: Rect?,
+    ) {
+        super.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
+        accessibilityHelper.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
+    }
+
     private fun refreshAccessibilityDescription() {
         contentDescription = accessibilityDescription()
+        accessibilityHelper.invalidateRoot()
     }
 
     private fun accessibilityDescription(): String =
@@ -318,6 +412,8 @@ class VoiceOverlayView(context: Context) : View(context) {
         const val MIC_CENTRE_FRACTION = 0.38f
         const val MIC_RADIUS_FRACTION = 0.16f
         const val CANCEL_CENTRE_FRACTION = 0.82f
+        const val A11Y_MAIN = 0
+        const val A11Y_CANCEL = 1
 
         const val LEVEL_SMOOTHING = 0.35f
 

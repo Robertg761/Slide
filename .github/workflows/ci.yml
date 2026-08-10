@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Install pinned Android toolchain
+        shell: bash
+        run: |
+          set -eu
+          yes | sdkmanager \
+            "platforms;android-37" \
+            "build-tools;36.0.0" \
+            "ndk;28.2.13676358" \
+            "cmake;3.22.1" >/dev/null
+
+      - name: Fetch and verify the pinned speech model
+        run: bash tools/fetch_model.sh base.en-q5_1
+
+      - name: Verify monotonic release version history
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)"/\1/p' app/build.gradle.kts)"
+          code="$(sed -nE 's/^[[:space:]]*versionCode[[:space:]]*=[[:space:]]*([0-9]+)/\1/p' app/build.gradle.kts)"
+          bash tools/verify_version_history.sh "$version" "$code"
+
+      - name: Test release metadata scripts
+        run: bash tools/test_release_scripts.sh
+
+      - name: Run JVM tests, lint, and build the unsigned release
+        run: >-
+          ./gradlew --no-daemon
+          :core:testDebugUnitTest
+          :engine:testDebugUnitTest
+          :asr:testDebugUnitTest
+          :ime:testDebugUnitTest
+          :app:testDebugUnitTest
+          :app:lintRelease
+          :app:assembleRelease
+
+      - name: Verify the release APK contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' -print -quit)"
+          version="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)"/\1/p' app/build.gradle.kts)"
+          code="$(sed -nE 's/^[[:space:]]*versionCode[[:space:]]*=[[:space:]]*([0-9]+)/\1/p' app/build.gradle.kts)"
+          bash tools/verify_release_apk.sh "$apk" "$version" "$code" unsigned

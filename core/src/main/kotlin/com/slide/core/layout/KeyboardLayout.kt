@@ -13,6 +13,8 @@ data class KeyboardLayout(
     /** BCP-47 tag this layout is intended for, e.g. "en". */
     val languageTag: String,
     val rows: List<KeyRow>,
+    /** Whether the user's optional persistent digit row makes sense on this layout. */
+    val supportsNumberRow: Boolean = false,
 ) {
     /** Total width weight of the widest row; used to normalise key widths. */
     val widthUnits: Float = rows.maxOfOrNull { it.totalWeight }?.takeIf { it > 0f } ?: 10f

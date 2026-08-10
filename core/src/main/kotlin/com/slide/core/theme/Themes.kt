@@ -24,19 +24,19 @@ object Themes {
         background = 0xFFEEEFF2.toInt(),
         keyBackground = 0xFFFFFFFF.toInt(),
         specialKeyBackground = 0xFFDADCE0.toInt(),
-        accentBackground = 0xFF1A73E8.toInt(),
+        accentBackground = 0xFF1558B0.toInt(),
         keyText = 0xFF202124.toInt(),
         specialKeyText = 0xFF202124.toInt(),
         accentText = 0xFFFFFFFF.toInt(),
-        hintText = 0xFF70757A.toInt(),
+        hintText = 0xFF5F6368.toInt(),
         keyBorder = 0x1A000000,
         keyPressedOverlay = 0x1F000000,
-        gestureTrail = 0xFF1A73E8.toInt(),
+        gestureTrail = 0xFF1558B0.toInt(),
         popupBackground = 0xFFFFFFFF.toInt(),
         popupText = 0xFF202124.toInt(),
-        popupSelectedBackground = 0xFF1A73E8.toInt(),
+        popupSelectedBackground = 0xFF1558B0.toInt(),
         suggestionText = 0xFF3C4043.toInt(),
-        suggestionHighlightText = 0xFF1A73E8.toInt(),
+        suggestionHighlightText = 0xFF1558B0.toInt(),
         divider = 0x1F000000,
     )
 
@@ -83,19 +83,33 @@ object Themes {
      *
      * @param themeId the user's chosen theme id, or [ID_DYNAMIC] for Material You
      * @param systemInDarkMode whether the system is currently in dark mode
-     * @param followSystem when true, [ID_LIGHT]/[ID_DARK] are chosen by the system setting
+     * @param followSystem legacy fallback for an unknown id. Explicit preset selections always win.
      */
     fun resolve(
         context: Context,
         themeId: String,
         systemInDarkMode: Boolean,
         followSystem: Boolean,
-    ): KeyboardTheme = when {
-        themeId == ID_DYNAMIC -> dynamic(context, systemInDarkMode)
+    ): KeyboardTheme = if (themeId == ID_DYNAMIC) {
+        dynamic(context, systemInDarkMode)
             ?: if (systemInDarkMode) Dark else Light
-        followSystem && (themeId == ID_LIGHT || themeId == ID_DARK) ->
-            if (systemInDarkMode) Dark else Light
-        else -> byId(themeId) ?: Light
+    } else {
+        resolvePreset(themeId, systemInDarkMode, followSystem)
+    }
+
+    /** Pure preset branch, split out so explicit-selection semantics stay JVM-testable. */
+    internal fun resolvePreset(
+        themeId: String,
+        systemInDarkMode: Boolean,
+        followSystem: Boolean,
+    ): KeyboardTheme {
+        val resolvedId = ThemeSelection.presetId(
+            requestedId = themeId,
+            knownIds = presets.mapTo(linkedSetOf(), KeyboardTheme::id),
+            systemInDarkMode = systemInDarkMode,
+            followSystem = followSystem,
+        )
+        return byId(resolvedId) ?: Light
     }
 
     /**
@@ -163,7 +177,7 @@ object Themes {
     private fun solidTheme(id: String, name: String, seed: Int, dark: Boolean): KeyboardTheme {
         val keyBg = seed.shiftLightness(if (dark) +0.07f else +0.06f)
         val specialBg = seed.shiftLightness(if (dark) -0.03f else -0.05f)
-        val accent = seed.saturate(0.55f).withLightness(if (dark) 0.72f else 0.45f)
+        val accent = seed.saturate(0.55f).withLightness(if (dark) 0.72f else 0.32f)
         val text = if (dark) 0xFFECEFF1.toInt() else 0xFF1F2226.toInt()
         val hint = ColorUtils.setAlphaComponent(text, 0x99)
 

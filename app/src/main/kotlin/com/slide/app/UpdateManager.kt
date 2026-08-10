@@ -6,10 +6,13 @@ import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.storage.StorageManager
 import android.provider.Settings
 import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.core.content.FileProvider
+import androidx.core.net.toUri
+import androidx.core.content.pm.PackageInfoCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -17,9 +20,16 @@ import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
 
 /** Deliberately user-mediated updater for the public GitHub distribution channel. */
-data class UpdateInfo(val version: String, val notes: String, val apkUrl: String)
+data class UpdateInfo(
+    val version: String,
+    val notes: String,
+    val apkUrl: String,
+    val apkSha256: String,
+    val apkSize: Long,
+)
 
 /** What [UpdateManager.downloadAndInstall] did, so the UI can say something true about it. */
 enum class InstallOutcome {
@@ -34,36 +44,59 @@ object UpdateManager {
     private const val RELEASES = "https://api.github.com/repos/Robertg761/Slide/releases?per_page=30"
     private const val TAG = "SlideUpdates"
 
-    /** Slide ships two speech models, so its APK is large; leave room to write it and to spare. */
+    /** Leave enough room for the download plus Package Installer's separate staging copy. */
     private const val FREE_SPACE_HEADROOM = 64L * 1024 * 1024
 
-    suspend fun check(context: Context, includeAlphas: Boolean): UpdateInfo? = withContext(Dispatchers.IO) {
+    suspend fun check(context: Context, includePrereleases: Boolean): UpdateInfo? = withContext(Dispatchers.IO) {
         val current = context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: return@withContext null
         val connection = (URL(RELEASES).openConnection() as HttpURLConnection).apply {
             connectTimeout = 10_000; readTimeout = 15_000
             setRequestProperty("Accept", "application/vnd.github+json")
             setRequestProperty("User-Agent", "Slide-Android")
         }
-        val json = connection.inputStream.bufferedReader().use { it.readText() }
-        connection.disconnect()
+        val json = try {
+            val status = connection.responseCode
+            if (status != HttpURLConnection.HTTP_OK) {
+                throw IOException("GitHub returned HTTP $status while checking for updates")
+            }
+            connection.inputStream.bufferedReader().use { it.readText() }
+        } finally {
+            connection.disconnect()
+        }
         JSONArray(json).let { releases ->
             (0 until releases.length()).mapNotNull { i -> releases.getJSONObject(i) }
-                .firstNotNullOfOrNull { release ->
-                    if (release.optBoolean("draft") || (!includeAlphas && release.optBoolean("prerelease"))) return@firstNotNullOfOrNull null
+                .mapNotNull { release ->
+                    if (release.optBoolean("draft")) return@mapNotNull null
                     val version = release.getString("tag_name").removePrefix("v")
-                    if (compare(version, current) <= 0) return@firstNotNullOfOrNull null
+                    if (!isValidSemVer(version)) return@mapNotNull null
+                    if (!includePrereleases &&
+                        (release.optBoolean("prerelease") || isPrerelease(version))
+                    ) {
+                        return@mapNotNull null
+                    }
                     val asset = release.getJSONArray("assets").let { assets ->
                         (0 until assets.length()).map { assets.getJSONObject(it) }
-                            .firstOrNull { it.getString("name").matches(Regex("Slide-[0-9].*\\.apk")) }
-                    } ?: return@firstNotNullOfOrNull null
-                    UpdateInfo(version, release.optString("body"), asset.getString("browser_download_url"))
+                            .firstOrNull { it.getString("name") == "Slide-$version.apk" }
+                    } ?: return@mapNotNull null
+                    val digest = asset.optString("digest").removePrefix("sha256:").lowercase()
+                    if (!digest.matches(Regex("[0-9a-f]{64}"))) return@mapNotNull null
+                    val size = asset.optLong("size", -1L)
+                    if (size <= 0) return@mapNotNull null
+                    UpdateInfo(
+                        version = version,
+                        notes = release.optString("body"),
+                        apkUrl = asset.getString("browser_download_url"),
+                        apkSha256 = digest,
+                        apkSize = size,
+                    )
                 }
+                .let { newest(current, it) }
         }
     }
 
     suspend fun downloadAndInstall(context: Context, update: UpdateInfo): InstallOutcome = withContext(Dispatchers.IO) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !context.packageManager.canRequestPackageInstalls()) {
-            context.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        if (!context.packageManager.canRequestPackageInstalls()) {
+            context.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, "package:${context.packageName}".toUri()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
             return@withContext InstallOutcome.NeedsPermission
         }
         require(update.apkUrl.startsWith("https://")) { "Update URL is not HTTPS" }
@@ -97,6 +130,7 @@ object UpdateManager {
      * the release.
      */
     private fun download(context: Context, update: UpdateInfo): File {
+        require(update.apkSize > 0) { "Update size is missing" }
         val directory = File(context.cacheDir, "updates").apply { mkdirs() }
         // Only the download in progress belongs here; older versions are dead weight in a cache
         // directory the system is entitled to reclaim under pressure.
@@ -104,6 +138,17 @@ object UpdateManager {
 
         val target = File(directory, "Slide-${update.version}.apk")
         val partial = File(directory, "Slide-${update.version}.apk.part")
+
+        val allocatableBytes = runCatching {
+            context.getSystemService(StorageManager::class.java)
+                .getAllocatableBytes(StorageManager.UUID_DEFAULT)
+        }.getOrElse { directory.usableSpace }
+        if (allocatableBytes < requiredFreeBytes(update.apkSize)) {
+            throw IOException(
+                "Not enough free space: downloading and staging this update needs about " +
+                    "${requiredFreeBytes(update.apkSize) / (1024 * 1024)} MB free",
+            )
+        }
 
         val connection = (URL(update.apkUrl).openConnection() as HttpURLConnection).apply {
             connectTimeout = 15_000; readTimeout = 60_000; instanceFollowRedirects = true
@@ -115,21 +160,40 @@ object UpdateManager {
                 throw IOException("GitHub returned HTTP $status for the release APK")
             }
 
-            val expected = connection.contentLengthLong
-            if (expected > 0 && directory.usableSpace < expected + FREE_SPACE_HEADROOM) {
+            val contentLength = connection.contentLengthLong
+            if (contentLength > 0 && contentLength != update.apkSize) {
                 throw IOException(
-                    "Not enough free space: the update needs about ${expected / (1024 * 1024)} MB",
+                    "GitHub reported $contentLength bytes for an ${update.apkSize}-byte release",
                 )
             }
 
+            val digest = MessageDigest.getInstance("SHA-256")
             val written = connection.inputStream.use { input ->
-                partial.outputStream().use { output -> input.copyTo(output) }
+                partial.outputStream().use { output ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    var total = 0L
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        if (count.toLong() > update.apkSize - total) {
+                            throw IOException("The update exceeded its published ${update.apkSize}-byte size")
+                        }
+                        output.write(buffer, 0, count)
+                        digest.update(buffer, 0, count)
+                        total += count
+                    }
+                    total
+                }
             }
-            if (expected > 0 && written != expected) {
-                throw IOException("Download stopped early at $written of $expected bytes")
+            if (written != update.apkSize) {
+                throw IOException("Download stopped at $written of ${update.apkSize} published bytes")
             }
             if (!looksLikeZip(partial)) {
                 throw IOException("The downloaded file is not an APK")
+            }
+            val actualDigest = digest.digest().toHex()
+            if (actualDigest != update.apkSha256) {
+                throw IOException("The downloaded APK failed its GitHub SHA-256 check")
             }
         } catch (e: Exception) {
             partial.delete()
@@ -191,7 +255,11 @@ object UpdateManager {
         }
 
         val installed = packageInfo(pm, context.packageName, 0)
-        require(compare(candidate.versionName ?: "", installed.versionName ?: "") > 0) {
+        val candidateVersion = candidate.versionName ?: ""
+        val installedVersion = installed.versionName ?: ""
+        val candidateCode = PackageInfoCompat.getLongVersionCode(candidate)
+        val installedCode = PackageInfoCompat.getLongVersionCode(installed)
+        require(isValidUpgrade(candidateVersion, candidateCode, installedVersion, installedCode)) {
             "The downloaded release is not newer than the installed one"
         }
 
@@ -242,14 +310,104 @@ object UpdateManager {
         }
 
     internal fun compare(left: String, right: String): Int {
-        fun parse(value: String): List<String> = value.removePrefix("v").split("-", limit = 2).flatMap { it.split('.') }
-        val a = parse(left); val b = parse(right)
-        for (i in 0 until maxOf(a.size, b.size)) {
-            val x = a.getOrNull(i) ?: "0"; val y = b.getOrNull(i) ?: "0"
-            val n = x.toIntOrNull(); val m = y.toIntOrNull()
-            val result = if (n != null && m != null) n.compareTo(m) else x.compareTo(y)
-            if (result != 0) return result
+        val a = requireNotNull(SemVer.parse(left)) { "Invalid semantic version: $left" }
+        val b = requireNotNull(SemVer.parse(right)) { "Invalid semantic version: $right" }
+        return a.compareTo(b)
+    }
+
+    internal fun isValidSemVer(value: String): Boolean = SemVer.parse(value) != null
+
+    internal fun isPrerelease(value: String): Boolean = SemVer.parse(value)?.prerelease != null
+
+    internal fun isValidUpgrade(
+        candidateVersion: String,
+        candidateCode: Long,
+        installedVersion: String,
+        installedCode: Long,
+    ): Boolean = candidateCode > installedCode &&
+        runCatching { compare(candidateVersion, installedVersion) > 0 }.getOrDefault(false)
+
+    internal fun newest(currentVersion: String, candidates: List<UpdateInfo>): UpdateInfo? {
+        if (!isValidSemVer(currentVersion)) return null
+        return candidates
+            .filter { isValidSemVer(it.version) && compare(it.version, currentVersion) > 0 }
+            .maxWithOrNull { left, right -> compare(left.version, right.version) }
+    }
+
+    internal fun sha256Hex(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(bytes).toHex()
+
+    internal fun requiredFreeBytes(downloadSize: Long): Long = try {
+        Math.addExact(Math.multiplyExact(downloadSize, 2L), FREE_SPACE_HEADROOM)
+    } catch (_: ArithmeticException) {
+        Long.MAX_VALUE
+    }
+
+    private fun ByteArray.toHex(): String = joinToString(separator = "") { byte ->
+        "%02x".format(byte.toInt() and 0xff)
+    }
+
+    private data class SemVer(
+        val major: String,
+        val minor: String,
+        val patch: String,
+        val prerelease: List<String>?,
+    ) : Comparable<SemVer> {
+        override fun compareTo(other: SemVer): Int {
+            compareNumeric(major, other.major).takeIf { it != 0 }?.let { return it }
+            compareNumeric(minor, other.minor).takeIf { it != 0 }?.let { return it }
+            compareNumeric(patch, other.patch).takeIf { it != 0 }?.let { return it }
+
+            val left = prerelease
+            val right = other.prerelease
+            if (left == null) return if (right == null) 0 else 1
+            if (right == null) return -1
+
+            for (index in 0 until minOf(left.size, right.size)) {
+                val a = left[index]
+                val b = right[index]
+                val aNumber = a.all(Char::isDigit)
+                val bNumber = b.all(Char::isDigit)
+                val result = when {
+                    aNumber && bNumber -> compareNumeric(a, b)
+                    aNumber -> -1
+                    bNumber -> 1
+                    else -> a.compareTo(b)
+                }
+                if (result != 0) return result
+            }
+            return left.size.compareTo(right.size)
         }
-        return 0
+
+        private fun compareNumeric(left: String, right: String): Int =
+            left.length.compareTo(right.length).takeIf { it != 0 } ?: left.compareTo(right)
+
+        companion object {
+            private val pattern = Regex(
+                "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)" +
+                    "(?:-([0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*))?" +
+                    "(?:\\+([0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*))?$",
+            )
+
+            fun parse(raw: String): SemVer? {
+                val match = pattern.matchEntire(raw.removePrefix("v")) ?: return null
+                val prerelease = match.groupValues[4]
+                    .takeIf(String::isNotEmpty)
+                    ?.split('.')
+                if (prerelease?.any { identifier ->
+                        identifier.length > 1 && identifier[0] == '0' &&
+                            identifier.all(Char::isDigit)
+                    } == true
+                ) {
+                    return null
+                }
+                return SemVer(
+                    major = match.groupValues[1],
+                    minor = match.groupValues[2],
+                    patch = match.groupValues[3],
+                    prerelease = prerelease,
+                )
+            }
+        }
     }
 }

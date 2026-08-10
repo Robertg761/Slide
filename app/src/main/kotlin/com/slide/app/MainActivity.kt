@@ -21,7 +21,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -31,7 +30,6 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -110,6 +108,12 @@ private fun SetupScreen(repository: SettingsRepository) {
     var showClearLearnedDataConfirmation by remember { mutableStateOf(false) }
     var clearingLearnedData by remember { mutableStateOf(false) }
     var privacyMessage by remember { mutableStateOf<String?>(null) }
+    var showThirdPartyNotices by remember { mutableStateOf(false) }
+    val thirdPartyNotices = remember {
+        runCatching {
+            context.assets.open("THIRD_PARTY_NOTICES.txt").bufferedReader().use { it.readText() }
+        }.getOrElse { "Licences and notices could not be loaded." }
+    }
 
     LaunchedEffect(settings.updateChecksEnabled, settings.includeAlphaUpdates) {
         if (settings.updateChecksEnabled) {
@@ -280,24 +284,21 @@ private fun SetupScreen(repository: SettingsRepository) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Voice typing", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "Speech is recognised on this device. Nothing is recorded or sent anywhere.",
+                        "Speech is recognised on this device. Microphone audio is kept only in " +
+                            "memory while Slide transcribes it; audio and transcripts are not sent " +
+                            "to a server by Slide.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
 
-                    val selected = WhisperModel.fromId(settings.voiceModelId)
-                    WhisperModel.entries.forEach { model ->
-                        ModelChoice(
-                            label = model.label,
-                            description = model.description,
-                            selected = model == selected,
-                            onClick = {
-                                scope.launch {
-                                    repository.update { it.copy(voiceModelId = model.name) }
-                                }
-                            },
-                        )
-                    }
+                    val model = WhisperModel.Default
+                    Text(model.label, style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "${model.description} Slide packages one verified model to keep every " +
+                            "install and security update smaller.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
 
@@ -307,8 +308,22 @@ private fun SetupScreen(repository: SettingsRepository) {
                     Text("GitHub is contacted only when you check. Android always confirms installation.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     SettingSwitch("Check GitHub for updates", settings.updateChecksEnabled) { value -> scope.launch { repository.update { it.copy(updateChecksEnabled = value) } } }
                     if (settings.updateChecksEnabled) {
-                        SettingSwitch("Include alpha prereleases", settings.includeAlphaUpdates) { value -> scope.launch { repository.update { it.copy(includeAlphaUpdates = value) } } }
+                        SettingSwitch("Include prereleases", settings.includeAlphaUpdates) { value -> scope.launch { repository.update { it.copy(includeAlphaUpdates = value) } } }
                         Button(onClick = { scope.launch { runCatching { UpdateManager.check(context, settings.includeAlphaUpdates) }.onSuccess { availableUpdate = it; updateMessage = if (it == null) "You already have the newest selected release." else null }.onFailure { updateMessage = "Could not check for updates: ${it.message ?: "network error"}" } } }) { Text("Check now") }
+                    }
+                }
+            }
+
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("About", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "Slide is Apache-2.0 licensed and includes open-source software and public language data.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Button(onClick = { showThirdPartyNotices = true }) {
+                        Text("Licences and notices")
                     }
                 }
             }
@@ -446,29 +461,23 @@ private fun SetupScreen(repository: SettingsRepository) {
             },
         )
     }
-}
-
-@Composable
-private fun ModelChoice(
-    label: String,
-    description: String,
-    selected: Boolean,
-    onClick: () -> Unit,
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth().selectable(selected = selected, onClick = onClick),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        RadioButton(selected = selected, onClick = null) // the whole row is the target
-        Column(Modifier.weight(1f)) {
-            Text(label, style = MaterialTheme.typography.bodyLarge)
-            Text(
-                description,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
+    if (showThirdPartyNotices) {
+        AlertDialog(
+            onDismissRequest = { showThirdPartyNotices = false },
+            title = { Text("Licences and notices") },
+            text = {
+                SelectionContainer {
+                    Text(
+                        thirdPartyNotices,
+                        modifier = Modifier.verticalScroll(rememberScrollState()),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = { showThirdPartyNotices = false }) { Text("Close") }
+            },
+        )
     }
 }
 

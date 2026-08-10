@@ -13,7 +13,6 @@ import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
-import android.view.inputmethod.ExtractedTextRequest
 import android.view.inputmethod.InputConnection
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
@@ -28,6 +27,7 @@ import com.slide.core.emoji.EmojiData
 import com.slide.core.emoji.EmojiLoader
 import com.slide.core.layout.Key
 import com.slide.core.layout.KeyType
+import com.slide.core.layout.KeyboardLayout
 import com.slide.core.layout.Layouts
 import com.slide.core.settings.KeyboardSettings
 import com.slide.core.settings.SettingsRepository
@@ -42,7 +42,9 @@ import com.slide.engine.lexicon.UserBigrams
 import com.slide.engine.lexicon.UserDictionary
 import com.slide.engine.lexicon.UserDictionaryStore
 import com.slide.engine.suggest.TypingSuggester
+import com.slide.ime.text.AndroidGraphemeBoundaries
 import com.slide.ime.text.EditorInputPolicy
+import com.slide.ime.text.EditorKeyboardMode
 import com.slide.ime.text.PrecedingWord
 import com.slide.ime.text.SelectionUpdate
 import com.slide.ime.text.matchTypedCase
@@ -94,15 +96,19 @@ class SlideInputMethodService :
      * Staying bound would keep a process alive — and eventually a few hundred megabytes of model
      * with it — for as long as Slide is the selected keyboard, which is essentially always.
      */
-    private val voiceClient by lazy {
+    private val voiceClientDelegate = lazy {
         VoiceInputClient(this).also { it.listener = this }
     }
+    private val voiceClient by voiceClientDelegate
 
     /** Which of the three key layers is on screen. */
     private enum class Layer { ALPHA, SYMBOLS, SYMBOLS_ALT }
 
     private var layer = Layer.ALPHA
+    private var editorBaseLayout: KeyboardLayout = Layouts.QwertyEn
     private var searchPreviousLayer = Layer.ALPHA
+    private var searchPreviousShift = ShiftState.OFF
+    private var preservedCapsLock = false
     private var lastShiftTapMs = 0L
     private var lastSpaceCommitMs = 0L
 
@@ -158,7 +164,21 @@ class SlideInputMethodService :
     private var observedLearnedDataClearEpoch: Long? = null
 
     private var emojiData: EmojiData? = null
+    private var emojiRenderable: Array<IntArray>? = null
     private var recentEmoji: List<String> = emptyList()
+
+    /** Monotonically identifies the editor whose connection may receive asynchronous input. */
+    private var editorGeneration = 0L
+
+    /** Editor generation that explicitly started the active voice session, or null when inactive. */
+    private var voiceEditorGeneration: Long? = null
+
+    /** Prevents an old, untagged speech callback being mistaken for a newly started session. */
+    private var voiceCancellationPending = false
+
+    /** Absolute selection cached from framework callbacks and updated optimistically by cursor swipes. */
+    private var cachedSelectionStart = -1
+    private var cachedSelectionEnd = -1
 
     /**
      * The word being typed, held as composing text in the editor rather than committed.
@@ -288,6 +308,7 @@ class SlideInputMethodService :
                 }
                 keyboardView?.settings = updated
                 emojiPanel?.skinTone = updated.emojiSkinTone
+                updateGestureAvailability()
 
                 val suggestionPolicyChanged =
                     previous.suggestionsEnabled != updated.suggestionsEnabled ||
@@ -355,6 +376,7 @@ class SlideInputMethodService :
                     "Decoder and suggester ready with ${lexicon.size} words" +
                         (bigrams?.let { ", ${it.pairCount} bigrams" } ?: ", no context model"),
                 )
+                updateGestureAvailability()
             }
         }
 
@@ -367,6 +389,7 @@ class SlideInputMethodService :
             }
             if (catalogue == null || renderable == null) return@launch
             emojiData = catalogue
+            emojiRenderable = renderable
             emojiPanel?.apply {
                 data = catalogue
                 this.renderable = renderable
@@ -381,6 +404,7 @@ class SlideInputMethodService :
         val strip = SuggestionStripView(this).apply {
             listener = this@SlideInputMethodService
             keyboardTheme = theme
+            voiceEnabled = editorInputPolicy.allowsVoice
         }
         val view = KeyboardView(this).apply {
             listener = this@SlideInputMethodService
@@ -388,6 +412,7 @@ class SlideInputMethodService :
             keyboardTheme = theme
             keyboardLayout = Layouts.QwertyEn
             enterAction = EnterAction.RETURN
+            gestureTypingAvailable = false
             addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
                 if (
                     left != oldLeft || top != oldTop || right != oldRight || bottom != oldBottom
@@ -407,7 +432,7 @@ class SlideInputMethodService :
             skinTone = settings.emojiSkinTone
             emojiData?.let {
                 data = it
-                renderable = EmojiGlyphs.renderable(it)
+                emojiRenderable?.let { cached -> renderable = cached }
             }
             visibility = View.GONE
         }
@@ -417,6 +442,7 @@ class SlideInputMethodService :
         gestureKeyMapCache = null
         voiceOverlay = overlay
         emojiPanel = emoji
+        updateGestureAvailability()
 
         // The picker and the voice overlay sit on top of the keys rather than replacing them, so the
         // input view keeps exactly the same height whichever is open. Swapping in a panel of a
@@ -438,12 +464,29 @@ class SlideInputMethodService :
         }
     }
 
+    override fun onStartInput(attribute: EditorInfo, restarting: Boolean) {
+        super.onStartInput(attribute, restarting)
+        // This callback precedes the visual input-view transition, so it closes the small window in
+        // which an old speech result could otherwise see the framework's new InputConnection.
+        editorGeneration++
+        cancelVoiceForEditorTransition()
+    }
+
+    override fun onFinishInput() {
+        editorGeneration++
+        cancelVoiceForEditorTransition()
+        super.onFinishInput()
+    }
+
     override fun onStartInputView(info: EditorInfo, restarting: Boolean) {
         super.onStartInputView(info, restarting)
+        editorGeneration++
+        cancelVoiceForEditorTransition()
         exitEmojiSearch(showPicker = false)
         layer = Layer.ALPHA
         hideEmojiPanel()
         editorInputPolicy = EditorInputPolicy.from(info.inputType)
+        editorBaseLayout = layoutFor(editorInputPolicy.keyboardMode)
         passwordField = editorInputPolicy.isPassword
         editorRequestsNoLearning =
             (info.imeOptions and EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) != 0
@@ -453,12 +496,22 @@ class SlideInputMethodService :
         literalWordInProgress = false
         abandonComposing()
         gestureKeyMapCache = null
+        lastShiftTapMs = 0L
+        preservedCapsLock = false
+        // EditorInfo already carries absolute initial offsets. Using it avoids a potentially slow
+        // getExtractedText Binder round trip on the IME main thread; later changes come through
+        // onUpdateSelection, also as absolute document offsets.
+        cachedSelectionStart = info.initialSelStart
+        cachedSelectionEnd = info.initialSelEnd
 
         keyboardView?.apply {
-            keyboardLayout = Layouts.QwertyEn
+            shiftState = ShiftState.OFF
+            keyboardLayout = editorBaseLayout
             settings = this@SlideInputMethodService.settings
             enterAction = enterActionFor(info.imeOptions)
         }
+        suggestionStrip?.voiceEnabled = editorInputPolicy.allowsVoice
+        updateGestureAvailability()
         applyTheme(resolveTheme())
         // Candidates from the previous field would be nonsense here, and tapping one would try to
         // rewrite text that belongs to a different editor.
@@ -496,10 +549,12 @@ class SlideInputMethodService :
      */
     override fun onWindowHidden() {
         super.onWindowHidden()
+        editorGeneration++
+        cancelVoiceForEditorTransition()
         exitEmojiSearch(showPicker = false)
         hideEmojiPanel()
-        hideVoiceOverlay()
-        voiceClient.unbind()
+        if (voiceClientDelegate.isInitialized()) voiceClient.unbind()
+        voiceCancellationPending = false
         if (learnedPersistence.deletionPending) scheduleLearnedDataDelete()
         saveLearnedWords()
     }
@@ -512,8 +567,12 @@ class SlideInputMethodService :
      */
     override fun onFinishInputView(finishingInput: Boolean) {
         super.onFinishInputView(finishingInput)
+        editorGeneration++
+        cancelVoiceForEditorTransition()
         literalWordInProgress = false
         abandonComposing()
+        cachedSelectionStart = -1
+        cachedSelectionEnd = -1
     }
 
     /**
@@ -588,7 +647,8 @@ class SlideInputMethodService :
     override fun onEvaluateFullscreenMode(): Boolean = false
 
     override fun onDestroy() {
-        voiceClient.unbind()
+        cancelVoiceForEditorTransition()
+        if (voiceClientDelegate.isInitialized()) voiceClient.unbind()
         val finalLearnedData = captureFinalLearnedData()
         scope.cancel()
         finalLearnedData?.let(::flushFinalLearnedData)
@@ -607,6 +667,7 @@ class SlideInputMethodService :
     }
 
     override fun onKeyCommit(key: Key, text: String, touchX: Float, touchY: Float) {
+        if (key.type != KeyType.SHIFT) lastShiftTapMs = 0L
         if (keyboardView?.searchMode == true) {
             handleSearchKey(key, text)
             return
@@ -640,21 +701,16 @@ class SlideInputMethodService :
         }
     }
 
-    override fun onGestureComplete(points: List<GesturePoint>) {
+    override fun onGestureComplete(points: List<GesturePoint>): Boolean {
         if (!settings.gestureTypingEnabled || !editorInputPolicy.allowsSuggestions) {
             clearSuggestions()
-            return
+            return false
         }
-        if (searchModeShown || emojiPanelShown || voiceOverlayShown || layer != Layer.ALPHA) return
+        if (searchModeShown || emojiPanelShown || voiceOverlayShown || layer != Layer.ALPHA) return false
 
-        val decoder = gestureDecoder ?: return
-        val connection = currentInputConnection ?: return
-        val keys = currentGestureKeyMap() ?: return
-
-        // A swipe ends the typed word as surely as a space does. It also settles what the swiped
-        // word will be predicted from, so the context is read after this rather than before.
-        if (composing.isNotEmpty()) selfEdit = true
-        finishComposing(connection)
+        val decoder = gestureDecoder ?: return false
+        val connection = currentInputConnection ?: return false
+        val keys = currentGestureKeyMap() ?: return false
 
         val candidates = decoder.decode(
             points = points,
@@ -662,7 +718,12 @@ class SlideInputMethodService :
             blockOffensive = settings.blockOffensiveWords,
             previousWord = precedingWordForSwipe(),
         )
-        val best = candidates.firstOrNull() ?: return
+        val best = candidates.firstOrNull() ?: return false
+
+        // Only settle a typed prefix once decoding has definitely produced replacement input. A
+        // rejected path falls back to its starting key in KeyboardView and must not mutate state.
+        if (composing.isNotEmpty()) selfEdit = true
+        finishComposing(connection)
 
         selfEdit = true
         commitGestureWord(connection, best.word)
@@ -673,39 +734,68 @@ class SlideInputMethodService :
         } else {
             clearSuggestions()
         }
+        return true
     }
 
     override fun onCursorMove(steps: Int) {
-        selfEdit = true
+        if (steps == 0) return
         val connection = currentInputConnection ?: return
-        val extracted = connection.getExtractedText(ExtractedTextRequest(), 0)
-        if (extracted != null) {
-            val start = extracted.selectionStart
-            val end = extracted.selectionEnd
-            val target = if (start != end) {
-                if (steps < 0) start else end
-            } else {
-                (start + steps).coerceIn(0, extracted.text?.length ?: start)
-            }
-            connection.setSelection(target, target)
-            literalWordInProgress = false
-            abandonComposing()
-            updateShiftFromCursor()
-            keyboardView?.announceForAccessibility("Cursor moved")
-        } else {
-            val direction = if (steps < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT
-            repeat(kotlin.math.abs(steps)) {
-                connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, direction))
-                connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, direction))
-            }
-            literalWordInProgress = false
-            abandonComposing()
+        selfEdit = true
+        val start = cachedSelectionStart
+        val end = cachedSelectionEnd
+        if (start < 0 || end < 0) {
+            sendCursorKeyEvents(connection, steps)
+            return
         }
+
+        val target = if (start != end) {
+            if (steps < 0) minOf(start, end) else maxOf(start, end)
+        } else if (steps < 0) {
+            val before = connection.getTextBeforeCursor(MAX_GRAPHEME_CONTEXT_CHARS, 0)?.toString()
+            if (before.isNullOrEmpty()) {
+                sendCursorKeyEvents(connection, steps)
+                return
+            }
+            (start - (before.length - AndroidGraphemeBoundaries.move(before, before.length, steps)))
+                .coerceAtLeast(0)
+        } else {
+            val after = connection.getTextAfterCursor(MAX_GRAPHEME_CONTEXT_CHARS, 0)?.toString()
+            if (after.isNullOrEmpty()) {
+                sendCursorKeyEvents(connection, steps)
+                return
+            }
+            start + AndroidGraphemeBoundaries.move(after, 0, steps)
+        }
+
+        if (connection.setSelection(target, target)) {
+            cachedSelectionStart = target
+            cachedSelectionEnd = target
+        } else {
+            cachedSelectionStart = -1
+            cachedSelectionEnd = -1
+        }
+        literalWordInProgress = false
+        abandonComposing()
+        updateShiftFromCursor()
+        keyboardView?.announceForAccessibility("Cursor moved")
+    }
+
+    private fun sendCursorKeyEvents(connection: InputConnection, steps: Int) {
+        val direction = if (steps < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT
+        repeat(kotlin.math.abs(steps)) {
+            connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, direction))
+            connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, direction))
+        }
+        cachedSelectionStart = -1
+        cachedSelectionEnd = -1
+        literalWordInProgress = false
+        abandonComposing()
+        updateShiftFromCursor()
     }
 
     override fun onDeleteWordGesture() {
-        selfEdit = true
         val connection = currentInputConnection ?: return
+        selfEdit = true
         finishComposing(connection)
         val selected = connection.getSelectedText(0)
         if (!selected.isNullOrEmpty()) {
@@ -906,13 +996,18 @@ class SlideInputMethodService :
     private fun startEmojiSearch() {
         hideEmojiPanel()
         searchPreviousLayer = layer
+        searchPreviousShift = shiftState()
         keyboardView?.apply {
+            shiftState = ShiftState.OFF
+            keyboardLayout = Layouts.QwertyEn
             searchQuery = ""
             searchMode = true
             searchResults = recentEmoji.take(MAX_SEARCH_RESULTS)
         }
+        suggestionStrip?.voiceEnabled = false
         suggestionStrip?.setEmptyMessage("Emoji search is open")
         clearSuggestions()
+        updateGestureAvailability()
         setBackCallbackRegistered(true)
     }
 
@@ -924,12 +1019,18 @@ class SlideInputMethodService :
         view.searchResults = emptyList()
         layer = searchPreviousLayer
         view.keyboardLayout = layoutFor(layer)
-        if (layer == Layer.ALPHA) updateShiftFromCursor()
+        if (layer == Layer.ALPHA && searchPreviousShift == ShiftState.LOCKED) {
+            setShift(ShiftState.LOCKED)
+        } else if (layer == Layer.ALPHA) {
+            updateShiftFromCursor()
+        }
+        suggestionStrip?.voiceEnabled = editorInputPolicy.allowsVoice
         refreshSuggestionEmptyMessage()
         if (showPicker && emojiData != null) {
             emojiPanel?.reset()
             emojiPanel?.visibility = View.VISIBLE
         }
+        updateGestureAvailability()
         setBackCallbackRegistered(if (showPicker) true else emojiPanelShown || voiceOverlayShown)
     }
 
@@ -963,6 +1064,14 @@ class SlideInputMethodService :
      * for the microphone during setup, before the user has any reason to say yes.
      */
     override fun onVoiceRequested() {
+        if (voiceCancellationPending) {
+            announce("Voice typing is still closing")
+            return
+        }
+        if (!editorInputPolicy.allowsVoice || currentInputConnection == null) {
+            announce("Voice typing is unavailable in this field")
+            return
+        }
         if (!MicPermissionActivity.hasPermission(this)) {
             startActivity(MicPermissionActivity.intent(this))
             return
@@ -979,39 +1088,68 @@ class SlideInputMethodService :
         }
         setBackCallbackRegistered(true)
         clearSuggestions()
+        voiceEditorGeneration = editorGeneration
+        updateGestureAvailability()
         voiceClient.start(WhisperModel.fromId(settings.voiceModelId))
     }
 
     override fun onVoiceDismissed(committed: Boolean) {
+        if (voiceEditorGeneration != editorGeneration) {
+            cancelVoiceForEditorTransition()
+            return
+        }
         if (committed) {
             voiceClient.stop() // the transcript arrives in onVoiceResult
         } else {
+            voiceEditorGeneration = null
+            voiceCancellationPending = true
             voiceClient.cancel()
             hideVoiceOverlay()
         }
     }
 
     override fun onVoiceState(state: VoiceInput.State) {
+        if (voiceCancellationPending) {
+            if (state == VoiceInput.State.Idle) voiceCancellationPending = false
+            return
+        }
+        if (voiceEditorGeneration != editorGeneration) return
         voiceOverlay?.state = state
         // Idle after a result or a cancellation means the session is over. The overlay is already
         // hidden in those paths; this catches the speech process dying underneath us.
-        if (state == VoiceInput.State.Idle && voiceOverlay?.errorText == null) hideVoiceOverlay()
+        if (state == VoiceInput.State.Idle && voiceOverlay?.errorText == null) {
+            voiceEditorGeneration = null
+            hideVoiceOverlay()
+        }
     }
 
     override fun onVoiceLevel(level: Float) {
+        if (voiceEditorGeneration != editorGeneration) return
         voiceOverlay?.setLevel(level)
     }
 
     override fun onVoiceResult(text: String) {
+        if (voiceCancellationPending) return
+        val resultGeneration = voiceEditorGeneration
+        voiceEditorGeneration = null
         hideVoiceOverlay()
-        if (text.isBlank()) return
-        selfEdit = true
-
+        if (
+            resultGeneration == null ||
+            resultGeneration != editorGeneration ||
+            !editorInputPolicy.allowsVoice ||
+            text.isBlank()
+        ) return
         val connection = currentInputConnection ?: return
+        selfEdit = true
         commitDictation(connection, text)
     }
 
     override fun onVoiceError(reason: String) {
+        if (voiceCancellationPending) {
+            voiceCancellationPending = false
+            return
+        }
+        if (voiceEditorGeneration != editorGeneration) return
         voiceOverlay?.apply {
             errorText = reason
             state = VoiceInput.State.Idle
@@ -1041,7 +1179,19 @@ class SlideInputMethodService :
             errorText = null
             state = VoiceInput.State.Idle
         }
+        updateGestureAvailability()
         setBackCallbackRegistered(emojiPanelShown)
+    }
+
+    /** Cancels asynchronous speech before an editor generation can be replaced. */
+    private fun cancelVoiceForEditorTransition() {
+        val hadSession = voiceEditorGeneration != null || voiceOverlayShown
+        voiceEditorGeneration = null
+        if (hadSession && voiceClientDelegate.isInitialized()) {
+            voiceCancellationPending = true
+            voiceClient.cancel()
+        }
+        hideVoiceOverlay()
     }
 
     private val voiceOverlayShown: Boolean
@@ -1064,6 +1214,7 @@ class SlideInputMethodService :
         clearSuggestions()
         panel.reset()
         panel.visibility = View.VISIBLE
+        updateGestureAvailability()
         setBackCallbackRegistered(true)
     }
 
@@ -1073,6 +1224,7 @@ class SlideInputMethodService :
             reset()
             visibility = View.GONE
         }
+        updateGestureAvailability()
         setBackCallbackRegistered(voiceOverlayShown)
     }
 
@@ -1084,8 +1236,9 @@ class SlideInputMethodService :
 
     override fun onEmojiPicked(emoji: String) {
         performHaptic()
+        val connection = currentInputConnection ?: return
         selfEdit = true
-        currentInputConnection?.commitText(emoji, 1)
+        connection.commitText(emoji, 1)
         // Whatever the undo record pointed at is no longer what sits before the cursor.
         lastAutocorrect = null
         literalWordInProgress = false
@@ -1101,8 +1254,8 @@ class SlideInputMethodService :
     override fun onEmojiBackspace() {
         performHaptic()
         val connection = currentInputConnection ?: return
-        // Emoji are surrogate pairs and often ZWJ sequences, so this borrows the key row's
-        // code-point-aware delete rather than removing one char and leaving half a glyph.
+        // Emoji are often multi-code-point ZWJ, tone, flag or keycap clusters, so this borrows the
+        // key row's ICU grapheme-aware delete rather than leaving a partial glyph behind.
         handleDelete(connection)
     }
 
@@ -1249,7 +1402,7 @@ class SlideInputMethodService :
         // Mid-word, backspace shortens the composing region rather than deleting from the editor,
         // so the suggestions keep up with what is actually in front of the cursor.
         if (composing.isNotEmpty()) {
-            composing.setLength(composing.length - 1)
+            composing.setLength(AndroidGraphemeBoundaries.previousBoundary(composing, composing.length))
             recordTouch(composing.length, Float.NaN, Float.NaN)
             if (composing.isEmpty()) {
                 // The empty string has to be committed before the region is finished. On its own,
@@ -1270,11 +1423,22 @@ class SlideInputMethodService :
         val selected = connection.getSelectedText(0)
         if (!selected.isNullOrEmpty()) {
             connection.commitText("", 1)
+            val collapsed = minOf(cachedSelectionStart, cachedSelectionEnd).takeIf { it >= 0 }
+            if (collapsed != null) {
+                cachedSelectionStart = collapsed
+                cachedSelectionEnd = collapsed
+            }
         } else {
-            // Delete a whole code point so emoji and surrogate pairs vanish in one press.
-            val before = connection.getTextBeforeCursor(2, 0) ?: ""
-            val toDelete = if (before.length == 2 && Character.isSurrogatePair(before[0], before[1])) 2 else 1
-            connection.deleteSurroundingText(toDelete, 0)
+            val before = connection.getTextBeforeCursor(MAX_GRAPHEME_CONTEXT_CHARS, 0)?.toString().orEmpty()
+            if (before.isNotEmpty()) {
+                val boundary = AndroidGraphemeBoundaries.previousBoundary(before, before.length)
+                val toDelete = before.length - boundary
+                connection.deleteSurroundingText(toDelete, 0)
+                if (cachedSelectionStart == cachedSelectionEnd && cachedSelectionStart >= 0) {
+                    cachedSelectionStart = (cachedSelectionStart - toDelete).coerceAtLeast(0)
+                    cachedSelectionEnd = cachedSelectionStart
+                }
+            }
         }
         literalWordInProgress = cursorTouchesWord(connection)
         updateShiftFromCursor()
@@ -1310,17 +1474,48 @@ class SlideInputMethodService :
     }
 
     private fun switchLayer(target: Layer) {
+        if (layer == Layer.ALPHA && target != Layer.ALPHA) {
+            preservedCapsLock = shiftState() == ShiftState.LOCKED
+        }
         layer = target
         gestureKeyMapCache = null
         if (target != Layer.ALPHA) setShift(ShiftState.OFF)
         keyboardView?.keyboardLayout = layoutFor(target)
-        if (target == Layer.ALPHA) updateShiftFromCursor()
+        if (target == Layer.ALPHA) {
+            if (preservedCapsLock) setShift(ShiftState.LOCKED) else updateShiftFromCursor()
+        }
+        updateGestureAvailability()
     }
 
     private fun layoutFor(layer: Layer) = when (layer) {
-        Layer.ALPHA -> Layouts.QwertyEn
+        Layer.ALPHA -> editorBaseLayout
         Layer.SYMBOLS -> Layouts.SymbolsEn
         Layer.SYMBOLS_ALT -> Layouts.SymbolsAltEn
+    }
+
+    private fun layoutFor(mode: EditorKeyboardMode): KeyboardLayout = when (mode) {
+        EditorKeyboardMode.TEXT -> Layouts.QwertyEn
+        EditorKeyboardMode.EMAIL -> Layouts.EmailEn
+        EditorKeyboardMode.URI -> Layouts.UriEn
+        EditorKeyboardMode.NUMBER, EditorKeyboardMode.PIN -> Layouts.NumberPad
+        EditorKeyboardMode.SIGNED_NUMBER -> Layouts.SignedNumberPad
+        EditorKeyboardMode.DECIMAL_NUMBER -> Layouts.DecimalPad
+        EditorKeyboardMode.SIGNED_DECIMAL_NUMBER -> Layouts.SignedDecimalPad
+        EditorKeyboardMode.PHONE -> Layouts.PhonePad
+        EditorKeyboardMode.DATE -> Layouts.DatePad
+        EditorKeyboardMode.TIME -> Layouts.TimePad
+        EditorKeyboardMode.DATETIME -> Layouts.DateTimePad
+    }
+
+    private fun updateGestureAvailability() {
+        keyboardView?.gestureTypingAvailable =
+            settings.gestureTypingEnabled &&
+            editorInputPolicy.allowsSuggestions &&
+            gestureDecoder != null &&
+            layer == Layer.ALPHA &&
+            !searchModeShown &&
+            !emojiPanelShown &&
+            !voiceOverlayShown
     }
 
     // endregion
@@ -1839,6 +2034,9 @@ class SlideInputMethodService :
             oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd,
         )
 
+        cachedSelectionStart = newSelStart
+        cachedSelectionEnd = newSelEnd
+
         val ourEdit = selfEdit
         selfEdit = false
 
@@ -1855,6 +2053,7 @@ class SlideInputMethodService :
 
         if (composing.isNotEmpty() && !update.cursorLeftComposing) {
             update.composingAtEnd?.let { composingAtEnd = it }
+            if (update.externalSelectionChanged) updateShiftFromCursor()
             return
         }
         // Dropping one word and reopening another are the same gesture — a tap somewhere else in
@@ -1868,6 +2067,7 @@ class SlideInputMethodService :
             literalWordInProgress = false
             clearSuggestions()
             reopenWordAtCursor(newSelStart, newSelEnd)
+            updateShiftFromCursor()
         }
     }
 
@@ -1942,7 +2142,11 @@ class SlideInputMethodService :
 
     /** Applies sentence auto-capitalisation, unless caps lock is on or the user disabled it. */
     private fun updateShiftFromCursor() {
-        if (layer != Layer.ALPHA) return
+        if (layer != Layer.ALPHA || searchModeShown) return
+        if (editorBaseLayout.rows.none { row -> row.keys.any { it.type == KeyType.SHIFT } }) {
+            setShift(ShiftState.OFF)
+            return
+        }
         if (shiftState() == ShiftState.LOCKED) return
         if (!settings.autoCapitalize) {
             setShift(ShiftState.OFF)
@@ -1997,15 +2201,17 @@ class SlideInputMethodService :
         }
     }
 
-    private fun enterActionFor(imeOptions: Int): EnterAction = when (
-        imeOptions and EditorInfo.IME_MASK_ACTION
-    ) {
-        EditorInfo.IME_ACTION_GO -> EnterAction.GO
-        EditorInfo.IME_ACTION_SEARCH -> EnterAction.SEARCH
-        EditorInfo.IME_ACTION_SEND -> EnterAction.SEND
-        EditorInfo.IME_ACTION_NEXT -> EnterAction.NEXT
-        EditorInfo.IME_ACTION_DONE -> EnterAction.DONE
-        else -> EnterAction.RETURN
+    private fun enterActionFor(imeOptions: Int): EnterAction {
+        if ((imeOptions and EditorInfo.IME_FLAG_NO_ENTER_ACTION) != 0) return EnterAction.RETURN
+        return when (imeOptions and EditorInfo.IME_MASK_ACTION) {
+            EditorInfo.IME_ACTION_GO -> EnterAction.GO
+            EditorInfo.IME_ACTION_SEARCH -> EnterAction.SEARCH
+            EditorInfo.IME_ACTION_SEND -> EnterAction.SEND
+            EditorInfo.IME_ACTION_PREVIOUS -> EnterAction.PREVIOUS
+            EditorInfo.IME_ACTION_NEXT -> EnterAction.NEXT
+            EditorInfo.IME_ACTION_DONE -> EnterAction.DONE
+            else -> EnterAction.RETURN
+        }
     }
 
     private fun resolveTheme(): KeyboardTheme {
@@ -2031,6 +2237,7 @@ class SlideInputMethodService :
         const val MAX_WORD_DELETE_CHARS = 2048
         const val MAX_SEARCH_QUERY_LENGTH = 64
         const val MAX_SEARCH_RESULTS = 6
+        const val MAX_GRAPHEME_CONTEXT_CHARS = 256
 
         /**
          * Characters whose touch positions are tracked.

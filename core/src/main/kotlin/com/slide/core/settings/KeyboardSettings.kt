@@ -9,14 +9,24 @@ import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.preferencesDataStore
 import com.slide.core.emoji.EmojiData
 import com.slide.core.theme.Themes
+import java.io.File
 import java.io.IOException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /** User-facing keyboard preferences. */
 data class KeyboardSettings(
@@ -83,7 +93,7 @@ data class KeyboardSettings(
     /** Explicit opt-in: update checks are the only feature that contacts GitHub. */
     val updateChecksEnabled: Boolean = false,
     /** Alpha builds are intentionally opt-in even while Slide itself is pre-1.0. */
-    val includeAlphaUpdates: Boolean = true,
+    val includeAlphaUpdates: Boolean = false,
 ) {
     /** Autocorrection can only operate while the suggestion pipeline and strip are enabled. */
     val isAutocorrectionActive: Boolean
@@ -92,8 +102,33 @@ data class KeyboardSettings(
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "slide_settings")
 
+/** One DataStore per file per process, rooted where Android backup cannot see it. */
+private object NoBackupRecentEmojiStore {
+    private val stores = mutableMapOf<String, DataStore<Preferences>>()
+
+    @Synchronized
+    fun get(context: Context): DataStore<Preferences> {
+        val file = File(context.noBackupFilesDir, "datastore/recent_emoji.preferences_pb")
+        return stores.getOrPut(file.absolutePath) {
+            PreferenceDataStoreFactory.create(
+                scope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+                produceFile = {
+                    val directory = checkNotNull(file.parentFile)
+                    check(directory.isDirectory || directory.mkdirs()) {
+                        "Could not create the no-backup emoji-history directory"
+                    }
+                    file
+                },
+            )
+        }
+    }
+}
+
 /** Reads and writes [KeyboardSettings]. Held by the IME and the settings UI alike. */
 class SettingsRepository(private val context: Context) {
+
+    private val recentEmojiStore = NoBackupRecentEmojiStore.get(context.applicationContext)
+    private val recentEmojiMigration = Mutex()
 
     /**
      * Deduplicated because recently-used emoji share this store, and they change on every tap.
@@ -117,13 +152,22 @@ class SettingsRepository(private val context: Context) {
      * Usage rather than preference, which is why it sits beside [settings] instead of inside it:
      * nothing in the settings UI shows it, and it changes far more often than anything that does.
      */
-    val recentEmoji: Flow<List<String>> = context.dataStore.data
-        .map { it[Keys.RECENT_EMOJI].orEmpty().split(RECENT_SEPARATOR).filter(String::isNotEmpty) }
-        .catch { error ->
-            if (error !is IOException) throw error
-            emit(emptyList())
-        }
-        .distinctUntilChanged()
+    val recentEmoji: Flow<List<String>> = flow {
+        migrateLegacyRecentEmoji()
+        emitAll(
+            recentEmojiStore.data
+                .map {
+                    it[Keys.RECENT_EMOJI].orEmpty()
+                        .split(RECENT_SEPARATOR)
+                        .filter(String::isNotEmpty)
+                }
+                .catch { error ->
+                    if (error !is IOException) throw error
+                    emit(emptyList())
+                }
+                .distinctUntilChanged(),
+        )
+    }
 
     /**
      * Moves [emoji] to the front of the recent list, trimmed to [MAX_RECENT].
@@ -132,7 +176,8 @@ class SettingsRepository(private val context: Context) {
      * stays a most-recently-used list and not a history log.
      */
     suspend fun recordEmojiUse(emoji: String) {
-        context.dataStore.edit { prefs ->
+        migrateLegacyRecentEmoji()
+        recentEmojiStore.edit { prefs ->
             val current = prefs[Keys.RECENT_EMOJI].orEmpty()
                 .split(RECENT_SEPARATOR)
                 .filter { it.isNotEmpty() && it != emoji }
@@ -142,6 +187,19 @@ class SettingsRepository(private val context: Context) {
     }
 
     suspend fun clearRecentEmoji() {
+        recentEmojiStore.edit { it.remove(Keys.RECENT_EMOJI) }
+        // Remove any pre-0.2.1 value even when migration had not run yet.
+        context.dataStore.edit { it.remove(Keys.RECENT_EMOJI) }
+    }
+
+    /** Moves pre-0.2.1 emoji history out of the backed-up settings file exactly once. */
+    private suspend fun migrateLegacyRecentEmoji() = recentEmojiMigration.withLock {
+        val legacy = context.dataStore.data.first()[Keys.RECENT_EMOJI] ?: return@withLock
+        recentEmojiStore.edit { privatePrefs ->
+            if (privatePrefs[Keys.RECENT_EMOJI].isNullOrEmpty()) {
+                privatePrefs[Keys.RECENT_EMOJI] = legacy
+            }
+        }
         context.dataStore.edit { it.remove(Keys.RECENT_EMOJI) }
     }
 
