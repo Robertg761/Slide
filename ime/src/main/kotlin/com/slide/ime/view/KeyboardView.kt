@@ -2,10 +2,12 @@ package com.slide.ime.view
 
 import android.content.Context
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -14,6 +16,7 @@ import android.util.TypedValue
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.animation.AnimationUtils
 import android.view.accessibility.AccessibilityNodeInfo
 import androidx.core.view.ViewCompat
 import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
@@ -166,6 +169,10 @@ class KeyboardView @JvmOverloads constructor(
     private val keyGapH = dp(3f)
     private val keyGapV = dp(3.5f)
     private val cornerRadius = dp(12f)
+    private val keyShadowOffset = dp(1f)
+
+    /** Medium weight keeps 22sp letters crisp where regular reads spindly on a bare keycap. */
+    private val keyLabelTypeface: Typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
 
     private var placedKeys: List<PlacedKey> = emptyList()
 
@@ -220,6 +227,14 @@ class KeyboardView @JvmOverloads constructor(
     )
 
     private val pointers = HashMap<Int, Pointer>()
+
+    /**
+     * Keys whose pressed overlay is still fading out, by release time.
+     *
+     * Keyed by the layout's [Key] rather than the placed cell because geometry is recomputed on
+     * layout passes, and a fade that survives one must follow the key, not a stale rectangle.
+     */
+    private val fadingPresses = HashMap<Key, Long>()
 
     /** Pointer id that owns the current gesture, or null when not gesturing. */
     private var gesturePointerId: Int? = null
@@ -436,14 +451,31 @@ class KeyboardView @JvmOverloads constructor(
 
         if (searchMode) drawSearchHeader(canvas)
 
+        val now = AnimationUtils.currentAnimationTimeMillis()
+        fadingPresses.values.removeAll { now - it >= PRESS_FADE_MS }
+
         placedKeys.forEach { placed ->
-            drawKey(canvas, placed, pressed = pointers.values.any { it.placed === placed })
+            val overlay = if (pointers.values.any { it.placed === placed }) {
+                1f
+            } else {
+                fadingPresses[placed.key]?.let { released ->
+                    1f - (now - released) / PRESS_FADE_MS.toFloat()
+                } ?: 0f
+            }
+            drawKey(canvas, placed, overlay)
         }
+        if (fadingPresses.isNotEmpty()) postInvalidateOnAnimation()
 
         if (gesturePointerId != null) drawGestureTrail(canvas)
     }
 
-    private fun drawKey(canvas: Canvas, placed: PlacedKey, pressed: Boolean) {
+    /** Marks a key as just released, so its pressed overlay decays instead of blinking off. */
+    private fun beginPressFade(key: Key) {
+        fadingPresses[key] = AnimationUtils.currentAnimationTimeMillis()
+    }
+
+    /** @param pressOverlay 1 while held, decaying to 0 across the release fade. */
+    private fun drawKey(canvas: Canvas, placed: PlacedKey, pressOverlay: Float) {
         val key = placed.key
         val compactSurface =
             !settings.showKeyBorders && KeySurfaceStyle.usesCompactSurface(key.type)
@@ -460,12 +492,19 @@ class KeyboardView @JvmOverloads constructor(
         // the space, mode, and enter targets retain compact pill surfaces.
         val drawSurface = KeySurfaceStyle.drawsSurface(key.type, settings.showKeyBorders)
         if (drawSurface) {
+            // A hand-drawn under-edge shadow rather than setShadowLayer, which hardware canvases
+            // only honour for shapes from API 28. One offset rect is enough to lift the cap.
+            reusableRect.offset(0f, keyShadowOffset)
+            fillPaint.color = keyboardTheme.keyShadow
+            canvas.drawRoundRect(reusableRect, cornerRadius, cornerRadius, fillPaint)
+            reusableRect.offset(0f, -keyShadowOffset)
             fillPaint.color = backgroundColorFor(key)
             canvas.drawRoundRect(reusableRect, cornerRadius, cornerRadius, fillPaint)
         }
 
-        if (pressed) {
+        if (pressOverlay > 0f) {
             fillPaint.color = keyboardTheme.keyPressedOverlay
+            fillPaint.alpha = (Color.alpha(keyboardTheme.keyPressedOverlay) * pressOverlay).roundToInt()
             canvas.drawRoundRect(reusableRect, cornerRadius, cornerRadius, fillPaint)
         }
 
@@ -485,6 +524,7 @@ class KeyboardView @JvmOverloads constructor(
         }
 
         labelPaint.color = textColorFor(key)
+        labelPaint.typeface = keyLabelTypeface
         val maxText = min(placed.width * if (key.type == KeyType.CHARACTER) 0.65f else 0.8f, placed.height * 0.58f)
         labelPaint.textSize = min(if (key.type == KeyType.CHARACTER) sp(22f) else sp(15f), maxText)
         val metrics = labelPaint.fontMetrics
@@ -625,6 +665,7 @@ class KeyboardView @JvmOverloads constructor(
 
     private fun drawSpaceLabel(canvas: Canvas, placed: PlacedKey) {
         labelPaint.color = keyboardTheme.hintText
+        labelPaint.typeface = keyLabelTypeface
         labelPaint.textSize = min(sp(12f), placed.width * 0.28f)
         val metrics = labelPaint.fontMetrics
         val baseline = placed.centerY - (metrics.ascent + metrics.descent) / 2f
@@ -635,22 +676,33 @@ class KeyboardView @JvmOverloads constructor(
         if (gesturePoints.size < 2) return
 
         // Preserve the full visible motion and soften the sampled polyline into one continuous
-        // stroke. Segment-by-segment alpha made fast traces look dashed, while discarding most of
-        // the path made a long glide look as though it had stopped tracking the finger.
+        // stroke. The taper is drawn as a handful of smoothed chunks that share endpoints and
+        // round caps — thin and faint at the tail, full weight under the finger — because true
+        // per-segment alpha made fast traces look dashed, while discarding most of the path made
+        // a long glide look as though it had stopped tracking the finger.
         val start = (gesturePoints.size - TRAIL_POINTS).coerceAtLeast(0)
+        val span = gesturePoints.lastIndex - start
         trailPaint.color = keyboardTheme.gestureTrail
-        trailPaint.alpha = 215
-        trailPaint.strokeWidth = dp(5.5f)
-        trailPath.reset()
-        trailPath.moveTo(gesturePoints[start].x, gesturePoints[start].y)
-        for (i in start + 1 until gesturePoints.lastIndex) {
-            val point = gesturePoints[i]
-            val next = gesturePoints[i + 1]
-            trailPath.quadTo(point.x, point.y, (point.x + next.x) / 2f, (point.y + next.y) / 2f)
+        for (segment in 0 until TRAIL_SEGMENTS) {
+            val from = start + span * segment / TRAIL_SEGMENTS
+            val to = start + span * (segment + 1) / TRAIL_SEGMENTS
+            if (to <= from) continue
+
+            // 0 at the trail's tail, 1 under the finger.
+            val head = (segment + 1f) / TRAIL_SEGMENTS
+            trailPaint.strokeWidth = dp(TRAIL_TAIL_WIDTH_DP + (TRAIL_HEAD_WIDTH_DP - TRAIL_TAIL_WIDTH_DP) * head)
+            trailPaint.alpha = (TRAIL_TAIL_ALPHA + (TRAIL_HEAD_ALPHA - TRAIL_TAIL_ALPHA) * head).roundToInt()
+
+            trailPath.reset()
+            trailPath.moveTo(gesturePoints[from].x, gesturePoints[from].y)
+            for (i in from + 1 until to) {
+                val point = gesturePoints[i]
+                val next = gesturePoints[i + 1]
+                trailPath.quadTo(point.x, point.y, (point.x + next.x) / 2f, (point.y + next.y) / 2f)
+            }
+            trailPath.lineTo(gesturePoints[to].x, gesturePoints[to].y)
+            canvas.drawPath(trailPath, trailPaint)
         }
-        val end = gesturePoints.last()
-        trailPath.lineTo(end.x, end.y)
-        canvas.drawPath(trailPath, trailPaint)
     }
 
     private fun backgroundColorFor(key: Key): Int = when (key.type) {
@@ -949,6 +1001,7 @@ class KeyboardView @JvmOverloads constructor(
             if (nowOver != null && nowOver !== pointer.placed) {
                 cancelPendingLongPress()
                 cancelRepeat()
+                beginPressFade(pointer.placed.key)
                 pointer.placed = nowOver
                 pointer.slidOff = true
                 showPreviewFor(nowOver)
@@ -962,6 +1015,7 @@ class KeyboardView @JvmOverloads constructor(
         cancelPendingLongPress()
         cancelRepeat(pointerId)
         previewPopup.dismiss()
+        beginPressFade(pointer.placed.key)
 
         if (pointer.cursorMove) {
             cursorRemainderPx = 0f
@@ -1216,6 +1270,22 @@ class KeyboardView @JvmOverloads constructor(
 
     private companion object {
         const val TRAIL_POINTS = 192
+
+        /**
+         * The trail's taper, drawn as a few chunks rather than a per-point gradient. Six is enough
+         * that the steps hide inside the stroke's own antialiasing.
+         */
+        const val TRAIL_SEGMENTS = 6
+        const val TRAIL_HEAD_WIDTH_DP = 5.5f
+        const val TRAIL_TAIL_WIDTH_DP = 2.25f
+        const val TRAIL_HEAD_ALPHA = 215f
+        const val TRAIL_TAIL_ALPHA = 50f
+
+        /**
+         * How long a released key's highlight takes to decay. Long enough to register as a glow,
+         * short enough that rapid typing never shows more than a couple of trailing keys lit.
+         */
+        const val PRESS_FADE_MS = 140L
 
         /**
          * The least a swipe must be to be worth decoding, mirroring `DecoderConfig`'s own floors.

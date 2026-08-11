@@ -45,6 +45,9 @@ class KeyPreviewPopup(private val anchor: View) {
         label.setTextColor(theme.popupText)
         label.textSize = 28f
         background.setColor(theme.popupBackground)
+        // Elevation alone vanishes on dark themes, where the popup and the keys share a surface
+        // colour; the same hairline the keycaps use keeps the popup's edge legible everywhere.
+        background.setStroke(density.roundToInt().coerceAtLeast(1), theme.keyBorder)
 
         label.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED)
         val popupWidth = maxOf(label.measuredWidth, (key.width * 1.18f).roundToInt())
@@ -165,6 +168,10 @@ class AlternatesPopup(private val anchor: View) {
 
         private val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val selectionPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = density
+        }
         private val reusableRect = RectF()
         private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             textAlign = Paint.Align.CENTER
@@ -188,6 +195,7 @@ class AlternatesPopup(private val anchor: View) {
             )
             backgroundPaint.color = theme.popupBackground
             selectionPaint.color = theme.popupSelectedBackground
+            borderPaint.color = theme.keyBorder
             textPaint.color = theme.popupText
             textPaint.textSize = 22 * density
             requestLayout()
@@ -230,6 +238,11 @@ class AlternatesPopup(private val anchor: View) {
             val radius = 12 * density
             reusableRect.set(0f, 0f, width.toFloat(), height.toFloat())
             canvas.drawRoundRect(reusableRect, radius, radius, backgroundPaint)
+            // Same rationale as the key preview: elevation is invisible against a same-coloured
+            // dark keyboard, so the edge is drawn. Inset half a stroke to keep it unclipped.
+            val edge = borderPaint.strokeWidth / 2f
+            reusableRect.inset(edge, edge)
+            canvas.drawRoundRect(reusableRect, radius - edge, radius - edge, borderPaint)
 
             val metrics = textPaint.fontMetrics
             val baselineOffset = (metrics.descent + metrics.ascent) / 2f

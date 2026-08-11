@@ -25,6 +25,7 @@ data class KeyboardTheme(
     @param:ColorInt val hintText: Int,
 
     @param:ColorInt val keyBorder: Int,
+    @param:ColorInt val keyShadow: Int,
     @param:ColorInt val keyPressedOverlay: Int,
 
     @param:ColorInt val gestureTrail: Int,
