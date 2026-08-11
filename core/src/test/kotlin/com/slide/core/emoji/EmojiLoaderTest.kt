@@ -1,6 +1,8 @@
 package com.slide.core.emoji
 
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
 import java.io.File
 import java.io.IOException
 import org.junit.Assert.assertEquals
@@ -188,6 +190,52 @@ class EmojiLoaderTest {
         assertThrows(IOException::class.java) {
             EmojiLoader.read(ByteArrayInputStream(bytes.copyOf(bytes.size / 2)))
         }
+    }
+
+    @Test
+    fun `rejects an entry filed under a category that does not exist`() {
+        val bytes = catalogue(categoryCount = 3, entryCategory = 3)
+        assertThrows(IOException::class.java) { EmojiLoader.read(ByteArrayInputStream(bytes)) }
+    }
+
+    /**
+     * Category ids are written one to a byte and read back into a signed `Byte`. Past 127 they go
+     * negative unless they are masked, and the first thing [EmojiData] does with one is index an
+     * array — so this used to be an out-of-bounds crash inside a constructor, thrown from a
+     * coroutine with nothing to catch it, rather than a picker that failed to load.
+     */
+    @Test
+    fun `reads a category id above 127`() {
+        val data = EmojiLoader.read(ByteArrayInputStream(catalogue(130, entryCategory = 129)))
+
+        assertEquals(1, data.size)
+        assertEquals(listOf(0), data.indicesIn(129).toList())
+        assertTrue(data.indicesIn(0).isEmpty())
+    }
+
+    /** One entry, in [entryCategory], for a catalogue naming [categoryCount] categories. */
+    private fun catalogue(categoryCount: Int, entryCategory: Int): ByteArray {
+        val bytes = ByteArrayOutputStream()
+        DataOutputStream(bytes).use { out ->
+            out.writeInt(0x53454D4A) // "SEMJ"
+            out.writeByte(1) // version
+            out.writeByte(categoryCount)
+            repeat(categoryCount) { index -> out.writeShortString("Category $index") }
+            out.writeShort(1) // one entry
+            out.writeByte(entryCategory)
+            out.writeShortString("🍕") // pizza
+            out.writeByte(0) // no skin tones
+            val search = "pizza".toByteArray(Charsets.UTF_8)
+            out.writeShort(search.size)
+            out.write(search)
+        }
+        return bytes.toByteArray()
+    }
+
+    private fun DataOutputStream.writeShortString(value: String) {
+        val encoded = value.toByteArray(Charsets.UTF_8)
+        writeByte(encoded.size)
+        write(encoded)
     }
 
     // endregion

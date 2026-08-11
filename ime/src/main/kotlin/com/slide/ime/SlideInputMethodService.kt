@@ -61,6 +61,7 @@ import com.slide.ime.text.GestureDeleteTransaction
 import com.slide.ime.text.GestureEditorSnapshot
 import com.slide.ime.text.GestureEditTransaction
 import com.slide.ime.text.GestureUndoState
+import com.slide.ime.text.OrderedInputGuard
 import com.slide.ime.text.OrderedInputQueue
 import com.slide.ime.text.OrderedInputRequest
 import com.slide.ime.text.PrecedingWord
@@ -304,6 +305,9 @@ class SlideInputMethodService :
     /** Completed swipes and following edits are chained so off-thread inference cannot reorder input. */
     private val gestureInputQueue = OrderedInputQueue(scope) { editorGeneration }
 
+    /** What the field looked like when the edit at the head of that chain was released. */
+    private var orderedInputGuard: OrderedInputGuard? = null
+
     /** Canceled native inference is not interruptible; one gate prevents canceled work piling up. */
     private val gestureDecodeMutex = Mutex()
 
@@ -332,19 +336,40 @@ class SlideInputMethodService :
                     !editorInputPolicy.allowsPersonalizedLearning ||
                     updated.incognitoModeEnabled
 
-                val previousClearEpoch = observedLearnedDataClearEpoch
-                observedLearnedDataClearEpoch = updated.learnedDataClearEpoch
-                if (previousClearEpoch == null && !learnedLoadStarted) {
-                    // Establish the persisted clear epoch before reading either file. Otherwise a
-                    // settings clear that wins startup could become our baseline after stale data
-                    // had already been restored into memory.
+                val baselineClearEpoch = observedLearnedDataClearEpoch
+                val clearEpoch = updated.learnedDataClearEpoch
+                // Wiping everything this person has taught the keyboard is irreversible, so what an
+                // observed clear epoch is allowed to mean is spelled out in full. Four cases:
+                //
+                //   epoch < 0         Not authoritative. The settings file has never been read
+                //                     successfully and this snapshot is the whole-defaults fallback
+                //                     carrying KeyboardSettings.LEARNED_DATA_EPOCH_UNKNOWN. It says
+                //                     nothing about the stored epoch, so it becomes neither a
+                //                     baseline nor a wipe; the real value arrives when a retry
+                //                     succeeds. Treating its 0 as authoritative is what would make
+                //                     the true epoch N look like a clear a moment later.
+                //   no baseline yet   The first authoritative reading. Adopt it. There is nothing
+                //                     to compare it against, so nothing has been cleared.
+                //   epoch < baseline  The stored file was reset — corruption replaced it with an
+                //                     empty one. Adopt the lower value rather than keeping ours: a
+                //                     stale high baseline would put the user's next Clear (0 -> 1)
+                //                     underneath it and silently ignore it for the whole session.
+                //   epoch > baseline  The only case that is a clear the user asked for. Wipe.
+                if (clearEpoch >= 0) {
+                    val userRequestedClear =
+                        baselineClearEpoch != null && clearEpoch > baselineClearEpoch
+                    // Established before either file is read, so a clear that wins startup cannot
+                    // become our baseline after stale data has already been restored into memory.
+                    observedLearnedDataClearEpoch = clearEpoch
+                    if (userRequestedClear) clearLearnedDataFromMemoryAndDisk()
+                }
+                if (!learnedLoadStarted) {
+                    // Started by the first snapshot of any kind, authoritative or not. Waiting for a
+                    // readable epoch would leave this person without their own words for as long as
+                    // the settings file keeps failing, and the clear epoch above is already settled
+                    // for this emission.
                     learnedLoadStarted = true
                     loadLearnedData()
-                } else if (
-                    previousClearEpoch != null &&
-                    previousClearEpoch != updated.learnedDataClearEpoch
-                ) {
-                    clearLearnedDataFromMemoryAndDisk()
                 }
 
                 if (
@@ -816,11 +841,23 @@ class SlideInputMethodService :
     }
 
     override fun onKeyCommit(key: Key, text: String, touchX: Float, touchY: Float) {
-        if (queueBehindGestureInput { processKeyCommit(key, text, touchX, touchY) }) return
-        processKeyCommit(key, text, touchX, touchY)
+        // Taken here rather than where the key is applied: a tap released while a swipe is still
+        // decoding runs minutes-of-thought later in queue order, and a double-tap window measured
+        // from that moment turns two unhurried shift taps into caps lock.
+        val pressedAtMs = System.currentTimeMillis()
+        if (queueBehindGestureInput { processKeyCommit(key, text, touchX, touchY, pressedAtMs) }) {
+            return
+        }
+        processKeyCommit(key, text, touchX, touchY, pressedAtMs)
     }
 
-    private fun processKeyCommit(key: Key, text: String, touchX: Float, touchY: Float) {
+    private fun processKeyCommit(
+        key: Key,
+        text: String,
+        touchX: Float,
+        touchY: Float,
+        pressedAtMs: Long,
+    ) {
         if (key.type != KeyType.DELETE) gestureUndoState.invalidate()
         if (key.type != KeyType.SHIFT) lastShiftTapMs = 0L
         if (keyboardView?.searchMode == true) {
@@ -856,13 +893,13 @@ class SlideInputMethodService :
         }
 
         when (key.type) {
-            KeyType.SHIFT -> handleShiftTap()
+            KeyType.SHIFT -> handleShiftTap(pressedAtMs)
             KeyType.DELETE -> handleDelete(connection)
             KeyType.ENTER -> handleEnter(connection)
             KeyType.SYMBOLS -> switchLayer(Layer.SYMBOLS)
             KeyType.SYMBOLS_ALT -> switchLayer(Layer.SYMBOLS_ALT)
             KeyType.ALPHA -> switchLayer(Layer.ALPHA)
-            KeyType.SPACE -> handleSpace(connection, text)
+            KeyType.SPACE -> handleSpace(connection, text, pressedAtMs)
             KeyType.MIC -> processVoiceRequested()
             KeyType.EMOJI -> showEmojiPanel()
             KeyType.GLOBE, KeyType.SETTINGS -> Unit
@@ -930,7 +967,8 @@ class SlideInputMethodService :
             currentInputConnection !== connection ||
             !gestureModeAvailable()
         ) return
-        if (!editorSnapshot.matches(gestureEditorSnapshot(connection))) {
+        val liveSnapshot = gestureEditorSnapshot(connection)
+        if (!editorSnapshot.matches(liveSnapshot)) {
             clearGesturePreview()
             return
         }
@@ -942,10 +980,14 @@ class SlideInputMethodService :
         // that intermediate position as well as the final commit. Editors are allowed to coalesce
         // both callbacks; ExpectedSelectionTracker deliberately handles that case.
         val composingBefore = composing.toString()
-        val selectionBeforeFinish = readEditorSelection(connection) ?: collapsedCursorPosition()?.let {
-            EditorSelection(it, it)
-        }
+        // The snapshot just compared was read from this connection with nothing edited since, so
+        // its cursor is the position before the word is settled. Extracting text again only to ask
+        // the same question is a blocking round trip that can carry the whole field with it.
+        val selectionBeforeFinish = liveSnapshot.cursor
         val corrected = finishComposing(connection)
+        // Reused as the position the commit starts from: settling the word is the only edit
+        // between the two, and where nothing was settled the position has not moved at all.
+        var selectionBeforeCommit = selectionBeforeFinish
         if (composingBefore.isNotEmpty()) {
             val selectionAfterFinish = readEditorSelection(connection) ?: run {
                 val applied = lastAutocorrect?.applied.takeIf { corrected }
@@ -967,10 +1009,11 @@ class SlideInputMethodService :
                 if (selectionAfterFinish != selectionBeforeFinish) {
                     expectedSelections.expect(selectionBeforeFinish, selectionAfterFinish)
                 }
+                selectionBeforeCommit = selectionAfterFinish
             }
         }
 
-        if (!commitGestureWord(connection, best.word)) {
+        if (!commitGestureWord(connection, best.word, selectionBeforeCommit)) {
             clearGesturePreview()
             return
         }
@@ -997,10 +1040,37 @@ class SlideInputMethodService :
     }
 
     private fun enqueueGestureInput(action: suspend (OrderedInputRequest) -> Unit) =
-        gestureInputQueue.enqueue(action)
+        gestureInputQueue.enqueue { request ->
+            try {
+                action(request)
+            } finally {
+                // Whatever the decode did or decided not to do, the field it leaves behind is what
+                // the edits queued after it were released against. Not for a sequence that has been
+                // cancelled: its own guard was cleared with it, and nothing queued behind it will
+                // run to read this one anyway.
+                if (gestureInputIsCurrent(request)) orderedInputGuard = captureOrderedInputGuard()
+            }
+        }
 
     private fun queueBehindGestureInput(action: () -> Unit): Boolean =
         gestureInputQueue.enqueueIfPending { processOrderedFollowup(action) }
+
+    /**
+     * What the editor looks like right now, to the extent it can be asked cheaply.
+     *
+     * [GESTURE_QUEUE_GUARD_CHARS] characters, not the whole field: this runs on the ordered path
+     * for every key released during a decode, and the point of the guard is to be cheaper than the
+     * mistake it prevents.
+     */
+    private fun captureOrderedInputGuard(): OrderedInputGuard {
+        val connection = currentInputConnection
+        return OrderedInputGuard(
+            selection = cachedEditorSelection(),
+            textBeforeCursor = connection
+                ?.getTextBeforeCursor(GESTURE_QUEUE_GUARD_CHARS, 0)
+                ?.toString(),
+        )
+    }
 
     /**
      * Reads the editor back after a deferred edit before allowing the next queued action to run.
@@ -1008,14 +1078,55 @@ class SlideInputMethodService :
      * The synchronous read is rare (only input released while final swipe inference is pending)
      * and closes two races at once: later cursor gestures see the real position, and delayed
      * updateSelection callbacks are matched to exact positions rather than one shared Boolean.
+     *
+     * The action runs inside one batch edit because exactly one net expectation is registered for
+     * it. Several of these actions mutate the field more than once — the automatic space before a
+     * word, the delete-then-full-stop of a double space — and a per-step callback matches nothing
+     * the tracker holds. Since [selfEdit] has already been cleared by then, it would be read as the
+     * user moving the cursor, which drops queued keystrokes and destroys the composing region.
+     *
+     * That relies on the editor honouring batch edits, which the framework editors do and a hand
+     * written [InputConnection] need not: one that reports every step regardless still produces the
+     * intermediate callback and still misclassifies it, now without the queue being cancelled
+     * underneath it. Registering an expectation per step instead would cover those editors too, but
+     * it would mean every one of these actions reporting its own mutations back — a contract across
+     * a dozen call sites, each of which has a fallback path for editors that cannot say where the
+     * cursor went. One batch here holds the whole invariant in one place; the residue is a
+     * misclassification on unusual editors rather than the cascade it used to be.
      */
     private fun processOrderedFollowup(action: () -> Unit) {
         val connection = currentInputConnection
-        val before = connection?.let(::readEditorSelection) ?: cachedEditorSelection()
+        if (connection == null) {
+            try {
+                action()
+            } finally {
+                cachedSelectionStart = -1
+                cachedSelectionEnd = -1
+                selfEdit = false
+            }
+            return
+        }
+
+        // This key was released against a field that has since been replaced from elsewhere — the
+        // app's own send button emptying the box is the ordinary way it happens. Dropping it is
+        // what the queue's contract already does for editor transitions; applying it would put the
+        // letter into whatever took the field's place. The guard is deliberately left stale, so the
+        // rest of the keys released against the same vanished text go the same way.
+        val expected = orderedInputGuard
+        if (expected != null && !expected.stillApplies(captureOrderedInputGuard())) return
+
+        val before = readEditorSelection(connection) ?: cachedEditorSelection()
+        // Actions that describe their own mutation precisely — a whole-word gesture delete knows
+        // what it removed even where the editor will not say — must not then be described a second
+        // time from out here. Today the two agree and the tracker would fold them together, but a
+        // read succeeding for one and failing for the other would leave two expectations the
+        // coalesced callback matches neither of.
+        val expectationsBefore = expectedSelections.size
+        connection.beginBatchEdit()
         try {
             action()
         } finally {
-            if (connection == null || currentInputConnection !== connection) {
+            if (currentInputConnection !== connection) {
                 cachedSelectionStart = -1
                 cachedSelectionEnd = -1
                 selfEdit = false
@@ -1024,12 +1135,20 @@ class SlideInputMethodService :
                 if (after != null) {
                     cachedSelectionStart = after.start
                     cachedSelectionEnd = after.end
-                    if (after != before) expectedSelections.expect(before, after)
+                    val actionRegisteredItsOwn = expectedSelections.size > expectationsBefore
+                    if (!actionRegisteredItsOwn && after != before) {
+                        expectedSelections.expect(before, after)
+                    }
                     selfEdit = false
                 }
                 // If this editor does not support extracted text, retain the existing one-shot
                 // fallback so its eventual callback is still recognized as ours.
             }
+            // Last, so the coalesced callback is only released once the position it will report is
+            // the one the tracker has been told to expect.
+            connection.endBatchEdit()
+            // What the next queued edit was released against.
+            orderedInputGuard = captureOrderedInputGuard()
         }
     }
 
@@ -1038,12 +1157,25 @@ class SlideInputMethodService :
     private fun gestureInputIsCurrent(request: OrderedInputRequest): Boolean =
         gestureInputQueue.isCurrent(request)
 
-    private fun cancelGestureInputSequence() {
-        gestureInputQueue.cancel()
+    /**
+     * Drops speculative gesture work without cancelling input the user has already committed.
+     *
+     * [OrderedInputQueue] reserves cancellation for editor and session transitions: a queued action
+     * is a key the user has already released, and nothing replays it. A cursor moving under the
+     * keyboard is not a transition, and a final decode still re-checks the editor it was started
+     * against before committing anything, so only the preview needs abandoning.
+     */
+    private fun cancelGesturePreviewWork() {
         gesturePreviewGeneration++
         pendingGesturePreview = null
         gesturePreviewJob?.cancel()
         gesturePreviewJob = null
+    }
+
+    private fun cancelGestureInputSequence() {
+        gestureInputQueue.cancel()
+        orderedInputGuard = null
+        cancelGesturePreviewWork()
     }
 
     override fun onGesturePreview(points: List<GesturePoint>) {
@@ -1208,8 +1340,13 @@ class SlideInputMethodService :
      * so words do not run together, but not at the very start of a field or straight after
      * existing whitespace or an opening bracket.
      */
-    private fun commitGestureWord(connection: InputConnection, word: String): Boolean {
-        val selectionBeforeCommit = readEditorSelection(connection) ?: cachedEditorSelection()
+    private fun commitGestureWord(
+        connection: InputConnection,
+        word: String,
+        /** Where the cursor already was, read once by the caller rather than extracted again. */
+        knownSelectionBeforeCommit: EditorSelection?,
+    ): Boolean {
+        val selectionBeforeCommit = knownSelectionBeforeCommit ?: cachedEditorSelection()
         val before = connection.getTextBeforeCursor(1, 0)
         val needsSpace = !before.isNullOrEmpty() && before[0].let { it.isLetterOrDigit() || it in ".,!?;:'\")" }
 
@@ -1852,8 +1989,17 @@ class SlideInputMethodService :
     }
 
     override fun onEmojiBackspace() {
+        if (queueBehindGestureInput(::processEmojiBackspace)) return
+        processEmojiBackspace()
+    }
+
+    private fun processEmojiBackspace() {
         performHaptic()
         val connection = currentInputConnection ?: return
+        // Routed like every other edit the keyboard makes: ordered behind a swipe still decoding,
+        // and announced, so the selection change it causes is recognized as ours rather than read
+        // as the user having moved the cursor.
+        selfEdit = true
         // Emoji are often multi-code-point ZWJ, tone, flag or keycap clusters, so this borrows the
         // key row's ICU grapheme-aware delete rather than leaving a partial glyph behind.
         handleDelete(connection)
@@ -1889,40 +2035,47 @@ class SlideInputMethodService :
             // `hello, w`, while leaving `hello?!` and a manually entered space exactly as typed.
             // Non-language editors opt out through the same policy as correction and prediction,
             // so an address or URL is never rewritten behind the user's back.
-            if (
-                composing.isEmpty() &&
+            val autoSpace = composing.isEmpty() &&
                 editorInputPolicy.allowsSuggestions &&
                 AutoSpacing.beforeWord(connection.getTextBeforeCursor(1, 0)?.lastOrNull())
-            ) {
-                connection.commitText(" ", 1)
-            }
 
-            // A cursor can arrive at the edge of existing text without a useful selection callback
-            // (notably on initial focus). Starting a one-character composing suffix there is just
-            // as unsafe as starting one after an asynchronous model load.
-            if (
-                composing.isEmpty() &&
-                !literalWordInProgress &&
-                cursorTouchesWord(connection)
-            ) {
-                literalWordInProgress = true
-            }
+            // The space and the letter it makes room for are one edit. Reported separately they
+            // produce two selection callbacks against a single one-shot [selfEdit], so the second
+            // is read as the user moving the cursor: candidates cleared, the word in progress
+            // abandoned, and the cursor mid-word taken as an invitation to reopen it.
+            if (autoSpace) connection.beginBatchEdit()
+            try {
+                if (autoSpace) connection.commitText(" ", 1)
 
-            val suggester = typingSuggester.takeIf { fieldSuggestionsEnabled() }
-            val keys = suggester?.let { currentGestureKeyMap() }
-            if (literalWordInProgress || suggester == null || keys == null) {
-                if (composing.isNotEmpty()) {
+                // A cursor can arrive at the edge of existing text without a useful selection
+                // callback (notably on initial focus). Starting a one-character composing suffix
+                // there is just as unsafe as starting one after an asynchronous model load.
+                if (
+                    composing.isEmpty() &&
+                    !literalWordInProgress &&
+                    cursorTouchesWord(connection)
+                ) {
                     literalWordInProgress = true
-                    abandonComposing()
                 }
-                literalWordInProgress = true
-                connection.commitText(text, 1)
-                clearSuggestions()
-            } else {
-                recordTouch(composing.length, touchX, touchY)
-                composing.append(text)
-                connection.setComposingText(composing, 1)
-                updateTypingSuggestions(suggester, keys)
+
+                val suggester = typingSuggester.takeIf { fieldSuggestionsEnabled() }
+                val keys = suggester?.let { currentGestureKeyMap() }
+                if (literalWordInProgress || suggester == null || keys == null) {
+                    if (composing.isNotEmpty()) {
+                        literalWordInProgress = true
+                        abandonComposing()
+                    }
+                    literalWordInProgress = true
+                    connection.commitText(text, 1)
+                    clearSuggestions()
+                } else {
+                    recordTouch(composing.length, touchX, touchY)
+                    composing.append(text)
+                    connection.setComposingText(composing, 1)
+                    updateTypingSuggestions(suggester, keys)
+                }
+            } finally {
+                if (autoSpace) connection.endBatchEdit()
             }
         } else {
             // Punctuation ends a word, so it settles whatever was pending first -- typing "teh,"
@@ -1974,24 +2127,33 @@ class SlideInputMethodService :
     private fun isWordCharacter(character: Char): Boolean =
         character.isLetter() || character == '\''
 
-    private fun handleSpace(connection: InputConnection, text: String) {
+    private fun handleSpace(connection: InputConnection, text: String, pressedAtMs: Long) {
         // Space is where a typed word is settled, and so where autocorrect actually happens.
         finishComposing(connection)
 
-        val now = System.currentTimeMillis()
+        // The interval between the two presses, not between the two moments the keyboard got round
+        // to applying them.
         val isDoubleSpace = settings.doubleSpacePeriod &&
-            now - lastSpaceCommitMs < DOUBLE_SPACE_WINDOW_MS &&
+            pressedAtMs - lastSpaceCommitMs < DOUBLE_SPACE_WINDOW_MS &&
             endsWithLetterThenSpace(connection)
 
         if (isDoubleSpace) {
-            connection.deleteSurroundingText(1, 0)
-            connection.commitText(". ", 1)
+            // One edit, so the editor reports one selection change: the intermediate position
+            // between the delete and the full stop matches no expectation and would be read as the
+            // user moving the cursor.
+            connection.beginBatchEdit()
+            try {
+                connection.deleteSurroundingText(1, 0)
+                connection.commitText(". ", 1)
+            } finally {
+                connection.endBatchEdit()
+            }
             lastSpaceCommitMs = 0L
             // The word before the full stop is no longer where the undo record says it is.
             lastAutocorrect = null
         } else {
             connection.commitText(text, 1)
-            lastSpaceCommitMs = now
+            lastSpaceCommitMs = pressedAtMs
         }
         literalWordInProgress = false
         updateShiftFromCursor()
@@ -2144,8 +2306,25 @@ class SlideInputMethodService :
             null
         }
 
+    /**
+     * One request object, reused, asking for as little as an extraction can be asked for.
+     *
+     * Only the two offsets are ever wanted. The hints say so, but do not make this cheap: AOSP's
+     * `TextView.extractTextInternal` ignores them on this path and copies the entire field across
+     * the Binder either way, so a request is as expensive as the document is long. What the hints
+     * buy is the editors that do read them; what actually bounds the cost is asking fewer times,
+     * which is why the swipe path threads one reading through several call sites instead of asking
+     * again at each. Reusing the object also keeps the per-call allocation off the input path.
+     */
+    private val selectionRequest = ExtractedTextRequest().apply {
+        token = 0
+        flags = 0
+        hintMaxChars = 0
+        hintMaxLines = 0
+    }
+
     private fun readEditorSelection(connection: InputConnection): EditorSelection? {
-        val extracted = connection.getExtractedText(ExtractedTextRequest(), 0) ?: return null
+        val extracted = connection.getExtractedText(selectionRequest, 0) ?: return null
         if (extracted.selectionStart < 0 || extracted.selectionEnd < 0) return null
         val offset = extracted.startOffset.coerceAtLeast(0)
         return EditorSelection(
@@ -2182,10 +2361,11 @@ class SlideInputMethodService :
         updateShiftFromCursor()
     }
 
-    private fun handleShiftTap() {
-        val now = System.currentTimeMillis()
-        val doubleTapped = now - lastShiftTapMs < DOUBLE_TAP_WINDOW_MS
-        lastShiftTapMs = now
+    private fun handleShiftTap(pressedAtMs: Long) {
+        // Measured between presses. Two taps queued behind a swipe decode are applied back to back,
+        // so an execution-time window would lock caps for a deliberate, unhurried pair.
+        val doubleTapped = pressedAtMs - lastShiftTapMs < DOUBLE_TAP_WINDOW_MS
+        lastShiftTapMs = pressedAtMs
 
         setShift(
             when {
@@ -2660,10 +2840,16 @@ class SlideInputMethodService :
             else -> return false
         }
 
+        // Closed from a finally: batch nesting is counted by the editor, so a throw between the two
+        // calls would leave it permanently open and the keyboard would never hear about a selection
+        // again for as long as the field is on screen.
         connection.beginBatchEdit()
-        connection.deleteSurroundingText(undo.applied.length + separator.length, 0)
-        connection.commitText(undo.original + separator, 1)
-        connection.endBatchEdit()
+        try {
+            connection.deleteSurroundingText(undo.applied.length + separator.length, 0)
+            connection.commitText(undo.original + separator, 1)
+        } finally {
+            connection.endBatchEdit()
+        }
 
         // The clearest signal a keyboard ever gets. The user was shown what it thought they meant
         // and said no, in the one gesture that means exactly that and nothing else. A word rescued
@@ -2718,11 +2904,16 @@ class SlideInputMethodService :
         }
 
         selfEdit = true
+        // Closed from a finally; an unbalanced begin leaves the editor's nesting count open for
+        // good, and with it every further selection callback.
         connection.beginBatchEdit()
-        connection.setComposingText(replacement, 1)
-        connection.finishComposingText()
-        if (appendSpace) connection.commitText(" ", 1)
-        connection.endBatchEdit()
+        try {
+            connection.setComposingText(replacement, 1)
+            connection.finishComposingText()
+            if (appendSpace) connection.commitText(" ", 1)
+        } finally {
+            connection.endBatchEdit()
+        }
 
         composing.setLength(0)
         clearTouches()
@@ -2782,9 +2973,14 @@ class SlideInputMethodService :
         val needsSpace = !before.isNullOrEmpty() && isWordCharacter(before[0])
 
         selfEdit = true
+        // Closed from a finally; an unbalanced begin leaves the editor's nesting count open for
+        // good, and with it every further selection callback.
         connection.beginBatchEdit()
-        connection.commitText(if (needsSpace) " $word " else "$word ", 1)
-        connection.endBatchEdit()
+        try {
+            connection.commitText(if (needsSpace) " $word " else "$word ", 1)
+        } finally {
+            connection.endBatchEdit()
+        }
 
         // Taking a prediction is a deliberate choice of what comes next, and worth learning from
         // exactly as typing it would have been.
@@ -2818,13 +3014,26 @@ class SlideInputMethodService :
             oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd,
         )
 
-        cachedSelectionStart = newSelStart
-        cachedSelectionEnd = newSelEnd
-
+        val reported = EditorSelection(newSelStart, newSelEnd)
         val expectedEdit = expectedSelections.consume(
             from = EditorSelection(oldSelStart, oldSelEnd),
-            to = EditorSelection(newSelStart, newSelEnd),
+            to = reported,
         )
+        // An expected callback with more of our own chain still outstanding is an intermediate
+        // report: the editor has already been sent the rest and is no longer where this callback
+        // says. Caching the end of the chain instead keeps an edit arriving in the gap — a
+        // Backspace hunting for the word a swipe just committed — from measuring itself against a
+        // position that has been superseded.
+        val landed = if (expectedEdit) expectedSelections.pendingTarget() ?: reported else reported
+        cachedSelectionStart = landed.start
+        cachedSelectionEnd = landed.end
+
+        // Whether the offsets this callback carries can be taken at face value. With nothing of
+        // ours outstanding, every edit the keyboard has made has already been acknowledged, so
+        // there is nothing that could have moved the text out from under these numbers. Captured
+        // before the invalidation below, which would otherwise make the answer trivially yes.
+        val reportedOffsetsAreCurrent = !expectedSelections.hasPending() && !selfEdit
+
         val ourEdit = expectedEdit || selfEdit
         // A matching earlier callback can arrive while a later queued mutation is using the
         // one-shot fallback (for an editor without extracted-text support). Preserve that later
@@ -2843,7 +3052,11 @@ class SlideInputMethodService :
         )
 
         if (update.externalSelectionChanged) {
-            cancelGestureInputSequence()
+            // Only the speculative half. Keys the user has already released are queued behind a
+            // decode with nothing to replay them, and the queue's own contract reserves
+            // cancellation for editor and session transitions; a cursor moving is neither, and the
+            // decode still re-checks the editor it was started against before committing.
+            cancelGesturePreviewWork()
             expectedSelections.invalidate()
             gestureUndoState.invalidate()
         }
@@ -2863,7 +3076,7 @@ class SlideInputMethodService :
             // strip mode.
             literalWordInProgress = false
             clearSuggestions()
-            reopenWordAtCursor(newSelStart, newSelEnd)
+            reopenWordAtCursor(newSelStart, newSelEnd, reportedOffsetsAreCurrent)
             updateShiftFromCursor()
         }
     }
@@ -2879,8 +3092,25 @@ class SlideInputMethodService :
      * Nothing is changed here, only marked: the word is put back exactly as it stands, autocorrect
      * is held off for it, and if the user carries on typing or moves away again it settles
      * untouched.
+     *
+     * The offset the region is measured from must belong to the same reading of the field as the
+     * characters it is measured over. A callback delivered after a mutation the keyboard has since
+     * made carries offsets from before it, and measuring from one of those while reading the
+     * characters live puts the composing region on the wrong text — which the next
+     * [setComposingText] then silently overwrites.
+     *
+     * [reportedOffsetsAreCurrent] says the callback was checked against exactly that: with nothing
+     * of ours outstanding it cannot be describing a superseded field, so it is used as it stands.
+     * That is the ordinary case, and it keeps a tap costing no extraction at all — and keeps this
+     * working on editors that do not implement `getExtractedText`, which is where the live read
+     * would come back empty. Only when something of ours is in flight is the editor asked directly,
+     * and an editor that will then not say where its cursor is gets no region rather than a guess.
      */
-    private fun reopenWordAtCursor(selectionStart: Int, selectionEnd: Int) {
+    private fun reopenWordAtCursor(
+        selectionStart: Int,
+        selectionEnd: Int,
+        reportedOffsetsAreCurrent: Boolean,
+    ) {
         if (selectionStart != selectionEnd || selectionStart < 0) return
         if (stripMode != StripMode.Empty) return
         if (!fieldSuggestionsEnabled()) return
@@ -2890,6 +3120,13 @@ class SlideInputMethodService :
         val keys = currentGestureKeyMap() ?: return
 
         val connection = currentInputConnection ?: return
+        val cursorPosition = if (reportedOffsetsAreCurrent) {
+            selectionStart
+        } else {
+            val live = readEditorSelection(connection) ?: return
+            if (live.start != live.end || live.start < 0) return
+            live.start
+        }
         val before = connection.getTextBeforeCursor(MAX_REOPEN_CHARS, 0)?.toString() ?: return
         val after = connection.getTextAfterCursor(MAX_REOPEN_CHARS, 0)?.toString() ?: return
 
@@ -2907,7 +3144,7 @@ class SlideInputMethodService :
         if (word.length !in MIN_REOPEN_LENGTH..MAX_REOPEN_LENGTH) return
         if (word.none(Char::isLetter)) return
 
-        val regionStart = selectionStart - (before.length - start)
+        val regionStart = cursorPosition - (before.length - start)
         if (regionStart < 0) return
 
         selfEdit = true
@@ -3072,6 +3309,15 @@ class SlideInputMethodService :
 
         /** Enough surrounding editor text to detect a cursor/context move during native decode. */
         const val GESTURE_CONTEXT_GUARD_CHARS = 48
+
+        /**
+         * Text behind the cursor proving a queued edit still belongs to the field it was made in.
+         *
+         * Shorter than the decode's guard on purpose. This is checked once per key released during
+         * a decode, and it only has to notice the field being emptied or rewritten from elsewhere,
+         * which never leaves the last few characters intact.
+         */
+        const val GESTURE_QUEUE_GUARD_CHARS = 16
 
         /** The key types that change the field, and so expect a selection update of their own. */
         val EDITING_KEYS = setOf(

@@ -57,6 +57,54 @@ class AudioRecorderTest {
     }
 
     @Test
+    fun `final chunk delivered as the microphone stops is kept`() {
+        repeat(TIMING_STRESS_REPEATS) {
+            val backend = FakeBackend(
+                actions = listOf(
+                    ReadAction.Data(shortArrayOf(1_000)),
+                    ReadAction.DataOnStop(shortArrayOf(2_000)),
+                ),
+            )
+            val recorder = AudioRecorder(QueueFactory(backend), joinTimeoutMs = 2_000L)
+
+            assertTrue(recorder.start())
+            assertTrue(backend.secondReadEntered.await(1, TimeUnit.SECONDS))
+            val audio = recorder.stop()
+
+            // stop() joins the worker before draining, so the buffer AudioRecord releases as it
+            // stops — the tail of the last word — is part of the transcript, not clipped off it.
+            assertArrayEquals(
+                floatArrayOf(1_000f / 32_768f, 2_000f / 32_768f),
+                audio,
+                0f,
+            )
+            assertEquals(1, backend.releaseCount.get())
+        }
+    }
+
+    @Test
+    fun `chunk arriving after a timed out stop drained the buffer is discarded`() {
+        val lateReadGate = CountDownLatch(1)
+        val backend = FakeBackend(
+            actions = listOf(ReadAction.ExternalBlock(lateReadGate, shortArrayOf(12_000))),
+            stopUnblocksRead = false,
+        )
+        val recorder = AudioRecorder(backendFactory = QueueFactory(backend), joinTimeoutMs = 20L)
+
+        assertTrue(recorder.start())
+        assertTrue(backend.readEntered.await(1, TimeUnit.SECONDS))
+        assertArrayEquals(FloatArray(0), recorder.stop(), 0f)
+
+        lateReadGate.countDown()
+        assertTrue(backend.released.await(1, TimeUnit.SECONDS))
+
+        // The buffer was already reported empty to the caller. Audio read after that point cannot
+        // be resurrected by any later drain, which is what the privacy wipe promises.
+        assertArrayEquals(FloatArray(0), recorder.stop(), 0f)
+        assertTrue(backend.lastDestination?.all { it == 0.toShort() } == true)
+    }
+
+    @Test
     fun `blocked backend stop cannot block the service caller`() {
         val stopGate = CountDownLatch(1)
         val backend = FakeBackend(
@@ -178,6 +226,9 @@ class AudioRecorderTest {
         data object Fail : ReadAction
         data object BlockUntilStop : ReadAction
         data class ExternalBlock(val gate: CountDownLatch, val values: ShortArray) : ReadAction
+
+        /** AudioRecord.stop() unblocking a pending read with one last partial buffer. */
+        data class DataOnStop(val values: ShortArray) : ReadAction
     }
 
     private class FakeBackend(
@@ -222,6 +273,11 @@ class AudioRecorderTest {
                 }
                 is ReadAction.ExternalBlock -> {
                     action.gate.await(2, TimeUnit.SECONDS)
+                    action.values.copyInto(destination)
+                    action.values.size
+                }
+                is ReadAction.DataOnStop -> {
+                    stopSignal.await(2, TimeUnit.SECONDS)
                     action.values.copyInto(destination)
                     action.values.size
                 }

@@ -86,11 +86,64 @@ class GestureUndoStateTest {
         assertNull(state.consume(3, false, " word", cursorPosition = 42))
     }
 
+    /**
+     * An unknown current position is not evidence that the cursor is elsewhere, but it is not
+     * evidence that it is here either, and unlike a known disagreement it can never be healed by a
+     * later callback. Retiring it keeps the record from surviving every Backspace.
+     */
     @Test
-    fun `losing a known cursor cannot target a matching word elsewhere`() {
+    fun `losing a known cursor retires the undo instead of targeting a word elsewhere`() {
         val state = GestureUndoState()
         state.arm(" word", editorGeneration = 3, cursorPosition = 25, learnedPair = null)
 
         assertNull(state.consume(3, false, " word", cursorPosition = null))
+        assertNull(state.expectedTextLength)
+        assertNull(state.consume(3, false, " word", cursorPosition = 25))
+    }
+
+    /** An undo armed without a known position was always allowed to match anywhere. */
+    @Test
+    fun `an undo armed with no cursor is consumed and retired`() {
+        val state = GestureUndoState()
+        state.arm(" word", editorGeneration = 3, cursorPosition = null, learnedPair = null)
+
+        assertEquals(
+            GestureUndo(" word", 3, null, null),
+            state.consume(3, false, " word", cursorPosition = 41),
+        )
+        assertNull(state.expectedTextLength)
+    }
+
+    /**
+     * The cursor is the keyboard's own cached idea of it, refreshed by callbacks that can still
+     * describe an intermediate position in a chain already written. Everything read from the editor
+     * agrees here, so the opportunity survives a disagreement that the next callback heals.
+     */
+    @Test
+    fun `a stale cursor does not permanently destroy the undo`() {
+        val state = GestureUndoState()
+        state.arm(" word", editorGeneration = 3, cursorPosition = 25, learnedPair = "a" to "word")
+
+        assertNull(state.consume(3, false, " word", cursorPosition = 20))
+        assertEquals(
+            GestureUndo(" word", 3, 25, "a" to "word"),
+            state.consume(3, false, " word", cursorPosition = 25),
+        )
+        assertNull(state.expectedTextLength)
+    }
+
+    /**
+     * The Backspace that found the cursor disagreeing fell back to an ordinary delete, so the text
+     * behind the cursor is no longer the committed word — which retires the record for good.
+     */
+    @Test
+    fun `an ordinary delete after a stale cursor still retires the record`() {
+        val state = GestureUndoState()
+        state.arm(" word", editorGeneration = 3, cursorPosition = 25, learnedPair = null)
+
+        assertNull(state.consume(3, false, " word", cursorPosition = 20))
+        assertNull(state.consume(3, false, " wor", cursorPosition = 24))
+        assertNull(state.expectedTextLength)
+        assertNull(state.consume(3, false, " word", cursorPosition = 25))
     }
 }

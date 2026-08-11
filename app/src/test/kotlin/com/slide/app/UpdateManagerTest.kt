@@ -1,11 +1,25 @@
 package com.slide.app
 
+import java.io.File
+import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class UpdateManagerTest {
+
+    @After
+    fun releaseDownloadGuard() {
+        UpdateManager.endDownload()
+    }
+
+    private fun newDirectory(): File =
+        Files.createTempDirectory("slide-updates").toFile().apply { deleteOnExit() }
 
     @Test
     fun `stable release sorts after its prerelease`() {
@@ -80,6 +94,144 @@ class UpdateManagerTest {
         assertEquals(
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
             UpdateManager.sha256Hex("abc".toByteArray()),
+        )
+    }
+
+    @Test
+    fun `a second download is refused while the first still holds the staging files`() {
+        assertFalse(UpdateManager.isDownloading.value)
+
+        assertTrue(UpdateManager.beginDownload())
+        assertTrue(UpdateManager.isDownloading.value)
+        assertFalse(UpdateManager.beginDownload())
+
+        UpdateManager.endDownload()
+        assertFalse(UpdateManager.isDownloading.value)
+        assertTrue(UpdateManager.beginDownload())
+        UpdateManager.endDownload()
+    }
+
+    @Test
+    fun `only one of many simultaneous download attempts claims the guard`() {
+        val racers = 16
+        val start = CountDownLatch(1)
+        val finished = CountDownLatch(racers)
+        val admitted = AtomicInteger()
+
+        repeat(racers) {
+            Thread {
+                start.await()
+                if (UpdateManager.beginDownload()) admitted.incrementAndGet()
+                finished.countDown()
+            }.start()
+        }
+        start.countDown()
+
+        assertTrue(finished.await(5, TimeUnit.SECONDS))
+        assertEquals(1, admitted.get())
+        UpdateManager.endDownload()
+        assertFalse(UpdateManager.isDownloading.value)
+    }
+
+    @Test
+    fun `sweep removes an installed release's APK and the legacy cache directory`() {
+        val staging = newDirectory()
+        val legacy = newDirectory()
+        // The successful-update case: this APK is what the installer just installed.
+        val staged = File(staging, "Slide-0.3.2.apk").apply { writeText("apk") }
+        val partial = File(staging, "Slide-0.4.0.apk.part").apply { writeText("half an apk") }
+        val legacyStaged = File(legacy, "Slide-0.3.1.apk").apply { writeText("old apk") }
+
+        assertTrue(UpdateManager.sweepStagingUnlessBusy(staging, legacy, installedVersion = "0.3.2"))
+
+        assertFalse(staged.exists())
+        assertFalse(partial.exists())
+        assertFalse(legacyStaged.exists())
+        assertFalse("the legacy directory itself is litter too", legacy.exists())
+        assertTrue("the staging directory is reused, not recreated", staging.exists())
+        staging.deleteRecursively()
+    }
+
+    @Test
+    fun `sweep leaves a running download's files alone`() {
+        val staging = newDirectory()
+        val legacy = newDirectory()
+        val partial = File(staging, "Slide-0.3.2.apk.part").apply { writeText("being written") }
+
+        assertTrue(UpdateManager.beginDownload())
+        assertFalse(UpdateManager.sweepStagingUnlessBusy(staging, legacy, installedVersion = "0.3.1"))
+        assertTrue("the sweep deleted a download in progress", partial.exists())
+
+        UpdateManager.endDownload()
+        assertTrue(UpdateManager.sweepStagingUnlessBusy(staging, legacy, installedVersion = "0.3.1"))
+        assertFalse(partial.exists())
+        staging.deleteRecursively()
+        legacy.deleteRecursively()
+    }
+
+    @Test
+    fun `sweep tolerates directories that were never created`() {
+        val root = newDirectory()
+        assertTrue(
+            UpdateManager.sweepStagingUnlessBusy(
+                staging = File(root, "updates"),
+                legacy = File(root, "legacy"),
+                installedVersion = "0.3.1",
+            ),
+        )
+        root.deleteRecursively()
+    }
+
+    @Test
+    fun `an APK the installer may still be about to read is kept, briefly`() {
+        val hour = 60L * 60L * 1000L
+        val now = 1_000L * hour
+
+        // Handed to the installer a minute ago and not yet installed: the confirmation dialog can
+        // outlive the rotation that triggered this sweep.
+        assertFalse(
+            UpdateManager.isStagedFileStale(
+                name = "Slide-0.4.0.apk",
+                lastModifiedMillis = now - 60_000L,
+                nowMillis = now,
+                installedVersion = "0.3.2",
+            ),
+        )
+        // Never confirmed. It is not going to be.
+        assertTrue(
+            UpdateManager.isStagedFileStale(
+                name = "Slide-0.4.0.apk",
+                lastModifiedMillis = now - 2 * hour,
+                nowMillis = now,
+                installedVersion = "0.3.2",
+            ),
+        )
+        // Already installed, however recently: nothing will read it again.
+        assertTrue(
+            UpdateManager.isStagedFileStale(
+                name = "Slide-0.4.0.apk",
+                lastModifiedMillis = now,
+                nowMillis = now,
+                installedVersion = "0.4.0",
+            ),
+        )
+        // A partial download, and anything else that is not an APK at all.
+        assertTrue(
+            UpdateManager.isStagedFileStale(
+                name = "Slide-0.4.0.apk.part",
+                lastModifiedMillis = now,
+                nowMillis = now,
+                installedVersion = "0.3.2",
+            ),
+        )
+        // An unreadable installed version must not strand a fresh APK forever.
+        assertFalse(
+            UpdateManager.isStagedFileStale(
+                name = "Slide-0.4.0.apk",
+                lastModifiedMillis = now,
+                nowMillis = now,
+                installedVersion = null,
+            ),
         )
     }
 

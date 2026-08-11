@@ -124,6 +124,36 @@ class OrderedInputQueueTest {
         assertFalse(committed)
     }
 
+    /**
+     * The editor generation catches the field being swapped. An app emptying the same field from
+     * underneath a queued keystroke — its own send button, while a swipe is still decoding — is no
+     * transition at all, and applying the key anyway drops the letter into whatever replaced it.
+     */
+    @Test
+    fun `a queued edit does not apply to a field that was replaced from elsewhere`() {
+        val released = OrderedInputGuard(EditorSelection(12, 12), "see you at ")
+
+        assertTrue(released.stillApplies(released.copy()))
+        assertFalse(released.stillApplies(OrderedInputGuard(EditorSelection(0, 0), "")))
+        assertFalse(released.stillApplies(released.copy(textBeforeCursor = "different ")))
+        assertFalse(released.stillApplies(released.copy(selection = EditorSelection(4, 4))))
+    }
+
+    /**
+     * Evidence the editor declines to give is not evidence that anything changed, and swallowing
+     * keys the user has already pressed is the worse of the two failures.
+     */
+    @Test
+    fun `missing evidence on either side is not treated as a change`() {
+        val released = OrderedInputGuard(EditorSelection(12, 12), "see you at ")
+        val silent = OrderedInputGuard(null, null)
+
+        assertTrue(released.stillApplies(silent))
+        assertTrue(silent.stillApplies(released))
+        assertTrue(released.stillApplies(released.copy(selection = null)))
+        assertTrue(released.stillApplies(released.copy(textBeforeCursor = null)))
+    }
+
     @Test
     fun `editor transition cancels queued and suspended input`() = runBlocking {
         var editorGeneration = 1L

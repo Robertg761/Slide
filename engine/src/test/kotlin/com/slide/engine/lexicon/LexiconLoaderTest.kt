@@ -1,8 +1,13 @@
 package com.slide.engine.lexicon
 
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
 import java.io.File
+import java.io.IOException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -106,5 +111,84 @@ class LexiconLoaderTest {
     fun `unknown words are absent`() {
         assertFalse(lexicon.contains("qqzzxx"))
         assertEquals(-1, lexicon.indexOf("qqzzxx"))
+    }
+
+    // region Corrupt files of the right length
+
+    /**
+     * A truncated asset is caught by the reads themselves; these are the files that are exactly as
+     * long as they claim to be and simply hold the wrong numbers. Every one of them used to index
+     * an array out of bounds inside a coroutine with no handler above it, which killed the
+     * keyboard on every open instead of leaving gesture typing switched off — so what matters here
+     * is not just that they are rejected but that they are rejected as [IOException], the one
+     * failure `LexiconLoader.load` is documented to survive.
+     */
+    @Test
+    fun `the hand-built lexicon this fixture uses is well formed`() {
+        val built = LexiconLoader.read(ByteArrayInputStream(packedLexicon(WORDS)))
+
+        assertEquals(WORDS.size, built.size)
+        assertEquals(WORDS, (0 until built.size).map(built::lowercaseAt))
+    }
+
+    @Test
+    fun `rejects a suffix that runs past the end of the block`() {
+        val corrupt = packedLexicon(WORDS, suffixLengthAt = mapOf(2 to 200))
+
+        val error = assertThrows(IOException::class.java) {
+            LexiconLoader.read(ByteArrayInputStream(corrupt))
+        }
+        assertTrue(error.message!!, error.message!!.contains("suffix"))
+    }
+
+    @Test
+    fun `rejects words that do not fit the character count the header declares`() {
+        // The smallest count the header check accepts, and far fewer characters than the words
+        // decode to: without a bounds check the decoded characters run off the end of the array.
+        val corrupt = packedLexicon(WORDS, declaredCharCount = WORDS.size)
+
+        val error = assertThrows(IOException::class.java) {
+            LexiconLoader.read(ByteArrayInputStream(corrupt))
+        }
+        assertTrue(error.message!!, error.message!!.contains("characters"))
+    }
+
+    /** Writes the layout `tools/build_lexicon.py` produces, with room to write it wrongly. */
+    private fun packedLexicon(
+        words: List<String>,
+        declaredCharCount: Int = words.sumOf(String::length),
+        suffixLengthAt: Map<Int, Int> = emptyMap(),
+    ): ByteArray {
+        val block = ByteArrayOutputStream()
+        var previous = ""
+        for ((index, word) in words.withIndex()) {
+            val shared = word.commonPrefixWith(previous).length
+            val suffix = word.substring(shared)
+            block.write(shared)
+            block.write(suffixLengthAt[index] ?: suffix.length)
+            block.write(suffix.toByteArray(Charsets.US_ASCII))
+            previous = word
+        }
+        val blockBytes = block.toByteArray()
+
+        val bytes = ByteArrayOutputStream()
+        DataOutputStream(bytes).use { out ->
+            out.writeInt(0x534C4558) // "SLEX"
+            out.writeByte(1) // version
+            out.writeInt(words.size)
+            out.writeInt(blockBytes.size)
+            out.writeInt(declaredCharCount)
+            out.write(blockBytes)
+            out.write(ByteArray(words.size) { 100 }) // frequencies
+            out.write(ByteArray(words.size)) // flags
+        }
+        return bytes.toByteArray()
+    }
+
+    // endregion
+
+    private companion object {
+        /** Shares a prefix, so the front coding is actually exercised. */
+        val WORDS = listOf("ant", "anteater", "bee")
     }
 }

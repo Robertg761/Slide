@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <cache-path name="updates" path="updates/" />
+    <!-- Staged APKs live in filesDir: the system may reclaim cacheDir between handing the package
+         installer a URI and the user confirming the install. -->
+    <files-path name="updates" path="updates/" />
 </paths>

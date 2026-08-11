@@ -47,6 +47,8 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.listSaver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -75,6 +77,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val repository = SettingsRepository(applicationContext)
+        // A staged APK is the biggest file Slide ever writes and nothing else deletes it, so drop
+        // whatever an earlier install left behind. Runs off the main thread and skips itself if a
+        // download is somehow already going.
+        UpdateManager.sweepStagedUpdates(applicationContext)
 
         setContent {
             SlideAppTheme {
@@ -112,9 +118,38 @@ private fun SetupScreen(repository: SettingsRepository) {
 
     var enabled by remember { mutableStateOf(isKeyboardEnabled(context)) }
     var selected by remember { mutableStateOf(isKeyboardSelected(context)) }
-    var updateMessage by remember { mutableStateOf<String?>(null) }
-    var availableUpdate by remember { mutableStateOf<UpdateInfo?>(null) }
-    var downloading by remember { mutableStateOf(false) }
+    var updateMessage by rememberSaveable { mutableStateOf<String?>(null) }
+    // Rotation must not silently drop the update the user is looking at, and — more to the point —
+    // must not re-offer the download button while the previous one is still running.
+    var availableUpdate by rememberSaveable(stateSaver = UpdateInfoSaver) {
+        mutableStateOf<UpdateInfo?>(null)
+    }
+    // The download belongs to the process, not to this composition: rotating away neither cancels
+    // it nor starts a second one, and the screen that happens to exist when it finishes reports it.
+    val downloading by UpdateManager.isDownloading.collectAsState()
+    val installOutcome by UpdateManager.outcome.collectAsState()
+    LaunchedEffect(installOutcome) {
+        when (val finished = installOutcome) {
+            null -> return@LaunchedEffect
+            InstallOutcome.Handed -> availableUpdate = null
+            InstallOutcome.NeedsPermission -> {
+                availableUpdate = null
+                updateMessage = "Allow Slide to install apps, then tap Check now again to finish " +
+                    "updating."
+            }
+            // The button is disabled while a download runs, so this is a stale tap at worst. The
+            // dialog is already saying "Downloading…"; leave it be.
+            InstallOutcome.AlreadyRunning -> Unit
+            is InstallOutcome.Failed -> {
+                availableUpdate = null
+                updateMessage = "Update download failed: " +
+                    (finished.message ?: "unknown error") +
+                    "\n\nYou can also download the APK from the Slide releases page on GitHub and " +
+                    "install it by hand."
+            }
+        }
+        UpdateManager.consumeOutcome()
+    }
     var showClearLearnedDataConfirmation by remember { mutableStateOf(false) }
     var clearingLearnedData by remember { mutableStateOf(false) }
     var privacyMessage by remember { mutableStateOf<String?>(null) }
@@ -131,7 +166,7 @@ private fun SetupScreen(repository: SettingsRepository) {
 
     LaunchedEffect(settings.updateChecksEnabled, settings.includeAlphaUpdates) {
         if (settings.updateChecksEnabled) {
-            runCatching { UpdateManager.check(context, settings.includeAlphaUpdates) }
+            runCatchingCancellable { UpdateManager.check(context, settings.includeAlphaUpdates) }
                 .onSuccess { availableUpdate = it }
         }
     }
@@ -387,7 +422,7 @@ private fun SetupScreen(repository: SettingsRepository) {
                     SettingSwitch("Check GitHub for updates", settings.updateChecksEnabled) { value -> scope.launch { repository.update { it.copy(updateChecksEnabled = value) } } }
                     if (settings.updateChecksEnabled) {
                         SettingSwitch("Include prereleases", settings.includeAlphaUpdates) { value -> scope.launch { repository.update { it.copy(includeAlphaUpdates = value) } } }
-                        Button(onClick = { scope.launch { runCatching { UpdateManager.check(context, settings.includeAlphaUpdates) }.onSuccess { availableUpdate = it; updateMessage = if (it == null) "You already have the newest selected release." else null }.onFailure { updateMessage = "Could not check for updates: ${it.message ?: "network error"}" } } }) { Text("Check now") }
+                        Button(onClick = { scope.launch { runCatchingCancellable { UpdateManager.check(context, settings.includeAlphaUpdates) }.onSuccess { availableUpdate = it; updateMessage = if (it == null) "You already have the newest selected release." else null }.onFailure { updateMessage = "Could not check for updates: ${it.message ?: "network error"}" } } }) { Text("Check now") }
                     }
                 }
             }
@@ -446,27 +481,9 @@ private fun SetupScreen(repository: SettingsRepository) {
             confirmButton = {
                 Button(
                     enabled = !downloading,
-                    onClick = {
-                        scope.launch {
-                            downloading = true
-                            runCatching { UpdateManager.downloadAndInstall(context, update) }
-                                .onSuccess { outcome ->
-                                    availableUpdate = null
-                                    if (outcome == InstallOutcome.NeedsPermission) {
-                                        updateMessage = "Allow Slide to install apps, then tap " +
-                                            "Check now again to finish updating."
-                                    }
-                                }
-                                .onFailure {
-                                    availableUpdate = null
-                                    updateMessage = "Update download failed: " +
-                                        (it.message ?: "unknown error") +
-                                        "\n\nYou can also download the APK from the Slide releases " +
-                                        "page on GitHub and install it by hand."
-                                }
-                            downloading = false
-                        }
-                    },
+                    // Handed to the manager rather than launched here: the result arrives through
+                    // UpdateManager.outcome, which survives this composition.
+                    onClick = { UpdateManager.install(context, update) },
                 ) { Text(if (downloading) "Downloading…" else "Download and install") }
             },
             dismissButton = {
@@ -701,6 +718,42 @@ private fun ThemeSwatch(color: Color, label: String, selected: Boolean, onClick:
         )
         Text(label, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 4.dp))
     }
+}
+
+/** Keeps the offered release across a configuration change instead of re-checking GitHub for it. */
+private val UpdateInfoSaver = listSaver<UpdateInfo?, Any>(
+    save = { update ->
+        update?.let { listOf<Any>(it.version, it.notes, it.apkUrl, it.apkSha256, it.apkSize) }
+            ?: emptyList()
+    },
+    restore = { saved ->
+        if (saved.size < 5) {
+            null
+        } else {
+            UpdateInfo(
+                version = saved[0] as String,
+                notes = saved[1] as String,
+                apkUrl = saved[2] as String,
+                apkSha256 = saved[3] as String,
+                apkSize = saved[4] as Long,
+            )
+        }
+    },
+)
+
+/**
+ * [runCatching] for suspending work.
+ *
+ * `runCatching` catches [CancellationException] along with everything else, which turns "the user
+ * left" into a failure dialog and, worse, leaves the coroutine believing it is still alive. The
+ * catch stays as wide as `runCatching`'s otherwise: a failure to reach GitHub should be reported
+ * whatever its class, and narrowing to [Exception] would turn an [Error] into a dead process.
+ */
+private suspend inline fun <T> runCatchingCancellable(block: () -> T): Result<T> = try {
+    Result.success(block())
+} catch (t: Throwable) {
+    if (t is CancellationException) throw t
+    Result.failure(t)
 }
 
 private fun isKeyboardEnabled(context: Context): Boolean {

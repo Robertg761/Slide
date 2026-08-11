@@ -110,6 +110,32 @@ class PrecedingWordTest {
         assertEquals(PrecedingWord.of("I like "), PrecedingWord.beforeNewWord("I like "))
     }
 
+    /**
+     * An apostrophe is part of a word only where a word runs into it. On its own it is an opening
+     * quote or a contraction not yet typed, and returning it feeds `'` to the decoder as the
+     * previous word and learns a user bigram keyed on punctuation.
+     */
+    @Test
+    fun `never returns a bare apostrophe as the preceding word`() {
+        assertEquals("said", PrecedingWord.beforeNewWord("he said '"))
+        assertEquals("said", PrecedingWord.beforeNewWord("he said ' "))
+        assertEquals("said", PrecedingWord.of("he said 'wor"))
+        assertEquals("x", PrecedingWord.beforeNewWord("x ''' "))
+        assertNull(PrecedingWord.beforeNewWord("'"))
+        assertNull(PrecedingWord.of("'wor"))
+        assertNull(PrecedingWord.beforeNewWord("he said. '"))
+    }
+
+    @Test
+    fun `a trailing apostrophe does not hide the word it follows`() {
+        // Either an opening quote after the word or a contraction the user has only started.
+        assertEquals("hello", PrecedingWord.beforeNewWord("hello'"))
+        assertEquals(
+            PrecedingWord.Context("we", "arrive"),
+            PrecedingWord.contextBeforeNewWord("we arrive '"),
+        )
+    }
+
     @Test
     fun `handles a window that starts mid-word`() {
         // getTextBeforeCursor returns a fixed number of characters, so the earliest word in the

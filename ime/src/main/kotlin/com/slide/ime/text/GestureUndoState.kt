@@ -45,8 +45,22 @@ internal class GestureUndoState {
     }
 
     /**
-     * Consumes the opportunity whether it matches or not, so a later Backspace can never delete a
+     * Consumes the opportunity, whether or not it applies, so a later Backspace can never delete a
      * stale word after the first one already behaved as an ordinary edit.
+     *
+     * The one exception is two positions that are both known and disagree. [cursorPosition] comes
+     * from the keyboard's cached selection, which is refreshed by editor callbacks that may still
+     * describe an intermediate position in a chain the keyboard has already finished writing.
+     * Everything read from the editor itself — its identity, the absence of a selection, and the
+     * committed text sitting immediately behind the cursor — still agrees in that case, so the
+     * opportunity is kept rather than destroyed by a disagreement that heals on the next callback.
+     * This Backspace still falls back to an ordinary delete, which changes the text behind the
+     * cursor and so retires the record for good if the disagreement was real.
+     *
+     * An *unknown* current position is not that. It carries no evidence either way, so it can never
+     * heal and would keep the record alive through every Backspace, widening the window in which a
+     * coincidentally matching word elsewhere could be swallowed. It retires the record, as it
+     * always did.
      */
     fun consume(
         editorGeneration: Long,
@@ -55,12 +69,18 @@ internal class GestureUndoState {
         cursorPosition: Int?,
     ): GestureUndo? {
         val candidate = pending ?: return null
-        pending = null
-        return candidate.takeIf {
-            it.editorGeneration == editorGeneration &&
-                !hasSelection &&
-                textBeforeCursor == it.committedText &&
-                (it.cursorPosition == null || it.cursorPosition == cursorPosition)
+        val editorStillAgrees = candidate.editorGeneration == editorGeneration &&
+            !hasSelection &&
+            textBeforeCursor == candidate.committedText
+        if (!editorStillAgrees) {
+            pending = null
+            return null
         }
+        val armedCursor = candidate.cursorPosition
+        if (armedCursor != null && cursorPosition != null && armedCursor != cursorPosition) {
+            return null
+        }
+        pending = null
+        return candidate.takeIf { armedCursor == null || armedCursor == cursorPosition }
     }
 }

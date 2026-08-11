@@ -67,6 +67,25 @@ internal class ExpectedSelectionTracker(
         return true
     }
 
+    /**
+     * Where the outstanding chain ends, or null when nothing is outstanding.
+     *
+     * Every expectation is registered after its mutation has been sent, so the last one describes
+     * where the editor already is — even while earlier callbacks in the chain are still arriving.
+     * Caching an intermediate callback's position instead would measure the next edit against a
+     * cursor the editor has already left.
+     */
+    fun pendingTarget(): EditorSelection? = pending.lastOrNull()?.to
+
+    /**
+     * Whether any mutation of ours is still waiting to be acknowledged.
+     *
+     * While this is false every edit the keyboard has made has already come back, so a callback
+     * arriving now describes the editor as it stands rather than as it stood before something the
+     * keyboard has since done.
+     */
+    fun hasPending(): Boolean = pending.isNotEmpty()
+
     fun invalidate() {
         pending.clear()
         recentlyRetired.clear()

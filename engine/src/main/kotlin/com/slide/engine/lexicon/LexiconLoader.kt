@@ -26,11 +26,14 @@ object LexiconLoader {
      * Loads the lexicon, or returns null if the asset is missing or unreadable.
      *
      * Null is a survivable outcome: the keyboard still types, it just cannot decode gestures.
-     * That is a much better failure than refusing to open at all.
+     * That is a much better failure than refusing to open at all — which is also why every
+     * [Exception] is caught rather than [IOException] alone. A file of the right length holding
+     * the wrong bytes fails an index check, not a read, and this is called from an IME coroutine
+     * with nothing above it to catch anything. Errors (out of memory and friends) still propagate.
      */
     fun load(context: Context): Lexicon? = try {
         context.assets.open(ASSET_NAME).use(::read)
-    } catch (e: IOException) {
+    } catch (e: Exception) {
         Log.e(TAG, "Could not read $ASSET_NAME; gesture typing will be unavailable", e)
         null
     }
@@ -67,9 +70,20 @@ object LexiconLoader {
         for (index in 0 until wordCount) {
             offsets[index] = written
 
+            // The two length bytes and the suffix they introduce all have to be inside the block,
+            // and the word they build has to fit the character count the header promised. Every
+            // one of these is an index into an array on the next line, so a corrupt file that
+            // happens to be the right length would otherwise crash the keyboard rather than
+            // disable gesture typing.
+            if (read + 2 > blockLength) {
+                throw IOException("Entry $index starts past the end of the block")
+            }
             val shared = block[read].toInt() and 0xFF
             val suffixLength = block[read + 1].toInt() and 0xFF
             read += 2
+            if (read + suffixLength > blockLength) {
+                throw IOException("Entry $index claims a $suffixLength-byte suffix past the block")
+            }
 
             // The shared prefix is carried forward from the previous word, which sits immediately
             // behind us in the same buffer. For the first entry that span is empty, so a non-zero
@@ -79,6 +93,9 @@ object LexiconLoader {
                 // A prefix longer than the word it refers to means the file is corrupt. Failing
                 // here beats silently emitting garbage words into the user's messages.
                 throw IOException("Entry $index claims a $shared-char prefix of a shorter word")
+            }
+            if (written + shared + suffixLength > charCount) {
+                throw IOException("Entry $index runs past the $charCount characters the header declared")
             }
 
             for (i in 0 until shared) {

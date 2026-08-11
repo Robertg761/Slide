@@ -42,7 +42,15 @@ class VoiceInputClient(private val context: Context) {
     private data class PendingStart(val sessionId: Long, val model: WhisperModel)
 
     private var service: Messenger? = null
-    private var bound = false
+
+    /**
+     * Whether the system holds a registration for [connection].
+     *
+     * This is not "the bind succeeded": `bindService` registers the connection even when it returns
+     * false, and only `unbindService` removes it. Tracking the request rather than its result is
+     * what lets a refused bind be cleaned up instead of leaking until the process dies.
+     */
+    private var registered = false
     private var pendingStart: PendingStart? = null
     private val session = VoiceSessionTracker()
 
@@ -124,8 +132,12 @@ class VoiceInputClient(private val context: Context) {
 
     /** Connects to the speech process. Cheap: no model is loaded until the first [start]. */
     fun bind() {
-        if (bound) return
-        bound = try {
+        if (registered) return
+        // Set before the call: a bindService that throws may still have registered the connection,
+        // and an unbindService for a registration that was never made is harmless (it throws
+        // IllegalArgumentException, which clearBindingRegistration expects).
+        registered = true
+        val started = try {
             context.bindService(
                 Intent(context, VoiceInputService::class.java),
                 connection,
@@ -135,23 +147,25 @@ class VoiceInputClient(private val context: Context) {
             Log.e(TAG, "Could not bind the speech service", e)
             false
         }
-        if (!bound) {
+        if (!started) {
             Log.e(TAG, "Could not bind the speech service")
+            // No callback will ever arrive for a refused bind, so nothing else would ever drop the
+            // registration: unbind() used to skip it and the connection leaked until process death.
+            clearBindingRegistration()
             reportActiveFailure("Voice typing service could not be started")
         }
     }
 
     /** Disconnects, which lets the speech process and its model be reclaimed. */
     fun unbind() {
-        if (!bound) {
+        if (!registered) {
             session.reset()
             pendingStart = null
             service = null
             return
         }
         cancel()
-        context.unbindService(connection)
-        bound = false
+        clearBindingRegistration()
         service = null
         pendingStart = null
         // An unbound client cannot receive the cancellation acknowledgement; invalidate locally.
@@ -237,13 +251,13 @@ class VoiceInputClient(private val context: Context) {
     }
 
     private fun clearBindingRegistration() {
-        if (!bound) return
+        if (!registered) return
         try {
             context.unbindService(connection)
         } catch (e: IllegalArgumentException) {
             Log.w(TAG, "Speech service binding was already gone", e)
         } finally {
-            bound = false
+            registered = false
         }
     }
 

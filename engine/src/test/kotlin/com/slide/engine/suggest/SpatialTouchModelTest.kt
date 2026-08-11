@@ -42,7 +42,58 @@ class SpatialTouchModelTest {
         assertTrue(model.entries().none { it.letter == 't' })
     }
 
-    private fun touchesFor(word: String, tOffset: Float): FloatArray =
+    /**
+     * The one correction whose touches cannot be attributed to anything.
+     *
+     * "gerat" reaches "great" by a single transposition, which is the cheapest edit the corrector
+     * sells and so a correction users really do accept from the strip. Both touches are honest —
+     * the finger hit `e` and then `r` — but which intended letter each belongs to is exactly what
+     * the alignment cannot say, and an alignment with no transposition to spend will confidently
+     * say the wrong thing: a whole key's error learned into both letters at once.
+     */
+    @Test
+    fun `a transposed correction teaches neither of the swapped keys`() {
+        val model = SpatialTouchModel()
+        // Learn 'e' and 'r' from honest typing first, so "unchanged" is a claim about real
+        // learned data rather than about an empty slot.
+        repeat(4) { model.observe("rest", "rest", touchesFor("rest"), keys) }
+        val before = model.entries().associateBy { it.letter }
+        assertTrue("the fixture should have taught 'e' and 'r'", 'e' in before && 'r' in before)
+
+        val learned = model.observe("gerat", "great", touchesFor("gerat"), keys)
+
+        assertEquals("only g, a and t are aligned to a touch of their own", 3, learned)
+        val after = model.entries().associateBy { it.letter }
+        assertEquals("'e' must not learn the touch that produced 'r'", before['e'], after['e'])
+        assertEquals("'r' must not learn the touch that produced 'e'", before['r'], after['r'])
+    }
+
+    /**
+     * Saving and reloading must not change what the model believes.
+     *
+     * [SpatialTouchModel.restore] clips a mean to ±0.65 key widths; a live mean past that would
+     * therefore mean one thing until the process restarted and another afterwards, from the very
+     * same learned data.
+     */
+    @Test
+    fun `an extreme but plausible mean survives a save and reload`() {
+        val model = SpatialTouchModel()
+        // Inside the observation gate, outside the clamp the restore path enforces.
+        repeat(20) { model.observe("test", "test", touchesFor("test", tOffset = 1.3f), keys) }
+
+        val restored = SpatialTouchModel().also { it.restore(model.entries()) }
+        assertEquals(model.entries(), restored.entries())
+
+        val x = keys.centerX('t') + 1.3f * keys.keyWidth
+        val y = keys.centerY('t')
+        assertEquals(
+            requireNotNull(model.distance('t', x, y, keys)),
+            requireNotNull(restored.distance('t', x, y, keys)),
+            0f,
+        )
+    }
+
+    private fun touchesFor(word: String, tOffset: Float = 0f): FloatArray =
         FloatArray(word.length * 2).also { points ->
             for (position in word.indices) {
                 val letter = word[position]

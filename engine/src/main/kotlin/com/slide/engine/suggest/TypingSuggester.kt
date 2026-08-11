@@ -271,9 +271,28 @@ class TypingSuggester(
     private val corrections = HashMap<Int, Float>()
     private val multiEditIndices = HashSet<Int>()
 
+    /**
+     * Longest target [editDistance] can be asked about, which is more than the edit bound implies.
+     *
+     * The trie the second stage walks is keyed on letters only — [SwipeLexiconTrie] skips
+     * apostrophes when it inserts — so a node two edits deep can hold a terminal whose actual
+     * spelling is longer than its path by every apostrophe in it. Sizing the rows from the edit
+     * bound alone is therefore correct only for apostrophe-free words, and quietly stops being
+     * correct if the wordlist ever gains a long contraction. Take the lexicon's own maximum
+     * instead, so the invariant is "every word this suggester could ever be handed fits".
+     */
+    private val maxTargetLength = run {
+        var longest = config.maxWordLength + MAX_MULTI_EDITS
+        for (index in 0 until lexicon.size) {
+            val length = lexicon.lengthAt(index)
+            if (length > longest) longest = length
+        }
+        longest
+    }
+
     /** Reused rows for the bounded second-stage decoder; no per-candidate arrays are allocated. */
-    private val unitRows = Array(3) { IntArray(config.maxWordLength + 3) }
-    private val weightedRows = Array(3) { FloatArray(config.maxWordLength + 3) }
+    private val unitRows = Array(3) { IntArray(maxTargetLength + 1) }
+    private val weightedRows = Array(3) { FloatArray(maxTargetLength + 1) }
 
     /** One edit-distance row per trie depth for allocation-free prefix pruning. */
     private val trieUnitRows = Array(config.maxWordLength + MAX_MULTI_EDITS + 2) {
@@ -424,7 +443,8 @@ class TypingSuggester(
         val exact = lexicon.indexOf(lower)
         val shown = exact.takeIf { it >= 0 && !(blockOffensive && lexicon.isOffensive(it)) }
 
-        val completions = collectCompletions(lower, blockOffensive)
+        val properNounsUnmarked = typed.none(Char::isUpperCase)
+        val completions = collectCompletions(lower, blockOffensive, properNounsUnmarked)
         if (lower.length >= config.minCorrectionLength) collectCorrections(lower, blockOffensive)
         collectUnambiguousContraction(lower, blockOffensive)
         if (
@@ -435,7 +455,7 @@ class TypingSuggester(
             collectMultiEditCorrections(lower, blockOffensive)
         }
 
-        val ranked = rank(shown, completions, properNounsUnmarked = typed.none(Char::isUpperCase))
+        val ranked = rank(shown, completions, properNounsUnmarked)
 
         // A word this person has deliberately used before is a word, whatever the shipped
         // dictionary thinks. This is the whole point of learning: without it their own name, and
@@ -454,8 +474,21 @@ class TypingSuggester(
 
     // region Candidate generation
 
-    /** Top completions by score. The range can hold thousands, so only the best few are kept. */
-    private fun collectCompletions(lower: String, blockOffensive: Boolean): TopK {
+    /**
+     * Top completions by score. The range can hold thousands, so only the best few are kept.
+     *
+     * The proper-noun penalty is charged here rather than after the board has been truncated, for
+     * the reason any score adjustment belongs before a top-k and not after: a name that is only
+     * ahead because it has not yet been charged still evicts the word that would have beaten it.
+     * "geo" filled the strip with Geos, Georg and Geoff while "geode" and "geology" were dropped
+     * on the way in and never got the chance to lose fairly. Corrections have always been scored
+     * this way — see `rank`'s `scoreOf`, whose board is the sort at the end rather than this one.
+     */
+    private fun collectCompletions(
+        lower: String,
+        blockOffensive: Boolean,
+        properNounsUnmarked: Boolean,
+    ): TopK {
         val board = TopK(config.maxResults + 1)
         if (lower.length < config.minCompletionLength) return board
 
@@ -465,7 +498,8 @@ class TypingSuggester(
             if (blockOffensive && lexicon.isOffensive(index)) continue
 
             val extra = length - lower.length
-            val cost = config.completionCost + config.completionCostPerChar * extra
+            var cost = config.completionCost + config.completionCostPerChar * extra
+            if (properNounsUnmarked && lexicon.isCapitalized(index)) cost += config.properNounCost
             board.offer(index, languageScore(index) - cost)
         }
         return board
@@ -771,17 +805,15 @@ class TypingSuggester(
                 ),
             )
         }
+        // Already penalised on the way into the board, so charging it again here would price a name
+        // at twice what a correction pays for being one.
         for (i in 0 until completions.size) {
             val index = completions.wordIndices[i]
             if (!seen.add(index)) continue
             pool.add(
                 WordSuggestion(
                     lexicon.wordAt(index),
-                    if (properNounsUnmarked && lexicon.isCapitalized(index)) {
-                        completions.scores[i] - config.properNounCost
-                    } else {
-                        completions.scores[i]
-                    },
+                    completions.scores[i],
                     WordSuggestion.Kind.Completion,
                 ),
             )

@@ -23,11 +23,14 @@ object EmojiLoader {
      * Loads the catalogue, or returns null if the asset is missing or unreadable.
      *
      * As with the lexicon, null is survivable: the emoji key stops working and everything else
-     * about the keyboard carries on, which is far better than refusing to open.
+     * about the keyboard carries on, which is far better than refusing to open. That is also why
+     * every [Exception] is caught rather than [IOException] alone: a file of the right length
+     * holding the wrong content fails an index check rather than a read, and this runs from an IME
+     * coroutine with no exception handler above it. Errors still propagate.
      */
     fun load(context: Context): EmojiData? = try {
         context.assets.open(ASSET_NAME).use(::read)
-    } catch (e: IOException) {
+    } catch (e: Exception) {
         Log.e(TAG, "Could not read $ASSET_NAME; the emoji picker will be unavailable", e)
         null
     }
