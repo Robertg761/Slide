@@ -533,11 +533,13 @@ class EmojiPanelView(context: Context) : View(context) {
                 // and a coloured block behind one of them reads as another emoji.
                 fillPaint.color = keyboardTheme.accentBackground
                 val inset = tabWidth * 0.22f
-                canvas.drawRect(
+                canvas.drawRoundRect(
                     left + inset,
-                    bottom - dp(2.5f),
+                    bottom - dp(3f),
                     left + tabWidth - inset,
-                    bottom,
+                    bottom - dp(0.5f),
+                    dp(1.25f),
+                    dp(1.25f),
                     fillPaint,
                 )
             }
@@ -699,6 +701,16 @@ class EmojiPanelView(context: Context) : View(context) {
         fillPaint.color = keyboardTheme.popupBackground
         val radius = dp(8f)
         canvas.drawRoundRect(popupRect, radius, radius, fillPaint)
+        // Drawn inline over the grid with no window elevation at all, so without an edge the row
+        // melts into same-coloured cells behind it on dark themes.
+        val oldStyle = linePaint.style
+        val oldStrokeWidth = linePaint.strokeWidth
+        linePaint.color = keyboardTheme.keyBorder
+        linePaint.style = Paint.Style.STROKE
+        linePaint.strokeWidth = dp(1f)
+        canvas.drawRoundRect(popupRect, radius, radius, linePaint)
+        linePaint.style = oldStyle
+        linePaint.strokeWidth = oldStrokeWidth
 
         val slot = popupRect.width() / forms.size
         emojiPaint.textSize = sp(EMOJI_SP)

@@ -265,15 +265,18 @@ class SuggestionStripView(context: Context) : View(context) {
                     inset,
                     left + cellWidth - inset,
                     height - inset,
-                    dp(10f),
-                    dp(10f),
+                    dp(12f),
+                    dp(12f),
                     pressedPaint,
                 )
             }
 
             // The top choice is the one that gets committed, so it is marked as such: the user
             // should be able to tell at a glance whether the keyboard already agrees with them.
-            textPaint.color = keyboardTheme.suggestionText
+            // Accent colour on top of weight, because bold alone disappears at 16sp in peripheral
+            // vision while a colour change reads without focusing on the strip.
+            textPaint.color =
+                if (index == 0) keyboardTheme.suggestionHighlightText else keyboardTheme.suggestionText
             textPaint.typeface = if (index == 0) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
 
             canvas.drawText(
