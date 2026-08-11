@@ -2,6 +2,7 @@ package com.slide.ime.text
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -58,6 +59,38 @@ class ExpectedSelectionTrackerTest {
         assertTrue(tracker.consume(start, end))
         assertTrue(tracker.consume(end, start))
         assertTrue(tracker.consume(start, end))
+    }
+
+    /**
+     * A chain is registered only after its edits have been sent, so while callbacks for the earlier
+     * steps are still arriving the editor is already at the end of it. That end is what the
+     * keyboard must cache: an edit landing between the two callbacks — a Backspace looking for the
+     * word a swipe just committed — is otherwise measured against a superseded position.
+     */
+    @Test
+    fun `an intermediate callback still reports where the chain ends`() {
+        val tracker = ExpectedSelectionTracker()
+        assertNull(tracker.pendingTarget())
+
+        tracker.expect(EditorSelection(4, 4), EditorSelection(12, 12))
+        tracker.expect(EditorSelection(12, 12), EditorSelection(19, 19))
+        assertEquals(EditorSelection(19, 19), tracker.pendingTarget())
+
+        assertTrue(tracker.consume(EditorSelection(4, 4), EditorSelection(12, 12)))
+        assertEquals(EditorSelection(19, 19), tracker.pendingTarget())
+
+        assertTrue(tracker.consume(EditorSelection(12, 12), EditorSelection(19, 19)))
+        assertNull(tracker.pendingTarget())
+    }
+
+    @Test
+    fun `a coalesced callback leaves nothing outstanding`() {
+        val tracker = ExpectedSelectionTracker()
+        tracker.expect(EditorSelection(4, 4), EditorSelection(12, 12))
+        tracker.expect(EditorSelection(12, 12), EditorSelection(19, 19))
+
+        assertTrue(tracker.consume(EditorSelection(4, 4), EditorSelection(19, 19)))
+        assertNull(tracker.pendingTarget())
     }
 
     @Test

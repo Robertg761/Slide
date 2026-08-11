@@ -135,6 +135,83 @@ class BigramLoaderTest {
         }
     }
 
+    /**
+     * A negative offset is the crash: the successor loop writes at `successors[offset]`, so the
+     * model used to take the keyboard down with an out-of-bounds write rather than load without
+     * context. `load` only promises to survive an [IOException].
+     */
+    @Test
+    fun `rejects an offset table that goes negative`() {
+        val error = assertThrows(IOException::class.java) {
+            BigramLoader.read(ByteArrayInputStream(withOffset(1, -1)), lexicon)
+        }
+        assertTrue(error.message!!, error.message!!.contains("backwards"))
+    }
+
+    /**
+     * This one never crashed, which is worse: offsets that go backwards but stay inside the array
+     * simply hand one context another context's successors, and every correction after that is
+     * quietly scored against words the corpus never saw follow.
+     */
+    @Test
+    fun `rejects an offset table that goes backwards`() {
+        val buffer = ByteBuffer.wrap(raw)
+        val first = buffer.getInt(offsetsPosition() + Int.SIZE_BYTES)
+        val second = buffer.getInt(offsetsPosition() + 2 * Int.SIZE_BYTES)
+        assertTrue("the asset's own offsets do not ascend", second >= first)
+
+        val error = assertThrows(IOException::class.java) {
+            // Swapping a neighbouring pair leaves every value in range and the table still ending
+            // at pairCount, so only an ordering check can tell.
+            BigramLoader.read(ByteArrayInputStream(withOffset(1, second, 2, first)), lexicon)
+        }
+        assertTrue(error.message!!, error.message!!.contains("backwards"))
+    }
+
+    /**
+     * A successor index is a varint, and a varint that runs to five bytes reaches the sign bit.
+     * The resulting negative index passed the "outside the lexicon" check, was stored, and then
+     * crashed `Lexicon.wordAt` on the keystroke that surfaced the suggestion — a load failure
+     * turning into a crash several keypresses away is exactly what these loaders must not do.
+     */
+    @Test
+    fun `rejects a successor index that decodes as negative`() {
+        val tampered = raw.copyOf()
+        // 8 shl 28 is Int.MIN_VALUE: four continuation bytes contributing nothing, then the byte
+        // that lands on the sign bit.
+        val varint = byteArrayOf(0x80.toByte(), 0x80.toByte(), 0x80.toByte(), 0x80.toByte(), 0x08)
+        varint.copyInto(tampered, blockPosition())
+
+        val error = assertThrows(IOException::class.java) {
+            BigramLoader.read(ByteArrayInputStream(tampered), lexicon)
+        }
+        // Naming the index proves this is the sign check failing rather than some later mishap.
+        assertTrue(error.message!!, error.message!!.contains("${Int.MIN_VALUE}"))
+    }
+
+    /** Overwrites entries of the offsets table, given as index-to-value pairs. */
+    private fun withOffset(vararg indexThenValue: Int): ByteArray {
+        val tampered = raw.copyOf()
+        val buffer = ByteBuffer.wrap(tampered)
+        val position = offsetsPosition()
+        for (i in indexThenValue.indices step 2) {
+            buffer.putInt(position + indexThenValue[i] * Int.SIZE_BYTES, indexThenValue[i + 1])
+        }
+        return tampered
+    }
+
+    /** The offsets table follows the header and the context ids. */
+    private fun offsetsPosition(): Int {
+        val contextCount = ByteBuffer.wrap(raw).getInt(CONTEXT_COUNT_OFFSET)
+        return HEADER_BYTES + contextCount * Int.SIZE_BYTES
+    }
+
+    /** The varint block follows the offsets table, whose last entry is the pair count. */
+    private fun blockPosition(): Int {
+        val contextCount = ByteBuffer.wrap(raw).getInt(CONTEXT_COUNT_OFFSET)
+        return offsetsPosition() + (contextCount + 1) * Int.SIZE_BYTES
+    }
+
     // endregion
 
     @Test
@@ -159,5 +236,9 @@ class BigramLoaderTest {
     private companion object {
         const val WORD_COUNT_OFFSET = 5
         const val FIRST_WORD_OFFSET = 19
+
+        /** Magic, version, word count, lexicon fingerprint, then three counts. */
+        const val CONTEXT_COUNT_OFFSET = 4 + 1 + 4 + 32
+        const val HEADER_BYTES = CONTEXT_COUNT_OFFSET + 3 * Int.SIZE_BYTES
     }
 }

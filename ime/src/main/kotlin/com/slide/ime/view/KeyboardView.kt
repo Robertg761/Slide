@@ -141,6 +141,7 @@ class KeyboardView @JvmOverloads constructor(
         set(value) {
             if (field == value) return
             field = value
+            clearSearchPress()
             requestLayout()
             if (width > 0 && height > 0) recomputeGeometry(width, height)
             refreshAccessibilityDescription()
@@ -246,10 +247,26 @@ class KeyboardView @JvmOverloads constructor(
     private var gestureStartTime = 0L
     private var lastGesturePreviewTime = 0L
 
-    private var longPressRunnable: Runnable? = null
+    /**
+     * Pending long presses, keyed by the finger that armed them.
+     *
+     * A single slot for the whole view meant any other pointer's press or lift disarmed a
+     * pending accent popup — on a two-thumb layout, that is most of them. Scoped like the
+     * repeat runnable, which already tracks its owner.
+     */
+    private val longPressRunnables = HashMap<Int, Runnable>()
+
+    /** Finger that opened the alternates popup; only it may commit or dismiss the selection. */
+    private var alternatesPointerId: Int? = null
+
+    /** Finger whose key the single shared preview window is currently showing. */
+    private var previewPointerId: Int? = null
+
     private var repeatRunnable: Runnable? = null
     private var repeatPointerId: Int? = null
-    private var searchPointerActive = false
+
+    /** Finger that owns the emoji-search header, or null while no finger is in it. */
+    private var searchPointerId: Int? = null
     private var pressedSearchResult = -1
     private var pressedSearchClose = false
     private var cursorRemainderPx = 0f
@@ -861,39 +878,7 @@ class KeyboardView @JvmOverloads constructor(
     // region Touch
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (searchMode && (searchPointerActive || event.actionMasked == MotionEvent.ACTION_DOWN && event.y < searchHeaderHeight())) {
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    searchPointerActive = true
-                    pressedSearchClose = searchCloseAt(event.x, event.y)
-                    pressedSearchResult = if (pressedSearchClose) -1 else searchResultAt(event.x, event.y)
-                    invalidate()
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    if (pressedSearchClose && !searchCloseAt(event.x, event.y)) pressedSearchClose = false
-                    val next = if (pressedSearchClose) -1 else searchResultAt(event.x, event.y)
-                    if (next != pressedSearchResult) pressedSearchResult = next
-                    invalidate()
-                }
-                MotionEvent.ACTION_UP -> {
-                    val close = pressedSearchClose
-                    val result = pressedSearchResult
-                    searchPointerActive = false
-                    pressedSearchClose = false
-                    pressedSearchResult = -1
-                    invalidate()
-                    if (close) listener?.onSearchClosed()
-                    else if (result in searchResults.indices) listener?.onSearchEmojiPicked(searchResults[result])
-                }
-                MotionEvent.ACTION_CANCEL -> {
-                    searchPointerActive = false
-                    pressedSearchClose = false
-                    pressedSearchResult = -1
-                    invalidate()
-                }
-            }
-            return true
-        }
+        if (searchMode && handleSearchHeaderTouch(event)) return true
 
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
@@ -946,7 +931,83 @@ class KeyboardView @JvmOverloads constructor(
         return true
     }
 
+    /**
+     * Routes the emoji-search header, which is a second touch target layered over the keys.
+     *
+     * Returns true when the header consumed the event. The header owns exactly one finger:
+     * a second finger landing in it is swallowed rather than handed to the key hit-test —
+     * [KeyGeometry.hitTest] never returns null, so falling through would type the nearest
+     * top-row letter into the query. Fingers on the keys keep working while the header is
+     * held, and only the header's own finger can resolve it, whether it lifts as ACTION_UP
+     * or, with a key still down, as ACTION_POINTER_UP.
+     */
+    private fun handleSearchHeaderTouch(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                val index = event.actionIndex
+                val x = event.getX(index)
+                val y = event.getY(index)
+                return when (
+                    SearchHeaderRouting.onPointerDown(searchPointerId, inHeader = y < searchHeaderHeight())
+                ) {
+                    SearchHeaderRouting.Down.PASS_TO_KEYS -> false
+                    SearchHeaderRouting.Down.SWALLOW -> true
+                    SearchHeaderRouting.Down.CLAIM -> {
+                        searchPointerId = event.getPointerId(index)
+                        pressedSearchClose = searchCloseAt(x, y)
+                        pressedSearchResult = if (pressedSearchClose) -1 else searchResultAt(x, y)
+                        invalidate()
+                        true
+                    }
+                }
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                val owner = searchPointerId ?: return false
+                val index = event.findPointerIndex(owner)
+                if (index < 0) return false
+                val x = event.getX(index)
+                val y = event.getY(index)
+                if (pressedSearchClose && !searchCloseAt(x, y)) pressedSearchClose = false
+                val next = if (pressedSearchClose) -1 else searchResultAt(x, y)
+                if (next != pressedSearchResult) pressedSearchResult = next
+                invalidate()
+                // Other fingers may be pressing keys, so the key layer still sees this move.
+                return false
+            }
+
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+                val lifted = event.getPointerId(event.actionIndex)
+                if (!SearchHeaderRouting.resolvesOnLift(searchPointerId, lifted)) return false
+                val close = pressedSearchClose
+                val result = pressedSearchResult
+                clearSearchPress()
+                if (close) listener?.onSearchClosed()
+                else if (result in searchResults.indices) listener?.onSearchEmojiPicked(searchResults[result])
+                return true
+            }
+
+            MotionEvent.ACTION_CANCEL -> {
+                clearSearchPress()
+                // The keys are cancelled by the same event.
+                return false
+            }
+        }
+        return false
+    }
+
+    private fun clearSearchPress() {
+        searchPointerId = null
+        pressedSearchClose = false
+        pressedSearchResult = -1
+        invalidate()
+    }
+
     private fun handlePointerDown(pointerId: Int, x: Float, y: Float, eventTime: Long) {
+        // A contact that arrives while a swipe is in flight — the other thumb, a palm — is not a
+        // key press: sounding it, previewing it, or committing it on lift all interrupt the swipe.
+        // Left out of [pointers] entirely, so its own move and lift are ignored too.
+        if (PointerOwnership.ignoresKeyDown(gesturePointerId)) return
         val placed = KeyGeometry.hitTest(placedKeys, x, y) ?: return
         completedGesturePoints.clear()
         val pointer = Pointer(placed, placed, x, y, eventTime)
@@ -954,7 +1015,7 @@ class KeyboardView @JvmOverloads constructor(
         cursorRemainderPx = 0f
 
         listener?.onKeyDown(placed.key)
-        showPreviewFor(placed)
+        showPreviewFor(pointerId, placed)
         scheduleLongPress(pointerId, placed)
 
         // Backspace commits on release unless repeat has begun. This preserves the user's selection
@@ -979,9 +1040,9 @@ class KeyboardView @JvmOverloads constructor(
             val dy = y - pointer.downY
             if (!pointer.cursorMove && abs(dx) > touchSlop * GESTURE_SLOP_FACTOR && abs(dx) > abs(dy) * 1.15f) {
                 pointer.cursorMove = true
-                cancelPendingLongPress()
+                cancelPendingLongPress(pointerId)
                 cancelRepeat(pointerId)
-                previewPopup.dismiss()
+                dismissPreviewFor(pointerId)
                 pointer.lastX = x
             }
             if (pointer.cursorMove) {
@@ -1003,9 +1064,9 @@ class KeyboardView @JvmOverloads constructor(
             val dy = y - pointer.downY
             if (!pointer.deleteWordGesture && dx < -touchSlop * GESTURE_SLOP_FACTOR && abs(dx) > abs(dy) * 1.15f) {
                 pointer.deleteWordGesture = true
-                cancelPendingLongPress()
+                cancelPendingLongPress(pointerId)
                 cancelRepeat(pointerId)
-                previewPopup.dismiss()
+                dismissPreviewFor(pointerId)
             }
             if (pointer.deleteWordGesture) {
                 invalidate()
@@ -1028,7 +1089,10 @@ class KeyboardView @JvmOverloads constructor(
             return
         }
 
-        if (alternatesPopup.isShowing && pointer.longPressFired) {
+        if (
+            pointer.longPressFired &&
+            PointerOwnership.ownsPopup(alternatesPopup.isShowing, alternatesPointerId, pointerId)
+        ) {
             alternatesPopup.updateSelection(x, y)
             return
         }
@@ -1037,12 +1101,12 @@ class KeyboardView @JvmOverloads constructor(
         if (travelled > touchSlop) {
             val nowOver = KeyGeometry.hitTest(placedKeys, x, y)
             if (nowOver != null && nowOver !== pointer.placed) {
-                cancelPendingLongPress()
-                cancelRepeat()
+                cancelPendingLongPress(pointerId)
+                cancelRepeat(pointerId)
                 beginPressFade(pointer.placed.key)
                 pointer.placed = nowOver
                 pointer.slidOff = true
-                showPreviewFor(nowOver)
+                showPreviewFor(pointerId, nowOver)
                 invalidate()
             }
         }
@@ -1050,9 +1114,9 @@ class KeyboardView @JvmOverloads constructor(
 
     private fun handlePointerUp(pointerId: Int, x: Float, y: Float, eventTime: Long) {
         val pointer = pointers.remove(pointerId) ?: return
-        cancelPendingLongPress()
+        cancelPendingLongPress(pointerId)
         cancelRepeat(pointerId)
-        previewPopup.dismiss()
+        releasePreview(pointerId)
         beginPressFade(pointer.placed.key)
 
         if (pointer.cursorMove) {
@@ -1073,9 +1137,12 @@ class KeyboardView @JvmOverloads constructor(
             return
         }
 
-        if (alternatesPopup.isShowing) {
+        // Only the finger that opened the popup can answer it. Another finger's lift used to
+        // commit the popup's selection against its own, unrelated key — and left the owning
+        // finger with nothing to commit when it eventually lifted.
+        if (PointerOwnership.ownsPopup(alternatesPopup.isShowing, alternatesPointerId, pointerId)) {
             val selection = alternatesPopup.selected
-            alternatesPopup.dismiss()
+            dismissAlternates()
             if (selection != null) {
                 listener?.onKeyCommit(pointer.placed.key, selection)
                 invalidate()
@@ -1098,22 +1165,61 @@ class KeyboardView @JvmOverloads constructor(
 
     private fun cancelAllPointers() {
         pointers.clear()
-        cancelPendingLongPress()
+        cancelAllPendingLongPresses()
         cancelRepeat()
         previewPopup.dismiss()
-        alternatesPopup.dismiss()
+        previewPointerId = null
+        dismissAlternates()
         abandonGesture()
         completedGesturePoints.clear()
         invalidate()
     }
 
-    private fun showPreviewFor(placed: PlacedKey) {
+    private fun showPreviewFor(pointerId: Int, placed: PlacedKey) {
         if (!settings.showKeyPreview) return
         if (placed.key.type != KeyType.CHARACTER) {
-            previewPopup.dismiss()
+            dismissPreviewFor(pointerId)
             return
         }
+        previewPointerId = pointerId
         previewPopup.show(keyboardTheme, displayLabel(placed.key), placed)
+    }
+
+    /** Hides the one shared preview window, but only on behalf of the finger showing in it. */
+    private fun dismissPreviewFor(pointerId: Int) {
+        if (!PointerOwnership.ownsPreview(previewPointerId, pointerId)) return
+        previewPopup.dismiss()
+        previewPointerId = null
+    }
+
+    /**
+     * Releases the preview on a lift, handing it back to a finger that is still down.
+     *
+     * There is one preview window for the whole view, so a rollover lift — the trailing thumb
+     * leaving while the leading one still rests on a letter — used to blank the preview of a key
+     * that is very much still pressed.
+     */
+    private fun releasePreview(pointerId: Int) {
+        if (!PointerOwnership.ownsPreview(previewPointerId, pointerId)) return
+        previewPopup.dismiss()
+        previewPointerId = null
+        val survivor = pointers.entries
+            .filter { (id, pointer) ->
+                id != pointerId &&
+                    id != gesturePointerId &&
+                    pointer.placed.key.type == KeyType.CHARACTER &&
+                    !pointer.longPressFired &&
+                    !pointer.cursorMove &&
+                    !pointer.deleteWordGesture
+            }
+            .maxByOrNull { (_, pointer) -> pointer.downTime }
+            ?: return
+        showPreviewFor(survivor.key, survivor.value.placed)
+    }
+
+    private fun dismissAlternates() {
+        alternatesPopup.dismiss()
+        alternatesPointerId = null
     }
 
     // endregion
@@ -1122,15 +1228,22 @@ class KeyboardView @JvmOverloads constructor(
 
     private fun scheduleLongPress(pointerId: Int, placed: PlacedKey) {
         if (placed.key.alternates.isEmpty()) return
-        cancelPendingLongPress()
+        cancelPendingLongPress(pointerId)
         val runnable = Runnable {
+            longPressRunnables.remove(pointerId)
             val pointer = pointers[pointerId] ?: return@Runnable
+            // One popup window, one owner: a second finger's hold must not steal a popup the
+            // first finger is still choosing from.
+            if (!PointerOwnership.mayOpenPopup(alternatesPopup.isShowing, alternatesPointerId, pointerId)) {
+                return@Runnable
+            }
             pointer.longPressFired = true
-            previewPopup.dismiss()
+            dismissPreviewFor(pointerId)
             val alternates = alternatesFor(placed.key)
+            alternatesPointerId = pointerId
             alternatesPopup.show(keyboardTheme, alternates, placed)
         }
-        longPressRunnable = runnable
+        longPressRunnables[pointerId] = runnable
         handler.postDelayed(runnable, longPressTimeout)
     }
 
@@ -1141,9 +1254,13 @@ class KeyboardView @JvmOverloads constructor(
         return (listOf(base) + rest).distinct()
     }
 
-    private fun cancelPendingLongPress() {
-        longPressRunnable?.let { handler.removeCallbacks(it) }
-        longPressRunnable = null
+    private fun cancelPendingLongPress(pointerId: Int) {
+        longPressRunnables.remove(pointerId)?.let(handler::removeCallbacks)
+    }
+
+    private fun cancelAllPendingLongPresses() {
+        longPressRunnables.values.forEach(handler::removeCallbacks)
+        longPressRunnables.clear()
     }
 
     private fun scheduleRepeat(pointerId: Int, placed: PlacedKey) {
@@ -1178,9 +1295,9 @@ class KeyboardView @JvmOverloads constructor(
     // region Gesture
 
     private fun beginGesture(pointerId: Int, pointer: Pointer) {
-        cancelPendingLongPress()
-        cancelRepeat()
-        previewPopup.dismiss()
+        cancelPendingLongPress(pointerId)
+        cancelRepeat(pointerId)
+        dismissPreviewFor(pointerId)
         // The gesture pointer's key stops drawing as held the moment the swipe begins, so hand it
         // to the release fade rather than letting the highlight vanish between two frames.
         beginPressFade(pointer.placed.key)
@@ -1369,6 +1486,65 @@ class KeyboardView @JvmOverloads constructor(
         const val REPEAT_MIN_DELAY_MS = 25L
         const val REPEAT_ACCELERATION = 0.66f
     }
+}
+
+/**
+ * Who owns the keyboard's single-slot touch state.
+ *
+ * The keyboard has one preview window, one alternates popup and one search header but any number
+ * of fingers. Kept outside the View so the ownership rules — the part that was wrong, not the
+ * Android plumbing — stay regression-tested.
+ */
+internal object PointerOwnership {
+
+    /** True when [pointerId] may commit or dismiss the alternates popup on its lift. */
+    fun ownsPopup(popupShowing: Boolean, owner: Int?, pointerId: Int): Boolean =
+        popupShowing && owner == pointerId
+
+    /**
+     * True when a long press that has just come due may open its popup.
+     *
+     * A popup another finger is still choosing from is not up for grabs; without this, the second
+     * thumb's rescheduled hold reopened the popup over its own key mid-selection.
+     */
+    fun mayOpenPopup(popupShowing: Boolean, owner: Int?, pointerId: Int): Boolean =
+        !popupShowing || owner == null || owner == pointerId
+
+    /** True when [pointerId] may hide or hand over the shared key preview. */
+    fun ownsPreview(owner: Int?, pointerId: Int): Boolean = owner == null || owner == pointerId
+
+    /** A contact that arrives while a swipe is in flight is not a key press. */
+    fun ignoresKeyDown(gesturePointerId: Int?): Boolean = gesturePointerId != null
+}
+
+/**
+ * How the emoji-search header claims fingers.
+ *
+ * The header is layered over the keys, and [KeyGeometry.hitTest] never returns null, so a header
+ * touch that is not claimed here becomes a stray letter in the search query.
+ */
+internal object SearchHeaderRouting {
+
+    enum class Down {
+        /** No finger held the header: this one takes it. */
+        CLAIM,
+
+        /** The header already has a finger; swallow this one rather than type with it. */
+        SWALLOW,
+
+        /** Below the header — the keys get it. */
+        PASS_TO_KEYS,
+    }
+
+    fun onPointerDown(headerOwner: Int?, inHeader: Boolean): Down = when {
+        !inHeader -> Down.PASS_TO_KEYS
+        headerOwner == null -> Down.CLAIM
+        else -> Down.SWALLOW
+    }
+
+    /** True when a lift — ACTION_UP or ACTION_POINTER_UP alike — resolves the header press. */
+    fun resolvesOnLift(headerOwner: Int?, pointerId: Int): Boolean =
+        headerOwner != null && headerOwner == pointerId
 }
 
 /** Visual keycap policy separated from Canvas work so theme settings cannot regress silently. */

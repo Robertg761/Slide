@@ -209,10 +209,10 @@ class AudioRecorder internal constructor(
                     break
                 }
 
-                // requestStop can unblock read with one last positive buffer. It belongs to the
-                // canceled capture and must not be appended after stop() has begun draining it.
-                if (capture.stopRequested.get()) break
-
+                // requestStop unblocks read with one last positive buffer, and that buffer is the
+                // tail of the user's last word. It is appended rather than dropped: stop() joins
+                // this worker before draining, so on the normal path the append lands first, and on
+                // the timed-out path append itself rejects it once the buffer has been drained.
                 var sumOfSquares = 0.0
                 val reachedLimit = capture.append(chunk, read) { sample ->
                     sumOfSquares += (sample * sample).toDouble()
@@ -312,9 +312,17 @@ class AudioRecorder internal constructor(
             }
         }
 
+        /**
+         * Adds a chunk, unless this capture's buffer has already been handed over or wiped.
+         *
+         * The gate is "drained", not "stop requested", and it is read under [samplesLock] with the
+         * drain itself: audio must never land in a buffer whose owner has already been told it is
+         * empty (a canceled dictation's privacy guarantee, and a timed-out stop's correctness one),
+         * but audio read *before* that handover belongs in the transcript.
+         */
         fun append(chunk: ShortArray, count: Int, observe: (Float) -> Unit): Boolean =
             synchronized(samplesLock) {
-                if (stopRequested.get()) return@synchronized false
+                if (drained.get()) return@synchronized false
                 if (sampleCount + count > maxSamples) return@synchronized true
                 ensureCapacity(sampleCount + count)
                 for (index in 0 until count) {

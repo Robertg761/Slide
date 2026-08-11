@@ -176,6 +176,28 @@ class TypingSuggesterTest {
         }
     }
 
+    /**
+     * A penalty charged after a top-k has been truncated is not a penalty, it is a formality.
+     *
+     * The wordlist rates names by how often they appear in text, so a four-slot completion board
+     * for "acc" fills with ACCA, ACCC and Accra, and one for "lyc" with LHC — all of which the
+     * proper-noun penalty then pushes below ordinary words the board had already discarded. The
+     * completions that would have won have to be scored before the board decides, exactly as
+     * corrections are.
+     */
+    @Test
+    fun `a penalised name does not evict the completion that outranks it`() {
+        assertTrue("expected 'accept' among ${words("acc")}", "accept" in words("acc"))
+        assertTrue("expected 'lychee' among ${words("lyc")}", "lychee" in words("lyc"))
+    }
+
+    /** The penalty is conditional, and reaching for shift is what says a name was meant. */
+    @Test
+    fun `a typed capital brings the names back`() {
+        val marked = suggester.suggest("Holm", keys).words.map { it.word }
+        assertTrue("expected 'Holmes' among $marked", "Holmes" in marked)
+    }
+
     @Test
     fun `keeps the dictionary's own capitalisation`() {
         val suggestions = suggest("septembe").words.map { it.word }

@@ -8,11 +8,13 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.OutputStreamWriter
+import java.nio.channels.FileChannel
 import java.nio.charset.StandardCharsets
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
+import java.nio.file.StandardOpenOption
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -247,6 +249,10 @@ class UserDictionaryStore(
                 // rename. Replacement is still collision-safe on unusual filesystems that do not.
                 Files.move(temporary.toPath(), target.toPath(), REPLACE_EXISTING)
             }
+            // The bytes were synced above, but the rename that made them the dictionary lives in
+            // the directory, and that is a separate write. Without this a power cut can leave the
+            // old file — or no file — behind data we have already told the caller is saved.
+            syncDirectory(target.absoluteFile.parentFile)
             return true
         } catch (e: IOException) {
             Log.w(TAG, "Could not save ${target.name}", e)
@@ -270,6 +276,10 @@ class UserDictionaryStore(
             }
             stream.fd.sync()
         }
+        // The marker's own contents are durable now, but the directory entry that makes it exist
+        // is not, and everything after this point deletes personal data on the strength of it. A
+        // power cut between the two is exactly how a cleared dictionary comes back on reboot.
+        syncDirectory(deletionMarker.absoluteFile.parentFile)
         true
     } catch (e: IOException) {
         Log.w(TAG, "Could not persist learned-data deletion marker", e)
@@ -277,6 +287,27 @@ class UserDictionaryStore(
     } catch (e: SecurityException) {
         Log.w(TAG, "Could not persist learned-data deletion marker", e)
         false
+    }
+
+    /**
+     * Flushes a directory's own entries, so a rename or a creation survives losing power.
+     *
+     * Opening a directory read-only and forcing the channel is the portable spelling of `fsync(2)`
+     * on a directory; filesystems that will not have it just say so, and a best-effort sync is
+     * still strictly better than the plain rename this replaces. (Android's own `AtomicFile` skips
+     * this step entirely, which is why it is spelled out here rather than borrowed.)
+     */
+    private fun syncDirectory(directory: File?) {
+        if (directory == null) return
+        try {
+            FileChannel.open(directory.toPath(), StandardOpenOption.READ).use { it.force(true) }
+        } catch (e: IOException) {
+            Log.d(TAG, "Could not sync ${directory.name}; the rename may not be durable yet", e)
+        } catch (e: SecurityException) {
+            Log.d(TAG, "Could not sync ${directory.name}; the rename may not be durable yet", e)
+        } catch (e: UnsupportedOperationException) {
+            Log.d(TAG, "Could not sync ${directory.name}; the rename may not be durable yet", e)
+        }
     }
 
     /** Any uncertainty about the marker is treated as pending, which is the privacy-safe side. */

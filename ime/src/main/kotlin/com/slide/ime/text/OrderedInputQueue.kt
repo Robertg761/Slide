@@ -13,6 +13,43 @@ internal data class OrderedInputRequest(
 )
 
 /**
+ * Bounded evidence that a queued edit still belongs to the text it was accepted for.
+ *
+ * The editor generation catches the field being swapped, but an app can empty or rewrite the same
+ * field underneath a queued keystroke without any transition at all — a send button clearing the
+ * box while a swipe is still decoding. Applying the key anyway drops the letter into whatever
+ * replaced it. This is deliberately cheap: a short run of text behind the cursor and the position
+ * already cached, never an extraction of the whole field, because it is checked on the path that
+ * runs for every key released during a decode.
+ *
+ * Each link in the chain re-captures this after its own edit, so the keyboard's own mutations
+ * always agree and only a change from elsewhere is a mismatch.
+ */
+internal data class OrderedInputGuard(
+    val selection: EditorSelection?,
+    val textBeforeCursor: String?,
+) {
+    /**
+     * Whether the editor still looks like the one this was captured from.
+     *
+     * Evidence missing on either side is not a mismatch. An editor that will not answer a question
+     * has not thereby said the answer changed, and silently swallowing keys the user has already
+     * pressed is the worse failure of the two.
+     */
+    fun stillApplies(now: OrderedInputGuard): Boolean {
+        if (selection != null && now.selection != null && selection != now.selection) return false
+        if (
+            textBeforeCursor != null &&
+            now.textBeforeCursor != null &&
+            textBeforeCursor != now.textBeforeCursor
+        ) {
+            return false
+        }
+        return true
+    }
+}
+
+/**
  * Serializes completed swipes and the edits that immediately follow them.
  *
  * Touch feedback remains synchronous, while committed editor mutations wait for earlier final

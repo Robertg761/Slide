@@ -387,6 +387,12 @@ class GestureDecoder(
         }
 
         fun offer(wordIndex: Int, score: Float) {
+            // A word with no scorable geometry (fewer than two distinct key corners: "mm", "tt")
+            // scores negative infinity, and a comparison against the worst entry cannot reject it
+            // while the board still has room. "Worse than everything" has to mean "not a candidate"
+            // rather than "last resort", because the classic decoder is what the user sees until
+            // the neural model has loaded, and forever if it never does.
+            if (!score.isFinite()) return
             if (size == capacity && score <= scores[size - 1]) return
 
             var slot = minOf(size, capacity - 1)

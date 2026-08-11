@@ -195,6 +195,10 @@ class SuggestionStripView(context: Context) : View(context) {
     fun setSuggestions(candidates: List<String>) {
         val requested = candidates.take(MAX_VISIBLE)
         if (words.size == requested.size && words.indices.all { words[it] == requested[it] }) return
+        // A pending hold captured a slot, not a word, and re-reads the list when it fires. Left
+        // armed across a swap — the decoder finishing mid-hold — it would teach or forget whatever
+        // word has since landed in that slot.
+        cancelPendingLongPress()
         words.clear()
         requested.forEach(words::add)
         pressedIndex = -1

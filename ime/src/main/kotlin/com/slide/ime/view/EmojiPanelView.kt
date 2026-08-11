@@ -164,6 +164,15 @@ class EmojiPanelView(context: Context) : View(context) {
     private var downY = 0f
 
     /**
+     * The finger the grid is following.
+     *
+     * Pointer index 0 is not stable: when the first finger lifts, the second one shifts into its
+     * place, so reading index 0 made a motionless second finger inherit the first one's press and
+     * jump the scroll by the distance between them.
+     */
+    private var activePointerId: Int? = null
+
+    /**
      * Repeats the footer's backspace while it is held, accelerating as it goes.
      *
      * Without it, clearing a line of emoji is one tap per character, and emoji are exactly the
@@ -458,6 +467,7 @@ class EmojiPanelView(context: Context) : View(context) {
         if (entry < 0 || tone !in EmojiData.TONE_DEFAULT until EmojiData.TONE_COUNT) return false
         popupIndex = -1
         popupPosition = -1
+        popupTone = EmojiData.TONE_DEFAULT
         listener?.onSkinTonePicked(tone)
         listener?.onEmojiPicked(catalogue.toned(entry, tone))
         accessibilityHelper.invalidateRoot()
@@ -770,7 +780,10 @@ class EmojiPanelView(context: Context) : View(context) {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> onDown(event)
             MotionEvent.ACTION_MOVE -> onMove(event)
-            MotionEvent.ACTION_UP -> onUp(event)
+            // A second finger is not a second press: the panel keeps following the first one.
+            MotionEvent.ACTION_POINTER_DOWN -> Unit
+            MotionEvent.ACTION_POINTER_UP -> onPointerLift(event)
+            MotionEvent.ACTION_UP -> onUp()
             MotionEvent.ACTION_CANCEL -> cancelTouch()
         }
         return true
@@ -778,6 +791,7 @@ class EmojiPanelView(context: Context) : View(context) {
 
     private fun onDown(event: MotionEvent) {
         scroller.forceFinished(true)
+        activePointerId = event.getPointerId(0)
         downY = event.y
         scrolling = false
         velocityTracker = VelocityTracker.obtain().apply { addMovement(event) }
@@ -809,8 +823,13 @@ class EmojiPanelView(context: Context) : View(context) {
     private fun onMove(event: MotionEvent) {
         velocityTracker?.addMovement(event)
 
+        val index = activePointerId?.let(event::findPointerIndex) ?: return
+        if (index < 0) return
+        val x = event.getX(index)
+        val y = event.getY(index)
+
         if (popupIndex >= 0) {
-            val tone = toneAt(event.x)
+            val tone = toneAt(x)
             if (tone != popupTone) {
                 popupTone = tone
                 invalidate()
@@ -818,7 +837,7 @@ class EmojiPanelView(context: Context) : View(context) {
             return
         }
 
-        if (!scrolling && abs(event.y - downY) > touchSlop && pressedTab < 0 &&
+        if (!scrolling && abs(y - downY) > touchSlop && pressedTab < 0 &&
             !pressedBack && !pressedBackspace
         ) {
             scrolling = true
@@ -829,36 +848,64 @@ class EmojiPanelView(context: Context) : View(context) {
         if (scrolling) {
             // Clamped rather than over-scrolled: a rubber-band would fight the app's own scroll
             // gesture in a list that the keyboard is sitting on top of.
-            scrollY = (scrollY - (event.y - downY)).coerceIn(0f, maxScroll())
-            downY = event.y
+            scrollY = (scrollY - (y - downY)).coerceIn(0f, maxScroll())
+            downY = y
             accessibilityHelper.invalidateRoot()
             invalidate()
             return
         }
 
         // Sliding off a button cancels it, as everywhere else on the keyboard.
-        val inFooter = event.y >= height - footerHeight()
-        if (pressedBackspace && (!inFooter || event.x < width - backButtonWidth())) {
+        val inFooter = y >= height - footerHeight()
+        if (pressedBackspace && (!inFooter || x < width - backButtonWidth())) {
             removeCallbacks(backspaceRepeat)
             pressedBackspace = false
             invalidate()
         }
-        if (pressedBack && (!inFooter || event.x >= backButtonWidth())) {
+        if (pressedBack && (!inFooter || x >= backButtonWidth())) {
             pressedBack = false
             invalidate()
         }
-        if (pressedTab >= 0 && tabAt(event.x) != pressedTab) {
+        if (pressedTab >= 0 && tabAt(x) != pressedTab) {
             pressedTab = -1
             invalidate()
         }
-        if (pressedIndex >= 0 && positionAt(event.x, event.y) != pressedIndex) {
+        if (pressedIndex >= 0 && positionAt(x, y) != pressedIndex) {
             removeCallbacks(longPress)
             pressedIndex = -1
             invalidate()
         }
     }
 
-    private fun onUp(event: MotionEvent) {
+    /**
+     * The tracked finger lifted while another is still down.
+     *
+     * The press it made belongs to it, so it is resolved here rather than left for the surviving
+     * finger's own lift to complete. A scroll simply continues, rebased on the finger that is
+     * still down; anything else starts from a clean slate under it.
+     */
+    private fun onPointerLift(event: MotionEvent) {
+        val tracked = activePointerId ?: return
+        if (event.getPointerId(event.actionIndex) != tracked) return
+
+        val successor = EmojiGridPointer.successorIndex(event.pointerCount, event.actionIndex)
+        if (successor == null) {
+            onUp()
+            return
+        }
+
+        if (!scrolling) resolveTouch()
+        activePointerId = event.getPointerId(successor)
+        downY = event.getY(successor)
+    }
+
+    private fun onUp() {
+        resolveTouch()
+        releaseTracker()
+        activePointerId = null
+    }
+
+    private fun resolveTouch() {
         removeCallbacks(longPress)
 
         if (popupIndex >= 0) {
@@ -875,13 +922,12 @@ class EmojiPanelView(context: Context) : View(context) {
                 listener?.onSkinTonePicked(tone)
                 listener?.onEmojiPicked(catalogue.toned(entry, tone))
             }
-            releaseTracker()
+            accessibilityHelper.invalidateRoot()
             return
         }
 
         if (scrolling) {
             fling()
-            releaseTracker()
             scrolling = false
             return
         }
@@ -890,7 +936,7 @@ class EmojiPanelView(context: Context) : View(context) {
         val back = pressedBack
         val backspace = pressedBackspace
         val position = pressedIndex
-        cancelTouch()
+        clearPressState()
 
         when {
             tab == searchTab() -> {
@@ -924,7 +970,9 @@ class EmojiPanelView(context: Context) : View(context) {
     private fun fling() {
         val tracker = velocityTracker ?: return
         tracker.computeCurrentVelocity(1000, maxFlingVelocity)
-        val velocity = -tracker.yVelocity
+        // Per-pointer velocity: the tracker follows every finger on the panel, and the no-argument
+        // reading is not necessarily the one that was doing the scrolling.
+        val velocity = -(activePointerId?.let(tracker::getYVelocity) ?: tracker.yVelocity)
         if (abs(velocity) < dp(MIN_FLING_DP_PER_S)) return
 
         scroller.fling(
@@ -944,13 +992,29 @@ class EmojiPanelView(context: Context) : View(context) {
     }
 
     private fun cancelTouch() {
+        clearPressState()
+        // A cancelled stream leaves no finger to close the tone row, and reset() clears exactly
+        // these three. Left open, a stale popupIndex turned the next unrelated tap — a tab, the
+        // ABC key — into an insertion of the popup's emoji, and a tap inside the stale popup rect
+        // into a silent change of the default skin tone.
+        val hadPopup = popupIndex >= 0
+        popupIndex = -1
+        popupPosition = -1
+        popupTone = EmojiData.TONE_DEFAULT
+        if (hadPopup) accessibilityHelper.invalidateRoot()
+        scrolling = false
+        releaseTracker()
+        activePointerId = null
+    }
+
+    /** Drops every in-flight press without touching the tone popup or the pointer bookkeeping. */
+    private fun clearPressState() {
         removeCallbacks(longPress)
         removeCallbacks(backspaceRepeat)
         pressedIndex = -1
         pressedTab = -1
         pressedBack = false
         pressedBackspace = false
-        releaseTracker()
         invalidate()
     }
 
@@ -1103,5 +1167,28 @@ class EmojiPanelView(context: Context) : View(context) {
             "Symbols" to "❤️",
             "Flags" to "🏁",
         )
+    }
+}
+
+/**
+ * Which finger the emoji grid follows across a multi-touch stream.
+ *
+ * Pulled out of the View because the rule is index arithmetic, not drawing: `actionIndex` is only
+ * meaningful on a pointer down or up, and the surviving indices renumber as soon as one lifts.
+ */
+internal object EmojiGridPointer {
+
+    /**
+     * Index of a pointer that is still down after the one at [liftedIndex] leaves, or null when
+     * that was the last one.
+     *
+     * [pointerCount] is the count reported by the ACTION_POINTER_UP event, which still includes
+     * the lifting pointer.
+     */
+    fun successorIndex(pointerCount: Int, liftedIndex: Int): Int? {
+        for (index in 0 until pointerCount) {
+            if (index != liftedIndex) return index
+        }
+        return null
     }
 }

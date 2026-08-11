@@ -99,6 +99,14 @@ class VoiceOverlayView(context: Context) : View(context) {
     private var pressedCancel = false
     private var pressStartedOnCancel = false
 
+    /**
+     * The finger that started the press, and the only one whose lift ends the dictation.
+     *
+     * Ending dictation is destructive either way — commit or discard — so a second contact
+     * (the hand steadying the phone, a palm) must not be able to do it.
+     */
+    private var pressPointerId: Int? = null
+
     private val accessibilityHelper = object : ExploreByTouchHelper(this) {
         override fun getVirtualViewAt(x: Float, y: Float): Int =
             if (isInCancel(x, y)) A11Y_CANCEL else A11Y_MAIN
@@ -332,6 +340,7 @@ class VoiceOverlayView(context: Context) : View(context) {
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                pressPointerId = event.getPointerId(0)
                 pressedCancel = isInCancel(event.x, event.y)
                 pressStartedOnCancel = pressedCancel
                 invalidate()
@@ -339,26 +348,42 @@ class VoiceOverlayView(context: Context) : View(context) {
             }
 
             MotionEvent.ACTION_MOVE -> {
-                if (pressedCancel && !isInCancel(event.x, event.y)) {
+                val index = pressPointerId?.let(event::findPointerIndex) ?: return true
+                if (index < 0) return true
+                if (pressedCancel && !isInCancel(event.getX(index), event.getY(index))) {
                     pressedCancel = false
                     invalidate()
                 }
                 return true
             }
 
-            MotionEvent.ACTION_CANCEL -> {
-                pressedCancel = false
-                pressStartedOnCancel = false
-                invalidate()
+            // Extra fingers are not a second decision, and the deciding finger leaving while
+            // another is still down is not a tap: both just clear the press.
+            MotionEvent.ACTION_POINTER_DOWN -> return true
+
+            MotionEvent.ACTION_POINTER_UP -> {
+                if (event.getPointerId(event.actionIndex) == pressPointerId) clearPress()
                 return true
             }
+
+            MotionEvent.ACTION_CANCEL -> {
+                clearPress()
+                return true
+            }
+
+            MotionEvent.ACTION_UP -> Unit
+
+            else -> return true
         }
 
-        val cancelled = pressStartedOnCancel && pressedCancel && isInCancel(event.x, event.y)
-        val mainActivated = !pressStartedOnCancel
-        pressedCancel = false
-        pressStartedOnCancel = false
-        invalidate()
+        val index = event.actionIndex
+        // Null once the deciding finger has already left through ACTION_POINTER_UP: whatever is
+        // lifting now is a bystander, and a bystander does not finish the dictation.
+        val owned = pressPointerId != null && event.getPointerId(index) == pressPointerId
+        val cancelled = owned && pressStartedOnCancel && pressedCancel &&
+            isInCancel(event.getX(index), event.getY(index))
+        val mainActivated = owned && !pressStartedOnCancel
+        clearPress()
 
         // Tapping anywhere else finishes the dictation. While transcribing there is nothing to
         // finish, so only Cancel does anything.
@@ -373,6 +398,13 @@ class VoiceOverlayView(context: Context) : View(context) {
             listener?.onVoiceDismissed(committed = false)
         }
         return true
+    }
+
+    private fun clearPress() {
+        pressPointerId = null
+        pressedCancel = false
+        pressStartedOnCancel = false
+        invalidate()
     }
 
     private fun isInCancel(x: Float, y: Float): Boolean =

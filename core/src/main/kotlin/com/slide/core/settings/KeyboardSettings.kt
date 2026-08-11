@@ -1,10 +1,13 @@
 package com.slide.core.settings
 
 import android.content.Context
+import android.util.Log
 import androidx.datastore.core.DataStore
+import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
@@ -18,13 +21,15 @@ import java.io.IOException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.retryWhen
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -67,6 +72,13 @@ data class KeyboardSettings(
      * The IME observes this value so it can also discard its live in-memory copies. It is an epoch
      * rather than a Boolean because every clear action must be observable, including consecutive
      * requests.
+     *
+     * Two rules go with it, and both exist because the number outlives the process that reads it:
+     * - A **negative** value is [LEARNED_DATA_EPOCH_UNKNOWN] — no epoch was read at all. It is
+     *   never a clear request and never a baseline to compare later values against.
+     * - A non-negative value is authoritative even when it is *lower* than the last one seen. A
+     *   corruption reset (see the store's `ReplaceFileCorruptionHandler`) legitimately puts the
+     *   epoch back to zero, so a decrease means "start counting again from here", not "clear".
      */
     val learnedDataClearEpoch: Long = 0L,
     /**
@@ -98,9 +110,45 @@ data class KeyboardSettings(
     /** Autocorrection can only operate while the suggestion pipeline and strip are enabled. */
     val isAutocorrectionActive: Boolean
         get() = suggestionsEnabled && autocorrectEnabled
+
+    companion object {
+        /**
+         * [learnedDataClearEpoch] for settings that stand in for a read that never happened.
+         *
+         * A stored epoch is a plain counter, so any real number the fallback could carry is a
+         * number the IME might later see rise past — and a rise is how the user asks for their
+         * learned words to be thrown away. There is no safe non-negative value to invent, so the
+         * fallback carries one that cannot be mistaken for an answer: consumers must neither
+         * clear on it nor take it as the baseline for the real value that follows.
+         */
+        const val LEARNED_DATA_EPOCH_UNKNOWN = -1L
+    }
 }
 
-private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "slide_settings")
+/**
+ * A file damaged by a power cut is replaced with an empty one rather than thrown from for ever.
+ *
+ * Without this, one truncated write makes every later read fail, and the keyboard is left crashing
+ * or running on fallbacks at every start with no way back. Losing preferences is recoverable: the
+ * user sets them again.
+ *
+ * It also costs no learned data, and that is the half worth spelling out, because a reset puts
+ * [KeyboardSettings.learnedDataClearEpoch] back to zero underneath a running IME whose baseline is
+ * some larger N. The contract consumers implement is therefore:
+ * - a **rise** in an authoritative (non-negative) epoch is a clear request;
+ * - a **fall** in an authoritative epoch is a corruption reset, and becomes the new baseline
+ *   without clearing anything — otherwise the user's next clear, writing 0 to 1, would count as
+ *   no change against the old baseline and be ignored by the session it was meant for;
+ * - a **negative** epoch is [KeyboardSettings.LEARNED_DATA_EPOCH_UNKNOWN], which only the
+ *   never-read fallback below produces, and is neither of those things.
+ */
+private fun preferencesCorruptionHandler() =
+    ReplaceFileCorruptionHandler<Preferences> { emptyPreferences() }
+
+private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(
+    name = "slide_settings",
+    corruptionHandler = preferencesCorruptionHandler(),
+)
 
 /** One DataStore per file per process, rooted where Android backup cannot see it. */
 private object NoBackupRecentEmojiStore {
@@ -111,6 +159,7 @@ private object NoBackupRecentEmojiStore {
         val file = File(context.noBackupFilesDir, "datastore/recent_emoji.preferences_pb")
         return stores.getOrPut(file.absolutePath) {
             PreferenceDataStoreFactory.create(
+                corruptionHandler = preferencesCorruptionHandler(),
                 scope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
                 produceFile = {
                     val directory = checkNotNull(file.parentFile)
@@ -124,11 +173,76 @@ private object NoBackupRecentEmojiStore {
     }
 }
 
+/**
+ * Keeps a preference consumer alive, and correct, across read failures.
+ *
+ * Three things matter here, and the obvious `catch { emit(defaults) }` gets all three wrong. A
+ * failure must not **complete** the flow, because a keyboard that stops hearing about setting
+ * changes until the service is recreated looks broken. It must not **substitute defaults for
+ * settings that were read successfully a moment ago**, because that silently reverts the user's
+ * theme, haptics and privacy choices — and rewinds the learned-data clear epoch, which downstream
+ * reads as a request. And it must **try again**, because the usual cause is a transient one.
+ *
+ * So: the last value that was actually read stays the current value, the upstream is resubscribed
+ * with a backoff, and [fallback] is used only when nothing has ever been read — where there is no
+ * user state to lose and a first value is what makes the keyboard usable at all.
+ *
+ * Only [IOException] is handled; anything else is a bug rather than a bad file, and is rethrown.
+ */
+internal fun <T> Flow<T>.survivingReadFailures(
+    fallback: () -> T,
+    onFailure: (Throwable) -> Unit,
+    retryDelayMillis: (attempt: Long) -> Long = ::preferenceRetryDelayMillis,
+): Flow<T> = flow {
+    var lastKnown: T? = null
+    var everRead = false
+    // Counted here rather than taken from `retryWhen`, whose own attempt number only ever grows:
+    // one bad afternoon early on would otherwise leave every hiccup for the rest of the session
+    // waiting the full ceiling. A backoff is for a file that is not coming back, and a successful
+    // read is the evidence that this one did.
+    var consecutiveFailures = 0L
+    emitAll(
+        this@survivingReadFailures
+            .onEach { value ->
+                lastKnown = value
+                everRead = true
+                consecutiveFailures = 0L
+            }
+            .retryWhen { cause, _ ->
+                if (cause !is IOException) return@retryWhen false
+                onFailure(cause)
+                if (!everRead) {
+                    lastKnown = fallback()
+                    everRead = true
+                }
+                // Emitting the current value is what makes a first-read fallback visible; on any
+                // later failure it is the value the consumer already holds, and the deduplication
+                // below drops it rather than waking the keyboard for nothing.
+                @Suppress("UNCHECKED_CAST")
+                emit(lastKnown as T)
+                delay(retryDelayMillis(consecutiveFailures++))
+                true
+            },
+    )
+}.distinctUntilChanged()
+
+/** Quick enough for a busy-file hiccup, quiet enough not to spin on a file that is truly gone. */
+internal fun preferenceRetryDelayMillis(attempt: Long): Long {
+    val doublings = attempt.coerceIn(0L, MAX_RETRY_DOUBLINGS).toInt()
+    return RETRY_BASE_MILLIS shl doublings
+}
+
+private const val RETRY_BASE_MILLIS = 250L
+private const val MAX_RETRY_DOUBLINGS = 7L // 250 ms up to 32 s.
+
 /** Reads and writes [KeyboardSettings]. Held by the IME and the settings UI alike. */
 class SettingsRepository(private val context: Context) {
 
     private val recentEmojiStore = NoBackupRecentEmojiStore.get(context.applicationContext)
     private val recentEmojiMigration = Mutex()
+
+    @Volatile
+    private var recentEmojiMigrated = false
 
     /**
      * Deduplicated because recently-used emoji share this store, and they change on every tap.
@@ -138,13 +252,22 @@ class SettingsRepository(private val context: Context) {
     val settings: Flow<KeyboardSettings> =
         context.dataStore.data
             .map { it.toSettings() }
-            .catch { error ->
-                if (error !is IOException) throw error
-                // Keep the keyboard usable after a transient preferences read failure, but never
-                // learn while a persisted privacy choice is unavailable.
-                emit(KeyboardSettings(incognitoModeEnabled = true))
-            }
-            .distinctUntilChanged()
+            .survivingReadFailures(
+                // Only reached when no setting has ever been read, so nothing of the user's is
+                // being overwritten. Learning stays off until a real value arrives, because a
+                // persisted privacy choice that cannot be read has to be assumed restrictive —
+                // and the clear epoch is the sentinel rather than 0, so that the real epoch
+                // arriving on a successful retry is not mistaken for the user asking for a clear.
+                fallback = {
+                    KeyboardSettings(
+                        incognitoModeEnabled = true,
+                        learnedDataClearEpoch = KeyboardSettings.LEARNED_DATA_EPOCH_UNKNOWN,
+                    )
+                },
+                onFailure = { error ->
+                    Log.w(TAG, "Could not read the settings; keeping the last known ones", error)
+                },
+            )
 
     /**
      * Emoji the user picked recently, most recent first.
@@ -153,21 +276,21 @@ class SettingsRepository(private val context: Context) {
      * nothing in the settings UI shows it, and it changes far more often than anything that does.
      */
     val recentEmoji: Flow<List<String>> = flow {
+        // Inside the builder, and so inside the failure handling below: the migration reads the
+        // shared settings file, and an unreadable one used to escape as far as the IME's scope,
+        // where nothing catches it and the process dies.
         migrateLegacyRecentEmoji()
         emitAll(
-            recentEmojiStore.data
-                .map {
-                    it[Keys.RECENT_EMOJI].orEmpty()
-                        .split(RECENT_SEPARATOR)
-                        .filter(String::isNotEmpty)
-                }
-                .catch { error ->
-                    if (error !is IOException) throw error
-                    emit(emptyList())
-                }
-                .distinctUntilChanged(),
+            recentEmojiStore.data.map {
+                it[Keys.RECENT_EMOJI].orEmpty()
+                    .split(RECENT_SEPARATOR)
+                    .filter(String::isNotEmpty)
+            },
         )
-    }
+    }.survivingReadFailures(
+        fallback = { emptyList() },
+        onFailure = { error -> Log.w(TAG, "Could not read the recently-used emoji", error) },
+    )
 
     /**
      * Moves [emoji] to the front of the recent list, trimmed to [MAX_RECENT].
@@ -177,12 +300,18 @@ class SettingsRepository(private val context: Context) {
      */
     suspend fun recordEmojiUse(emoji: String) {
         migrateLegacyRecentEmoji()
-        recentEmojiStore.edit { prefs ->
-            val current = prefs[Keys.RECENT_EMOJI].orEmpty()
-                .split(RECENT_SEPARATOR)
-                .filter { it.isNotEmpty() && it != emoji }
-            prefs[Keys.RECENT_EMOJI] =
-                (listOf(emoji) + current).take(MAX_RECENT).joinToString(RECENT_SEPARATOR)
+        try {
+            recentEmojiStore.edit { prefs ->
+                val current = prefs[Keys.RECENT_EMOJI].orEmpty()
+                    .split(RECENT_SEPARATOR)
+                    .filter { it.isNotEmpty() && it != emoji }
+                prefs[Keys.RECENT_EMOJI] =
+                    (listOf(emoji) + current).take(MAX_RECENT).joinToString(RECENT_SEPARATOR)
+            }
+        } catch (e: IOException) {
+            // Called from the IME's scope, which has no exception handler: a full disk must cost
+            // the recent-emoji row, not the keyboard.
+            Log.w(TAG, "Could not record the emoji just used", e)
         }
     }
 
@@ -192,43 +321,71 @@ class SettingsRepository(private val context: Context) {
         context.dataStore.edit { it.remove(Keys.RECENT_EMOJI) }
     }
 
-    /** Moves pre-0.2.1 emoji history out of the backed-up settings file exactly once. */
-    private suspend fun migrateLegacyRecentEmoji() = recentEmojiMigration.withLock {
-        val legacy = context.dataStore.data.first()[Keys.RECENT_EMOJI] ?: return@withLock
-        recentEmojiStore.edit { privatePrefs ->
-            if (privatePrefs[Keys.RECENT_EMOJI].isNullOrEmpty()) {
-                privatePrefs[Keys.RECENT_EMOJI] = legacy
+    /**
+     * Moves pre-0.2.1 emoji history out of the backed-up settings file exactly once.
+     *
+     * Once done it is never attempted again, and a failed attempt is not recorded as done: each
+     * half is idempotent (copy only into an empty list, then drop the legacy key), so a retry
+     * after a transient failure resumes rather than duplicating.
+     */
+    private suspend fun migrateLegacyRecentEmoji() {
+        if (recentEmojiMigrated) return
+        recentEmojiMigration.withLock {
+            if (recentEmojiMigrated) return@withLock
+            try {
+                val legacy = context.dataStore.data.first()[Keys.RECENT_EMOJI]
+                if (legacy != null) {
+                    recentEmojiStore.edit { privatePrefs ->
+                        if (privatePrefs[Keys.RECENT_EMOJI].isNullOrEmpty()) {
+                            privatePrefs[Keys.RECENT_EMOJI] = legacy
+                        }
+                    }
+                    context.dataStore.edit { it.remove(Keys.RECENT_EMOJI) }
+                }
+                recentEmojiMigrated = true
+            } catch (e: IOException) {
+                Log.w(TAG, "Could not move the legacy emoji history; will retry later", e)
             }
         }
-        context.dataStore.edit { it.remove(Keys.RECENT_EMOJI) }
     }
 
+    /**
+     * Applies [transform] and saves the result, or logs and leaves the stored settings alone.
+     *
+     * Callers are `scope.launch` blocks in the IME and the settings screen, neither of which has
+     * an exception handler, so a failed write here would take the whole process down. The setting
+     * simply does not stick, which the UI shows on its own the moment the flow re-emits.
+     */
     suspend fun update(transform: (KeyboardSettings) -> KeyboardSettings) {
-        context.dataStore.edit { prefs ->
-            val updated = transform(prefs.toSettings())
-            prefs[Keys.THEME_ID] = updated.themeId
-            prefs[Keys.FOLLOW_SYSTEM_DARK] = updated.followSystemDarkMode
-            prefs[Keys.KEY_BORDERS] = updated.showKeyBorders
-            prefs[Keys.KEY_PREVIEW] = updated.showKeyPreview
-            prefs[Keys.NUMBER_ROW] = updated.showNumberRow
-            prefs[Keys.KEY_HEIGHT] = updated.keyHeightScale
-            prefs[Keys.BOTTOM_PADDING] = updated.bottomPaddingDp
-            prefs[Keys.HAPTIC] = updated.hapticEnabled
-            prefs[Keys.HAPTIC_STRENGTH] = updated.hapticStrength
-            prefs[Keys.SOUND] = updated.soundEnabled
-            prefs[Keys.SOUND_VOLUME] = updated.soundVolume
-            prefs[Keys.GESTURE_TYPING] = updated.gestureTypingEnabled
-            prefs[Keys.SUGGESTIONS] = updated.suggestionsEnabled
-            prefs[Keys.AUTOCORRECT] = updated.autocorrectEnabled
-            prefs[Keys.INCOGNITO_MODE] = updated.incognitoModeEnabled
-            prefs[Keys.LEARNED_DATA_CLEAR_EPOCH] = updated.learnedDataClearEpoch
-            prefs[Keys.BLOCK_OFFENSIVE] = updated.blockOffensiveWords
-            prefs[Keys.VOICE_MODEL] = updated.voiceModelId
-            prefs[Keys.AUTO_CAPITALIZE] = updated.autoCapitalize
-            prefs[Keys.DOUBLE_SPACE_PERIOD] = updated.doubleSpacePeriod
-            prefs[Keys.EMOJI_SKIN_TONE] = updated.emojiSkinTone
-            prefs[Keys.UPDATE_CHECKS] = updated.updateChecksEnabled
-            prefs[Keys.INCLUDE_ALPHA_UPDATES] = updated.includeAlphaUpdates
+        try {
+            context.dataStore.edit { prefs ->
+                val updated = transform(prefs.toSettings())
+                prefs[Keys.THEME_ID] = updated.themeId
+                prefs[Keys.FOLLOW_SYSTEM_DARK] = updated.followSystemDarkMode
+                prefs[Keys.KEY_BORDERS] = updated.showKeyBorders
+                prefs[Keys.KEY_PREVIEW] = updated.showKeyPreview
+                prefs[Keys.NUMBER_ROW] = updated.showNumberRow
+                prefs[Keys.KEY_HEIGHT] = updated.keyHeightScale
+                prefs[Keys.BOTTOM_PADDING] = updated.bottomPaddingDp
+                prefs[Keys.HAPTIC] = updated.hapticEnabled
+                prefs[Keys.HAPTIC_STRENGTH] = updated.hapticStrength
+                prefs[Keys.SOUND] = updated.soundEnabled
+                prefs[Keys.SOUND_VOLUME] = updated.soundVolume
+                prefs[Keys.GESTURE_TYPING] = updated.gestureTypingEnabled
+                prefs[Keys.SUGGESTIONS] = updated.suggestionsEnabled
+                prefs[Keys.AUTOCORRECT] = updated.autocorrectEnabled
+                prefs[Keys.INCOGNITO_MODE] = updated.incognitoModeEnabled
+                prefs[Keys.LEARNED_DATA_CLEAR_EPOCH] = updated.learnedDataClearEpoch
+                prefs[Keys.BLOCK_OFFENSIVE] = updated.blockOffensiveWords
+                prefs[Keys.VOICE_MODEL] = updated.voiceModelId
+                prefs[Keys.AUTO_CAPITALIZE] = updated.autoCapitalize
+                prefs[Keys.DOUBLE_SPACE_PERIOD] = updated.doubleSpacePeriod
+                prefs[Keys.EMOJI_SKIN_TONE] = updated.emojiSkinTone
+                prefs[Keys.UPDATE_CHECKS] = updated.updateChecksEnabled
+                prefs[Keys.INCLUDE_ALPHA_UPDATES] = updated.includeAlphaUpdates
+            }
+        } catch (e: IOException) {
+            Log.w(TAG, "Could not save the changed settings", e)
         }
     }
 
@@ -299,6 +456,8 @@ class SettingsRepository(private val context: Context) {
     }
 
     private companion object {
+        const val TAG = "SlideSettings"
+
         /** Two rows on a typical phone, which is as far back as anyone scrolls for a recent. */
         const val MAX_RECENT = 32
 

@@ -30,11 +30,14 @@ object BigramLoader {
      * different lexicon.
      *
      * Null is survivable: every candidate simply scores as it did before there was a model at all,
-     * so the keyboard corrects on spelling alone rather than refusing to correct.
+     * so the keyboard corrects on spelling alone rather than refusing to correct. Catching every
+     * [Exception] rather than [IOException] alone keeps it survivable for a file that is the right
+     * length but the wrong content, which fails an index check rather than a read; there is no
+     * exception handler on the IME scope this runs in. Errors still propagate.
      */
     fun load(context: Context, lexicon: Lexicon): Bigrams? = try {
         context.assets.open(ASSET_NAME).use { read(it, lexicon) }
-    } catch (e: IOException) {
+    } catch (e: Exception) {
         Log.e(TAG, "Could not read $ASSET_NAME; corrections will not use context", e)
         null
     }
@@ -78,6 +81,16 @@ object BigramLoader {
         if (offsets[contextCount] != pairCount) {
             throw IOException("Offsets end at ${offsets[contextCount]}, expected $pairCount pairs")
         }
+        // Each context's successors are the half-open range between neighbouring offsets, and
+        // `Bigrams.score` binary-searches inside it. Offsets that go backwards stay in range and
+        // so never crash: they quietly hand one context another's successors, for ever. Checking
+        // the table once here is the only place that can tell the difference.
+        if (offsets[0] != 0) throw IOException("Offsets start at ${offsets[0]}, expected 0")
+        for (i in 1..contextCount) {
+            if (offsets[i] < offsets[i - 1]) {
+                throw IOException("Offset $i goes backwards: ${offsets[i - 1]} then ${offsets[i]}")
+            }
+        }
 
         val block = ByteArray(blockLength)
         data.readFully(block)
@@ -98,7 +111,11 @@ object BigramLoader {
                     if (shift > 28) throw IOException("Successor delta is not a valid varint")
                 }
                 previous += delta
-                if (previous >= wordCount) {
+                // Negative as well as too large: a varint may run to five bytes, and the fifth
+                // carries the sign bit, so a corrupt one decodes to a negative index that this
+                // check used to wave through. Nothing crashes here — it crashes later, in
+                // `wordAt` on the keypress that reads the suggestion.
+                if (previous < 0 || previous >= wordCount) {
                     throw IOException("Successor index $previous is outside the lexicon")
                 }
                 successors[slot] = previous

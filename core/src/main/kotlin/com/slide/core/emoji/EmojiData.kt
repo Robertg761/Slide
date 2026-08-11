@@ -99,14 +99,22 @@ class EmojiData(
         return -1
     }
 
+    /**
+     * Category ids are stored one to a byte, so they have to be read back unsigned.
+     *
+     * Kotlin's `Byte` is signed: without the mask, a catalogue with more than 128 categories turns
+     * id 130 into -126 and indexes out of the array before the picker ever draws anything.
+     */
+    private fun categoryAt(index: Int): Int = categoryOf[index].toInt() and 0xFF
+
     private fun buildCategoryIndex(): Array<IntArray> {
         val counts = IntArray(categories.size)
-        for (category in categoryOf) counts[category.toInt()]++
+        for (index in emoji.indices) counts[categoryAt(index)]++
 
         val result = Array(categories.size) { IntArray(counts[it]) }
         val cursor = IntArray(categories.size)
         for (index in emoji.indices) {
-            val category = categoryOf[index].toInt()
+            val category = categoryAt(index)
             result[category][cursor[category]++] = index
         }
         return result

@@ -2,6 +2,9 @@ package com.slide.engine.gesture
 
 import com.slide.engine.TestLexicon
 import com.slide.engine.lexicon.Lexicon
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.sin
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -97,6 +100,40 @@ class GestureDecoderTest {
     fun `returns nothing rather than guessing when the trace starts off the letters`() {
         val points = List(20) { GesturePoint(-500f, -500f + it * 10f, it * 8L) }
         assertTrue(decoder.decode(points, keys).isEmpty())
+    }
+
+    /**
+     * A word whose letters collapse to a single key centre has no path to compare against, so it
+     * scores negative infinity — which is not "the worst candidate" but "not a candidate". The
+     * board must not seat it merely because it has an empty slot, and the classic decoder is what
+     * the user sees until the neural model loads, and forever if it never does.
+     */
+    @Test
+    fun `a word with no scorable shape is never offered`() {
+        // A tight loop on one key: too long to be dismissed as a twitch, and the only word it can
+        // spell is the degenerate "mm".
+        val radius = keys.keyWidth * 0.45f
+        val loop = List(24) { i ->
+            val angle = i / 24f * 2f * PI.toFloat()
+            GesturePoint(
+                x = keys.centerX('m') + radius * cos(angle),
+                y = keys.centerY('m') + radius * sin(angle),
+                timeMs = i * 8L,
+            )
+        }
+
+        val results = decoder.decode(loop, keys)
+        // Without this the test could pass by the loop never reaching the scorer at all: it is
+        // "mm" and one other word that survive pruning here, and only "mm" is unscorable.
+        assertTrue("the loop must survive pruning for this to test anything", decoder.lastScoredCount > 0)
+        assertTrue(
+            "a single-corner word reached the strip: $results",
+            results.none { it.word.lowercase() == "mm" },
+        )
+        assertTrue(
+            "no candidate may carry a non-finite score: $results",
+            results.all { it.score.isFinite() },
+        )
     }
 
     @Test

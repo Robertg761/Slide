@@ -56,7 +56,7 @@ object PrecedingWord {
         var cursor = from
 
         fun previousWord(): String? {
-            while (cursor > 0 && !isWordCharacter(before[cursor - 1])) {
+            while (cursor > 0 && !before[cursor - 1].isLetter()) {
                 if (before[cursor - 1] in SENTENCE_ENDS) return null
                 cursor--
             }
@@ -78,8 +78,12 @@ object PrecedingWord {
      *   evidence about this one — it is a word that merely happens to be nearby.
      */
     private fun wordEndingAt(before: String, from: Int): String? {
+        // Walk back to the last *letter*, not the last word character. An apostrophe is part of a
+        // word only where a word runs into it; on its own it is an opening quote or a contraction
+        // not yet typed, and returning "'" as the preceding word hands the decoder a bogus context
+        // and learns a bigram keyed on punctuation.
         var cursor = from
-        while (cursor > 0 && !isWordCharacter(before[cursor - 1])) {
+        while (cursor > 0 && !before[cursor - 1].isLetter()) {
             if (before[cursor - 1] in SENTENCE_ENDS) return null
             cursor--
         }

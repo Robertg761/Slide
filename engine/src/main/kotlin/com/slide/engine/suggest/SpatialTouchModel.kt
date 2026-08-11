@@ -53,6 +53,15 @@ class SpatialTouchModel {
      *
      * The dynamic-programming table is tiny (words are capped at 28 characters). Only aligned
      * source/target characters have physical touches; inserted intended characters are skipped.
+     *
+     * The alignment counts transpositions (optimal string alignment), because the corrector offers
+     * them more cheaply than anything else and "gerat" → "great" is therefore a correction the user
+     * can actually accept. A plain Levenshtein alignment has no transposition to spend, so it pays
+     * for the same pair with two substitutions and hands the touch that produced `e` to `r` and the
+     * touch that produced `r` to `e` — a whole key's error, learned in the wrong direction, on
+     * exactly the input the corrector is most confident about. Transposed positions therefore learn
+     * *nothing*: the two touches are honest, but which intended letter each one belongs to is the
+     * one thing the alignment cannot say.
      */
     fun observe(
         typed: String,
@@ -72,11 +81,15 @@ class SpatialTouchModel {
         for (i in 1..source.length) {
             for (j in 1..target.length) {
                 val substitution = if (source[i - 1] == target[j - 1]) 0 else 1
-                cost[i * columns + j] = minOf(
+                var best = minOf(
                     cost[(i - 1) * columns + j] + 1,
                     cost[i * columns + j - 1] + 1,
                     cost[(i - 1) * columns + j - 1] + substitution,
                 )
+                if (isTransposition(source, target, i, j)) {
+                    best = minOf(best, cost[(i - 2) * columns + j - 2] + 1)
+                }
+                cost[i * columns + j] = best
             }
         }
 
@@ -84,6 +97,17 @@ class SpatialTouchModel {
         var i = source.length
         var j = target.length
         while (i > 0 || j > 0) {
+            // Checked before the diagonal: where a transposition is optimal it is strictly cheaper
+            // than the two substitutions that would otherwise cover the same pair, so taking it
+            // first never steals an alignment a match would have made.
+            if (
+                isTransposition(source, target, i, j) &&
+                cost[i * columns + j] == cost[(i - 2) * columns + j - 2] + 1
+            ) {
+                i -= 2
+                j -= 2
+                continue
+            }
             if (i > 0 && j > 0) {
                 val substitution = if (source[i - 1] == target[j - 1]) 0 else 1
                 if (cost[i * columns + j] == cost[(i - 1) * columns + j - 1] + substitution) {
@@ -111,6 +135,13 @@ class SpatialTouchModel {
         }
         return learned
     }
+
+    /** Whether the two characters ending at [i]/[j] are the same pair in the opposite order. */
+    private fun isTransposition(source: String, target: String, i: Int, j: Int): Boolean =
+        i > 1 && j > 1 &&
+            source[i - 1] == target[j - 2] &&
+            source[i - 2] == target[j - 1] &&
+            source[i - 1] != source[i - 2]
 
     fun entries(): List<Entry> = (0 until ALPHABET).mapNotNull { slot ->
         val count = counts[slot]
@@ -147,6 +178,14 @@ class SpatialTouchModel {
         m2Y.fill(0f)
     }
 
+    /**
+     * Folds one observation into a letter's running mean and spread.
+     *
+     * Means are clamped to the same range [restore] enforces. Saving and reloading learned data
+     * must not change how the keyboard behaves, and the snapshot the IME persists round-trips
+     * through [entries]/[restore] — so a live mean the restore path would have clipped is a mean
+     * that silently changes at the next process start.
+     */
     private fun add(letter: Char, x: Float, y: Float) {
         val slot = letter - 'a'
         if (counts[slot] >= MAX_COUNT) {
@@ -154,8 +193,8 @@ class SpatialTouchModel {
             // a lifetime of history to make it immovable.
             val oldX = meanX[slot]
             val oldY = meanY[slot]
-            meanX[slot] += (x - oldX) / MAX_COUNT
-            meanY[slot] += (y - oldY) / MAX_COUNT
+            meanX[slot] = (oldX + (x - oldX) / MAX_COUNT).coerceIn(-MAX_MEAN, MAX_MEAN)
+            meanY[slot] = (oldY + (y - oldY) / MAX_COUNT).coerceIn(-MAX_MEAN, MAX_MEAN)
             m2X[slot] = (1f - 1f / MAX_COUNT) * m2X[slot] + (x - oldX) * (x - meanX[slot])
             m2Y[slot] = (1f - 1f / MAX_COUNT) * m2Y[slot] + (y - oldY) * (y - meanY[slot])
             return
@@ -164,8 +203,8 @@ class SpatialTouchModel {
         val count = ++counts[slot]
         val deltaX = x - meanX[slot]
         val deltaY = y - meanY[slot]
-        meanX[slot] += deltaX / count
-        meanY[slot] += deltaY / count
+        meanX[slot] = (meanX[slot] + deltaX / count).coerceIn(-MAX_MEAN, MAX_MEAN)
+        meanY[slot] = (meanY[slot] + deltaY / count).coerceIn(-MAX_MEAN, MAX_MEAN)
         m2X[slot] += deltaX * (x - meanX[slot])
         m2Y[slot] += deltaY * (y - meanY[slot])
     }
