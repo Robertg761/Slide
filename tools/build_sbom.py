@@ -8,6 +8,7 @@ import csv
 import hashlib
 import json
 import re
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 
@@ -301,6 +302,15 @@ def build_bom(
     return {
         "bomFormat": "CycloneDX",
         "specVersion": "1.6",
+        "serialNumber": (
+            "urn:uuid:"
+            + str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"{app_purl}?source={source_commit}",
+                )
+            )
+        ),
         "version": 1,
         "metadata": {
             "component": {

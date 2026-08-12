@@ -34,6 +34,15 @@ class BuildSbomTest(unittest.TestCase):
             json.dumps(first, sort_keys=True, separators=(",", ":")),
             json.dumps(second, sort_keys=True, separators=(",", ":")),
         )
+        self.assertRegex(
+            first["serialNumber"],
+            r"^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-"
+            r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        )
+        changed_source = build_sbom.build_bom(
+            build_sbom.ROOT, "9.8.7", "b" * 40, build_sbom.COMPONENTS_FILE
+        )
+        self.assertNotEqual(first["serialNumber"], changed_source["serialNumber"])
         self.assertNotIn("dependencies", first)
         components = first["components"]
         names = {component["name"] for component in components}
