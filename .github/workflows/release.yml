@@ -245,6 +245,7 @@ jobs:
             engine/build/reports/androidTests/**
             engine/build/outputs/androidTest-results/**
             build/reports/instrumentation-api-*.log
+            build/reports/emulator-api-*.log
           if-no-files-found: ignore
           retention-days: 7
 

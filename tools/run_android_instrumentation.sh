@@ -19,9 +19,14 @@ API_LEVEL="$1"
 GPU_MODE="${SLIDE_EMULATOR_GPU:-lavapipe}"
 ACCEL_MODE="${SLIDE_EMULATOR_ACCEL:-on}"
 MEMORY_MB="${SLIDE_EMULATOR_MEMORY_MB:-2048}"
+DATA_PARTITION_MB="${SLIDE_EMULATOR_DATA_PARTITION_MB:-8192}"
 [[ "$GPU_MODE" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Invalid emulator GPU mode: $GPU_MODE" >&2; exit 2; }
 [[ "$ACCEL_MODE" =~ ^(on|off|auto)$ ]] || { echo "Invalid emulator acceleration mode: $ACCEL_MODE" >&2; exit 2; }
 [[ "$MEMORY_MB" =~ ^[0-9]+$ ]] || { echo "Invalid emulator memory size: $MEMORY_MB" >&2; exit 2; }
+[[ "$DATA_PARTITION_MB" =~ ^[0-9]+$ ]] || {
+    echo "Invalid emulator data partition size: $DATA_PARTITION_MB" >&2
+    exit 2
+}
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
@@ -62,6 +67,14 @@ if "$ADB" devices | awk 'NR > 1 { print $1 }' | grep -Fxq "$SERIAL"; then
     exit 1
 fi
 cleanup() {
+    local status=$?
+    if (( status != 0 )) && [[ -n "$EMULATOR_PID" ]]; then
+        mkdir -p "$ROOT/build/reports"
+        "$ADB" -s "$SERIAL" logcat -d \
+            >"$ROOT/build/reports/instrumentation-api-$API_LEVEL.log" 2>&1 || true
+        cp "$TEMP_DIR/emulator.log" \
+            "$ROOT/build/reports/emulator-api-$API_LEVEL.log" 2>/dev/null || true
+    fi
     if [[ -n "$EMULATOR_PID" ]] && kill -0 "$EMULATOR_PID" 2>/dev/null; then
         "$ADB" -s "$SERIAL" emu kill >/dev/null 2>&1 || true
     fi
@@ -104,11 +117,26 @@ printf 'no\n' | "$AVDMANAGER" create avd \
     -gpu "$GPU_MODE" \
     -accel "$ACCEL_MODE" \
     -memory "$MEMORY_MB" \
+    -partition-size "$DATA_PARTITION_MB" \
     >"$TEMP_DIR/emulator.log" 2>&1 &
 EMULATOR_PID="$!"
 
 timeout 180 "$ADB" -s "$SERIAL" wait-for-device
 verify_spawned_emulator
+luma_sampling_disabled=false
+for _ in $(seq 1 30); do
+    if "$ADB" -s "$SERIAL" shell setprop debug.sf.luma_sampling 0 >/dev/null 2>&1 \
+        && [[ "$($ADB -s "$SERIAL" shell getprop debug.sf.luma_sampling 2>/dev/null \
+            | tr -d '\r')" == "0" ]]; then
+        luma_sampling_disabled=true
+        break
+    fi
+    sleep 1
+done
+if [[ "$luma_sampling_disabled" != true ]]; then
+    echo "Could not disable headless SurfaceFlinger luma sampling." >&2
+    exit 1
+fi
 booted=false
 for _ in $(seq 1 180); do
     if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
@@ -147,6 +175,50 @@ if [[ "$settings_ready" != true ]]; then
     tail -200 "$TEMP_DIR/emulator.log" >&2
     exit 1
 fi
+
+# Android 37 Google APIs images can fill their default data partition during first boot. That can
+# abort SurfaceFlinger, restart Zygote, and leave a stale sys.boot_completed=1 while package installs
+# fail. Require consecutive healthy service and storage probes before running any app tests.
+services_stable=false
+stable_samples=0
+stable_system_server_pid=""
+for _ in $(seq 1 60); do
+    if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+        echo "Android emulator exited before system services stabilized:" >&2
+        tail -200 "$TEMP_DIR/emulator.log" >&2
+        exit 1
+    fi
+    available_kb="$($ADB -s "$SERIAL" shell df -k /data 2>/dev/null \
+        | tr -d '\r' \
+        | awk 'NR == 2 { print $4 }')"
+    system_server_pid="$($ADB -s "$SERIAL" shell pidof system_server 2>/dev/null \
+        | tr -d '\r' || true)"
+    if [[ "$available_kb" =~ ^[0-9]+$ ]] \
+        && [[ -n "$system_server_pid" ]] \
+        && [[ "$system_server_pid" == "$stable_system_server_pid" ]] \
+        && (( available_kb >= 524288 )) \
+        && "$ADB" -s "$SERIAL" shell cmd package list packages android >/dev/null 2>&1 \
+        && "$ADB" -s "$SERIAL" shell cmd activity get-config >/dev/null 2>&1 \
+        && "$ADB" -s "$SERIAL" shell cmd settings get global window_animation_scale \
+            >/dev/null 2>&1; then
+        ((stable_samples += 1))
+        if (( stable_samples >= 12 )); then
+            services_stable=true
+            break
+        fi
+    else
+        stable_samples=0
+        stable_system_server_pid="$system_server_pid"
+    fi
+    sleep 5
+done
+if [[ "$services_stable" != true ]]; then
+    echo "Android system services or /data storage did not stabilize after boot:" >&2
+    "$ADB" -s "$SERIAL" shell df -h /data >&2 || true
+    tail -200 "$TEMP_DIR/emulator.log" >&2
+    exit 1
+fi
+"$ADB" -s "$SERIAL" shell df -h /data
 
 "$ADB" -s "$SERIAL" shell settings put global window_animation_scale 0
 "$ADB" -s "$SERIAL" shell settings put global transition_animation_scale 0

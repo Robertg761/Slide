@@ -37,8 +37,11 @@
 - One Backspace immediately after a swipe now removes the complete committed word as a unit,
   including Slide's automatic leading space and the word's casing. The deletion is verified
   against the editor's actual text and also rolls back the provisional learned phrase.
-- The packaged-runtime emulator runner now defaults to Lavapipe. This avoids emulator 37.1.11's
-  SwiftShader initialization crash and restores reliable API 26 instrumentation on current hosts.
+- The packaged-runtime emulator runner now defaults to Lavapipe and an 8 GiB data partition. This
+  avoids emulator 37.1.11's SwiftShader initialization crash and Android 37's first-boot storage
+  exhaustion. Headless runs disable SurfaceFlinger's unrelated luma sampling to avoid a current
+  `mapper.ranchu` readback assertion, and the runner requires stable package, activity, and settings
+  services before tests.
 
 ### Changed
 
