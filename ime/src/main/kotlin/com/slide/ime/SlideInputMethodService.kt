@@ -1,20 +1,25 @@
 package com.slide.ime
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.inputmethodservice.InputMethodService
 import android.media.AudioManager
 import android.os.Build
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
 import android.view.HapticFeedbackConstants
+import android.view.InputDevice
+import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.ExtractedTextRequest
 import android.view.inputmethod.InputConnection
+import android.view.inputmethod.InputMethodManager
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
 import android.widget.LinearLayout
@@ -53,6 +58,7 @@ import com.slide.engine.suggest.SpatialTouchModel
 import com.slide.engine.suggest.TypingSuggester
 import com.slide.ime.text.AndroidGraphemeBoundaries
 import com.slide.ime.text.AutoSpacing
+import com.slide.ime.text.EditorComposingSettlement
 import com.slide.ime.text.EditorInputPolicy
 import com.slide.ime.text.EditorKeyboardMode
 import com.slide.ime.text.EditorSelection
@@ -66,6 +72,7 @@ import com.slide.ime.text.OrderedInputQueue
 import com.slide.ime.text.OrderedInputRequest
 import com.slide.ime.text.PrecedingWord
 import com.slide.ime.text.SelectionUpdate
+import com.slide.ime.text.SelfEditFallback
 import com.slide.ime.text.cursorAfterReplacement
 import com.slide.ime.text.isCaseableCharacter
 import com.slide.ime.text.matchTypedCase
@@ -149,6 +156,17 @@ class SlideInputMethodService :
     /** One policy shared by typing, swiping, prediction, and personalized learning. */
     private var editorInputPolicy = EditorInputPolicy.NaturalText
 
+    /** Re-evaluated for each input view because enabled IMEs can change while Slide is alive. */
+    private var imeSwitcherOffered = false
+
+    /** A permission cannot conjure microphone hardware on devices that do not have any. */
+    private val deviceHasMicrophone by lazy {
+        packageManager.hasSystemFeature(PackageManager.FEATURE_MICROPHONE)
+    }
+
+    private fun voiceAvailableForEditor(): Boolean =
+        deviceHasMicrophone && editorInputPolicy.allowsVoice
+
     /** Whether the active editor set IME_FLAG_NO_PERSONALIZED_LEARNING. */
     private var editorRequestsNoLearning = false
 
@@ -190,7 +208,10 @@ class SlideInputMethodService :
     private val learnedDataReady = CompletableDeferred<Unit>()
     private var learnedLoadStarted = false
     private val learnedPersistence = LearnedDataPersistenceState()
-    private var observedLearnedDataClearEpoch: Long? = null
+    private val learnedDataClearEpoch = LearnedDataClearEpochState(
+        UserDictionaryStore.latestDeletionRequestGeneration(),
+    )
+    private var removeLearnedDeletionListener: (() -> Unit)? = null
 
     private var emojiData: EmojiData? = null
     private var emojiRenderable: Array<IntArray>? = null
@@ -326,6 +347,13 @@ class SlideInputMethodService :
 
     override fun onCreate() {
         super.onCreate()
+        removeLearnedDeletionListener = userDictionaryStore.addDeletionRequestListener { generation ->
+            scope.launch {
+                if (learnedDataClearEpoch.observeDeletionRequest(generation)) {
+                    clearLearnedDataFromMemoryAndDisk()
+                }
+            }
+        }
         settingsRepository = SettingsRepository(applicationContext)
         settingsRepository.settings
             .onEach { updated ->
@@ -336,7 +364,6 @@ class SlideInputMethodService :
                     !editorInputPolicy.allowsPersonalizedLearning ||
                     updated.incognitoModeEnabled
 
-                val baselineClearEpoch = observedLearnedDataClearEpoch
                 val clearEpoch = updated.learnedDataClearEpoch
                 // Wiping everything this person has taught the keyboard is irreversible, so what an
                 // observed clear epoch is allowed to mean is spelled out in full. Four cases:
@@ -348,19 +375,18 @@ class SlideInputMethodService :
                 //                     baseline nor a wipe; the real value arrives when a retry
                 //                     succeeds. Treating its 0 as authoritative is what would make
                 //                     the true epoch N look like a clear a moment later.
-                //   no baseline yet   The first authoritative reading. Adopt it. There is nothing
-                //                     to compare it against, so nothing has been cleared.
+                //   no baseline yet   The first authoritative reading. Adopt it unless the durable
+                //                     deletion marker proves a clear won the startup race.
                 //   epoch < baseline  The stored file was reset — corruption replaced it with an
                 //                     empty one. Adopt the lower value rather than keeping ours: a
                 //                     stale high baseline would put the user's next Clear (0 -> 1)
                 //                     underneath it and silently ignore it for the whole session.
                 //   epoch > baseline  The only case that is a clear the user asked for. Wipe.
                 if (clearEpoch >= 0) {
-                    val userRequestedClear =
-                        baselineClearEpoch != null && clearEpoch > baselineClearEpoch
-                    // Established before either file is read, so a clear that wins startup cannot
-                    // become our baseline after stale data has already been restored into memory.
-                    observedLearnedDataClearEpoch = clearEpoch
+                    val userRequestedClear = learnedDataClearEpoch.observeEpoch(
+                        clearEpoch,
+                        UserDictionaryStore.latestDeletionRequestGeneration(),
+                    )
                     if (userRequestedClear) clearLearnedDataFromMemoryAndDisk()
                 }
                 if (!learnedLoadStarted) {
@@ -398,8 +424,7 @@ class SlideInputMethodService :
                     if (composing.isNotEmpty()) {
                         // The already-entered prefix is now committed literally. Keep the rest of
                         // this same word literal even if the setting is immediately turned back on.
-                        literalWordInProgress = true
-                        abandonComposing()
+                        if (abandonComposing().settled) literalWordInProgress = true
                     } else {
                         clearSuggestions()
                     }
@@ -528,7 +553,7 @@ class SlideInputMethodService :
         val strip = SuggestionStripView(this).apply {
             listener = this@SlideInputMethodService
             keyboardTheme = theme
-            voiceEnabled = editorInputPolicy.allowsVoice
+            voiceEnabled = voiceAvailableForEditor()
         }
         val view = KeyboardView(this).apply {
             listener = this@SlideInputMethodService
@@ -604,6 +629,7 @@ class SlideInputMethodService :
         cancelGestureInputSequence()
         expectedSelections.invalidate()
         gestureUndoState.invalidate()
+        selfEdit = false
         cancelVoiceForEditorTransition()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
     }
@@ -613,6 +639,7 @@ class SlideInputMethodService :
         cancelGestureInputSequence()
         expectedSelections.invalidate()
         gestureUndoState.invalidate()
+        selfEdit = false
         cancelVoiceForEditorTransition()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
         super.onFinishInput()
@@ -624,12 +651,14 @@ class SlideInputMethodService :
         cancelGestureInputSequence()
         expectedSelections.invalidate()
         gestureUndoState.invalidate()
+        selfEdit = false
         cancelVoiceForEditorTransition()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
         exitEmojiSearch(showPicker = false)
         layer = Layer.ALPHA
         hideEmojiPanel()
         editorInputPolicy = EditorInputPolicy.from(info.inputType)
+        imeSwitcherOffered = shouldOfferImeSwitcher()
         editorBaseLayout = layoutFor(editorInputPolicy.keyboardMode)
         passwordField = editorInputPolicy.isPassword
         editorRequestsNoLearning =
@@ -638,7 +667,12 @@ class SlideInputMethodService :
             !editorInputPolicy.allowsPersonalizedLearning ||
             settings.incognitoModeEnabled
         literalWordInProgress = false
-        abandonComposing()
+        // onStartInputView already refers to the new connection. Any retained region belongs to
+        // the editor that just ended and must never be committed into this field.
+        discardComposingForEditorTransition()
+        // The composing region belonged to the previous editor; no callback from it may classify a
+        // selection report in this newly started field.
+        selfEdit = false
         gestureKeyMapCache = null
         lastShiftTapMs = 0L
         preservedCapsLock = false
@@ -650,11 +684,11 @@ class SlideInputMethodService :
 
         keyboardView?.apply {
             shiftState = ShiftState.OFF
-            keyboardLayout = editorBaseLayout
+            keyboardLayout = layoutFor(Layer.ALPHA)
             settings = this@SlideInputMethodService.settings
             enterAction = enterActionFor(info.imeOptions)
         }
-        suggestionStrip?.voiceEnabled = editorInputPolicy.allowsVoice
+        suggestionStrip?.voiceEnabled = voiceAvailableForEditor()
         updateGestureAvailability()
         applyTheme(resolveTheme())
         // Candidates from the previous field would be nonsense here, and tapping one would try to
@@ -698,6 +732,7 @@ class SlideInputMethodService :
         cancelGestureInputSequence()
         expectedSelections.invalidate()
         gestureUndoState.invalidate()
+        selfEdit = false
         cancelVoiceForEditorTransition()
         exitEmojiSearch(showPicker = false)
         hideEmojiPanel()
@@ -724,6 +759,7 @@ class SlideInputMethodService :
         hideKeyboardSettingsPanel(restoreEditorUi = false)
         literalWordInProgress = false
         abandonComposing()
+        selfEdit = false
         cachedSelectionStart = -1
         cachedSelectionEnd = -1
     }
@@ -818,6 +854,8 @@ class SlideInputMethodService :
         expectedSelections.invalidate()
         cancelVoiceForEditorTransition()
         if (voiceClientDelegate.isInitialized()) voiceClient.unbind()
+        removeLearnedDeletionListener?.invoke()
+        removeLearnedDeletionListener = null
         val finalLearnedData = captureFinalLearnedData()
         scope.cancel()
         // Neural close shares its monitor with decode, so a native preview already in flight
@@ -867,6 +905,7 @@ class SlideInputMethodService :
 
         val connection = currentInputConnection ?: return
 
+        val selfEditWasPending = selfEdit
         if (key.type in EDITING_KEYS) selfEdit = true
 
         // Any keypress ends the swiped word: the candidates no longer describe what is in front of
@@ -892,18 +931,66 @@ class SlideInputMethodService :
             text
         }
 
-        when (key.type) {
-            KeyType.SHIFT -> handleShiftTap(pressedAtMs)
-            KeyType.DELETE -> handleDelete(connection)
-            KeyType.ENTER -> handleEnter(connection)
-            KeyType.SYMBOLS -> switchLayer(Layer.SYMBOLS)
-            KeyType.SYMBOLS_ALT -> switchLayer(Layer.SYMBOLS_ALT)
-            KeyType.ALPHA -> switchLayer(Layer.ALPHA)
-            KeyType.SPACE -> handleSpace(connection, text, pressedAtMs)
-            KeyType.MIC -> processVoiceRequested()
-            KeyType.EMOJI -> showEmojiPanel()
-            KeyType.GLOBE, KeyType.SETTINGS -> Unit
-            KeyType.CHARACTER -> handleCharacter(connection, appliedText, touchX, touchY)
+        val callbackPossible = when (key.type) {
+            KeyType.SHIFT -> {
+                handleShiftTap(pressedAtMs)
+                false
+            }
+            KeyType.DELETE -> if (editorInputPolicy.usesRawKeyEvents) {
+                handleRawKey(connection, KeyEvent.KEYCODE_DEL)
+            } else {
+                handleDelete(connection)
+            }
+            KeyType.ENTER -> if (editorInputPolicy.usesRawKeyEvents) {
+                handleRawKey(connection, KeyEvent.KEYCODE_ENTER)
+            } else {
+                handleEnter(connection)
+            }
+            KeyType.SYMBOLS -> {
+                switchLayer(Layer.SYMBOLS)
+                false
+            }
+            KeyType.SYMBOLS_ALT -> {
+                switchLayer(Layer.SYMBOLS_ALT)
+                false
+            }
+            KeyType.ALPHA -> {
+                switchLayer(Layer.ALPHA)
+                false
+            }
+            KeyType.SPACE -> if (editorInputPolicy.usesRawKeyEvents) {
+                handleRawText(connection, text)
+            } else {
+                handleSpace(connection, text, pressedAtMs)
+            }
+            KeyType.MIC -> {
+                processVoiceRequested()
+                false
+            }
+            KeyType.EMOJI -> {
+                showEmojiPanel()
+                false
+            }
+            KeyType.GLOBE -> {
+                switchToNextIme()
+                false
+            }
+            KeyType.SETTINGS -> false
+            KeyType.CHARACTER -> if (editorInputPolicy.usesRawKeyEvents) {
+                handleRawText(connection, appliedText)
+            } else {
+                handleCharacter(connection, appliedText, touchX, touchY)
+            }
+        }
+        if (key.type in EDITING_KEYS) {
+            // A rejected/no-op connection cannot produce the callback that normally clears this
+            // one-shot. Preserve an earlier edit still awaiting acknowledgement, but never arm a
+            // fresh fallback for an operation the editor declined.
+            selfEdit = SelfEditFallback.afterAttempt(
+                previouslyPending = selfEditWasPending,
+                callbackPossible = callbackPossible,
+                fallbackStillArmed = selfEdit,
+            )
         }
     }
 
@@ -984,7 +1071,14 @@ class SlideInputMethodService :
         // its cursor is the position before the word is settled. Extracting text again only to ask
         // the same question is a blocking round trip that can carry the whole field with it.
         val selectionBeforeFinish = liveSnapshot.cursor
-        val corrected = finishComposing(connection)
+        val finish = finishComposing(connection)
+        if (!finish.settled) {
+            // A swipe is a dependent edit: inserting it while the editor still owns the typed
+            // prefix can replace that prefix or put the decoded word inside its active region.
+            updateTypingSuggestions()
+            return
+        }
+        val corrected = finish.corrected
         // Reused as the position the commit starts from: settling the word is the only edit
         // between the two, and where nothing was settled the position has not moved at all.
         var selectionBeforeCommit = selectionBeforeFinish
@@ -1253,11 +1347,17 @@ class SlideInputMethodService :
     private fun processCursorMove(steps: Int) {
         gestureUndoState.invalidate()
         val connection = currentInputConnection ?: return
+        val selfEditWasPending = selfEdit
         selfEdit = true
         val start = cachedSelectionStart
         val end = cachedSelectionEnd
         if (start < 0 || end < 0) {
-            sendCursorKeyEvents(connection, steps)
+            val callbackPossible = sendCursorKeyEvents(connection, steps)
+            selfEdit = SelfEditFallback.afterAttempt(
+                selfEditWasPending,
+                callbackPossible,
+                selfEdit,
+            )
             return
         }
 
@@ -1266,7 +1366,12 @@ class SlideInputMethodService :
         } else if (steps < 0) {
             val before = connection.getTextBeforeCursor(MAX_GRAPHEME_CONTEXT_CHARS, 0)?.toString()
             if (before.isNullOrEmpty()) {
-                sendCursorKeyEvents(connection, steps)
+                val callbackPossible = sendCursorKeyEvents(connection, steps)
+                selfEdit = SelfEditFallback.afterAttempt(
+                    selfEditWasPending,
+                    callbackPossible,
+                    selfEdit,
+                )
                 return
             }
             (start - (before.length - AndroidGraphemeBoundaries.move(before, before.length, steps)))
@@ -1274,36 +1379,63 @@ class SlideInputMethodService :
         } else {
             val after = connection.getTextAfterCursor(MAX_GRAPHEME_CONTEXT_CHARS, 0)?.toString()
             if (after.isNullOrEmpty()) {
-                sendCursorKeyEvents(connection, steps)
+                val callbackPossible = sendCursorKeyEvents(connection, steps)
+                selfEdit = SelfEditFallback.afterAttempt(
+                    selfEditWasPending,
+                    callbackPossible,
+                    selfEdit,
+                )
                 return
             }
             start + AndroidGraphemeBoundaries.move(after, 0, steps)
         }
 
-        if (connection.setSelection(target, target)) {
+        val abandonment = abandonComposing(connection)
+        if (!abandonment.settled) {
+            selfEdit = SelfEditFallback.afterAttempt(
+                selfEditWasPending,
+                abandonment.callbackPossible,
+                selfEdit,
+            )
+            return
+        }
+        val selectionWillChange = start != end || target != start
+        val moved = selectionWillChange && connection.setSelection(target, target)
+        if (moved) {
             cachedSelectionStart = target
             cachedSelectionEnd = target
-        } else {
+        } else if (selectionWillChange) {
             cachedSelectionStart = -1
             cachedSelectionEnd = -1
         }
         literalWordInProgress = false
-        abandonComposing()
+        val callbackPossible = abandonment.callbackPossible || moved
         updateShiftFromCursor()
-        keyboardView?.announceForAccessibility("Cursor moved")
+        selfEdit = SelfEditFallback.afterAttempt(
+            selfEditWasPending,
+            callbackPossible,
+            selfEdit,
+        )
+        if (moved) keyboardView?.announceForAccessibility("Cursor moved")
     }
 
-    private fun sendCursorKeyEvents(connection: InputConnection, steps: Int) {
+    private fun sendCursorKeyEvents(connection: InputConnection, steps: Int): Boolean {
+        val abandonment = abandonComposing(connection)
+        if (!abandonment.settled) return abandonment.callbackPossible
+
         val direction = if (steps < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT
-        repeat(kotlin.math.abs(steps)) {
-            connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, direction))
-            connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, direction))
+        var keyAccepted = false
+        for (ignored in 0 until kotlin.math.abs(steps)) {
+            val accepted = sendSoftKeyPair(connection, direction)
+            keyAccepted = keyAccepted || accepted
+            if (!accepted) break
         }
         cachedSelectionStart = -1
         cachedSelectionEnd = -1
         literalWordInProgress = false
-        abandonComposing()
+        val callbackPossible = abandonment.callbackPossible || keyAccepted
         updateShiftFromCursor()
+        return callbackPossible
     }
 
     override fun onDeleteWordGesture() {
@@ -1314,23 +1446,54 @@ class SlideInputMethodService :
     private fun processDeleteWordGesture() {
         gestureUndoState.invalidate()
         val connection = currentInputConnection ?: return
+        val selfEditWasPending = selfEdit
         selfEdit = true
-        finishComposing(connection)
+        val finish = finishComposing(connection)
+        var callbackPossible = finish.callbackPossible
+        if (!finish.settled) {
+            selfEdit = SelfEditFallback.afterAttempt(
+                selfEditWasPending,
+                callbackPossible,
+                selfEdit,
+            )
+            return
+        }
         val selected = connection.getSelectedText(0)
         if (!selected.isNullOrEmpty()) {
-            connection.commitText("", 1)
-            literalWordInProgress = false
+            val deleted = connection.commitText("", 1)
+            callbackPossible = callbackPossible || deleted
+            if (deleted) literalWordInProgress = false
+            selfEdit = SelfEditFallback.afterAttempt(
+                selfEditWasPending,
+                callbackPossible,
+                selfEdit,
+            )
             return
         }
 
         val before = connection.getTextBeforeCursor(MAX_WORD_DELETE_CHARS, 0)?.toString().orEmpty()
-        if (before.isEmpty()) return
+        if (before.isEmpty()) {
+            selfEdit = SelfEditFallback.afterAttempt(
+                selfEditWasPending,
+                callbackPossible,
+                selfEdit,
+            )
+            return
+        }
         var start = before.length
         while (start > 0 && before[start - 1].isWhitespace()) start--
         while (start > 0 && !before[start - 1].isWhitespace()) start--
-        connection.deleteSurroundingText(before.length - start, 0)
-        literalWordInProgress = false
-        updateShiftFromCursor()
+        val deleted = connection.deleteSurroundingText(before.length - start, 0)
+        callbackPossible = callbackPossible || deleted
+        if (deleted) {
+            literalWordInProgress = false
+            updateShiftFromCursor()
+        }
+        selfEdit = SelfEditFallback.afterAttempt(
+            selfEditWasPending,
+            callbackPossible,
+            selfEdit,
+        )
     }
 
     /**
@@ -1346,9 +1509,10 @@ class SlideInputMethodService :
         /** Where the cursor already was, read once by the caller rather than extracted again. */
         knownSelectionBeforeCommit: EditorSelection?,
     ): Boolean {
+        val selfEditWasPending = selfEdit
         val selectionBeforeCommit = knownSelectionBeforeCommit ?: cachedEditorSelection()
-        val before = connection.getTextBeforeCursor(1, 0)
-        val needsSpace = !before.isNullOrEmpty() && before[0].let { it.isLetterOrDigit() || it in ".,!?;:'\")" }
+        val before = connection.getTextBeforeCursor(AUTO_SPACING_CONTEXT_CHARS, 0)
+        val needsSpace = AutoSpacing.beforeWord(before)
 
         val previousWord = precedingWordForSwipe()
         val learnablePair = if (!incognito && !previousWord.isNullOrEmpty() && word.isNotEmpty()) {
@@ -1361,6 +1525,7 @@ class SlideInputMethodService :
         val text = (if (needsSpace) " " else "") + applyShift(word, shifted)
 
         val committed = connection.commitText(text, 1)
+        var exactSelectionTracked = false
         lastGestureCommit = text.takeIf { committed }
         lastGestureShift = shifted
         if (committed) {
@@ -1370,6 +1535,7 @@ class SlideInputMethodService :
                 cachedSelectionEnd = liveSelection.end
                 if (liveSelection != selectionBeforeCommit) {
                     expectedSelections.expect(selectionBeforeCommit, liveSelection)
+                    exactSelectionTracked = true
                 }
             } else {
                 val insertionStart = minOf(cachedSelectionStart, cachedSelectionEnd)
@@ -1381,6 +1547,7 @@ class SlideInputMethodService :
                         selectionBeforeCommit,
                         EditorSelection(cachedSelectionStart, cachedSelectionEnd),
                     )
+                    exactSelectionTracked = true
                 }
             }
             learnPair(previousWord, word)
@@ -1395,10 +1562,17 @@ class SlideInputMethodService :
             lastGestureLearnedPair = null
             gestureUndoState.invalidate()
         }
+        selfEdit = SelfEditFallback.afterAttempt(
+            selfEditWasPending,
+            callbackPossible = committed,
+            fallbackStillArmed = committed && !exactSelectionTracked,
+        )
         lastAutocorrect = null
 
-        if (shifted == ShiftState.SHIFTED) setShift(ShiftState.OFF)
-        updateShiftFromCursor()
+        if (committed) {
+            if (shifted == ShiftState.SHIFTED) setShift(ShiftState.OFF)
+            updateShiftFromCursor()
+        }
         return committed
     }
 
@@ -1454,7 +1628,10 @@ class SlideInputMethodService :
 
         // Settings are an interaction mode, not a new Android task. Settle the current word and
         // close mutually exclusive panels before covering the keys in-place.
-        currentInputConnection?.let(::finishComposing)
+        if (composing.isNotEmpty()) {
+            val connection = currentInputConnection ?: return
+            if (!finishComposing(connection).settled) return
+        }
         if (voiceOverlayShown) onVoiceDismissed(committed = false)
         exitEmojiSearch(showPicker = false)
         hideEmojiPanel()
@@ -1474,7 +1651,7 @@ class SlideInputMethodService :
         if (panel.visibility != View.VISIBLE) return
         panel.visibility = View.GONE
 
-        suggestionStrip?.voiceEnabled = editorInputPolicy.allowsVoice
+        suggestionStrip?.voiceEnabled = voiceAvailableForEditor()
         clearSuggestions()
         refreshSuggestionEmptyMessage()
         updateGestureAvailability()
@@ -1561,7 +1738,10 @@ class SlideInputMethodService :
 
         val prefix = if (previous.startsWith(" ")) " " else ""
         val replacement = prefix + applyShift(word, lastGestureShift)
+        if (replacement == previous) return
 
+        val selfEditWasPending = selfEdit
+        selfEdit = true
         val selectionBefore = readEditorSelection(connection) ?: cachedEditorSelection()
         connection.beginBatchEdit()
         val transaction = try {
@@ -1574,6 +1754,7 @@ class SlideInputMethodService :
         } finally {
             connection.endBatchEdit()
         }
+        var exactSelectionTracked = false
         if (!transaction.replaced) {
             val selectionAfter = readEditorSelection(connection)
             if (selectionAfter != null) {
@@ -1581,6 +1762,7 @@ class SlideInputMethodService :
                 cachedSelectionEnd = selectionAfter.end
                 if (selectionAfter != selectionBefore) {
                     expectedSelections.expect(selectionBefore, selectionAfter)
+                    exactSelectionTracked = true
                 }
             } else if (transaction.deleted) {
                 if (transaction.restoredOriginal) {
@@ -1604,7 +1786,11 @@ class SlideInputMethodService :
                     gestureUndoState.invalidate()
                 }
             }
-            selfEdit = false
+            selfEdit = SelfEditFallback.afterAttempt(
+                previouslyPending = selfEditWasPending,
+                callbackPossible = transaction.deleted && !transaction.restoredOriginal,
+                fallbackStillArmed = selfEdit && !exactSelectionTracked,
+            )
             clearSuggestions()
             updateShiftFromCursor()
             return
@@ -1615,6 +1801,7 @@ class SlideInputMethodService :
             cachedSelectionEnd = selectionAfter.end
             if (selectionAfter != selectionBefore) {
                 expectedSelections.expect(selectionBefore, selectionAfter)
+                exactSelectionTracked = true
             }
         } else if (cachedSelectionStart == cachedSelectionEnd && cachedSelectionStart >= 0) {
             cachedSelectionStart += replacement.length - previous.length
@@ -1623,7 +1810,13 @@ class SlideInputMethodService :
                 selectionBefore,
                 EditorSelection(cachedSelectionStart, cachedSelectionEnd),
             )
+            exactSelectionTracked = true
         }
+        selfEdit = SelfEditFallback.afterAttempt(
+            previouslyPending = selfEditWasPending,
+            callbackPossible = true,
+            fallbackStillArmed = selfEdit && !exactSelectionTracked,
+        )
 
         // The first-ranked word was only a machine guess. Selecting another candidate is direct
         // evidence: remove the wrong observation and teach the chosen pair instead.
@@ -1689,8 +1882,12 @@ class SlideInputMethodService :
                 searchResults().firstOrNull()?.let { onSearchEmojiPicked(it) }
                 return
             }
+            KeyType.GLOBE -> {
+                switchToNextIme()
+                return
+            }
             KeyType.SHIFT, KeyType.SYMBOLS, KeyType.SYMBOLS_ALT, KeyType.ALPHA, KeyType.EMOJI,
-            KeyType.MIC, KeyType.GLOBE, KeyType.SETTINGS -> return
+            KeyType.MIC, KeyType.SETTINGS -> return
         }
         view.searchQuery = query.take(MAX_SEARCH_QUERY_LENGTH)
         refreshEmojiSearch()
@@ -1724,7 +1921,7 @@ class SlideInputMethodService :
         searchPreviousShift = shiftState()
         keyboardView?.apply {
             shiftState = ShiftState.OFF
-            keyboardLayout = Layouts.QwertyEn
+            keyboardLayout = Layouts.withImeSwitcher(Layouts.QwertyEn, imeSwitcherOffered)
             searchQuery = ""
             searchMode = true
             searchResults = recentEmoji.take(MAX_SEARCH_RESULTS)
@@ -1749,7 +1946,7 @@ class SlideInputMethodService :
         } else if (layer == Layer.ALPHA) {
             updateShiftFromCursor()
         }
-        suggestionStrip?.voiceEnabled = editorInputPolicy.allowsVoice
+        suggestionStrip?.voiceEnabled = voiceAvailableForEditor()
         refreshSuggestionEmptyMessage()
         if (showPicker && emojiData != null) {
             emojiPanel?.reset()
@@ -1799,7 +1996,12 @@ class SlideInputMethodService :
             announce("Voice typing is still closing")
             return
         }
-        if (!editorInputPolicy.allowsVoice || currentInputConnection == null) {
+        val connection = currentInputConnection
+        if (!voiceAvailableForEditor() || connection == null) {
+            if (!deviceHasMicrophone) {
+                announce("Voice typing is unavailable because this device has no microphone")
+                return
+            }
             announce("Voice typing is unavailable in this field")
             return
         }
@@ -1811,7 +2013,10 @@ class SlideInputMethodService :
         // Dictation replaces the whole input view, so the picker has no business staying open
         // underneath it.
         hideEmojiPanel()
-        currentInputConnection?.let(::finishComposing)
+        if (!finishComposing(connection).settled) {
+            announce("Finish the current word before starting voice typing")
+            return
+        }
         voiceOverlay?.apply {
             errorText = null
             state = VoiceInput.State.Preparing
@@ -1867,12 +2072,18 @@ class SlideInputMethodService :
         if (
             resultGeneration == null ||
             resultGeneration != editorGeneration ||
-            !editorInputPolicy.allowsVoice ||
+            !voiceAvailableForEditor() ||
             text.isBlank()
         ) return
         val connection = currentInputConnection ?: return
+        val selfEditWasPending = selfEdit
         selfEdit = true
-        commitDictation(connection, text)
+        val callbackPossible = commitDictation(connection, text)
+        selfEdit = SelfEditFallback.afterAttempt(
+            selfEditWasPending,
+            callbackPossible,
+            selfEdit,
+        )
     }
 
     override fun onVoiceError(reason: String) {
@@ -1893,15 +2104,20 @@ class SlideInputMethodService :
      * Whisper punctuates and capitalises its own output, so nothing here second-guesses it beyond
      * joining it to what is already in the field.
      */
-    private fun commitDictation(connection: InputConnection, text: String) {
-        val before = connection.getTextBeforeCursor(1, 0)
-        val needsSpace = !before.isNullOrEmpty() &&
-            before[0].let { it.isLetterOrDigit() || it in ".,!?;:'\")" }
+    private fun commitDictation(connection: InputConnection, text: String): Boolean {
+        val finish = finishComposing(connection)
+        if (!finish.settled) return finish.callbackPossible
 
-        connection.commitText(if (needsSpace) " $text" else text, 1)
+        val before = connection.getTextBeforeCursor(AUTO_SPACING_CONTEXT_CHARS, 0)
+        val needsSpace = AutoSpacing.beforeWord(before)
+
+        if (!connection.commitText(if (needsSpace) " $text" else text, 1)) {
+            return finish.callbackPossible
+        }
         lastAutocorrect = null
         literalWordInProgress = false
         updateShiftFromCursor()
+        return true
     }
 
     private fun hideVoiceOverlay() {
@@ -1939,7 +2155,10 @@ class SlideInputMethodService :
 
         // An emoji ends the word in progress the same way punctuation does, and it must settle
         // before the panel covers the keys -- otherwise the correction lands after the emoji.
-        currentInputConnection?.let(::finishComposing)
+        if (composing.isNotEmpty()) {
+            val connection = currentInputConnection ?: return
+            if (!finishComposing(connection).settled) return
+        }
         // Word candidates have nothing to say about emoji, and the panel covers the keys they
         // would apply to.
         clearSuggestions()
@@ -1974,8 +2193,35 @@ class SlideInputMethodService :
         gestureUndoState.invalidate()
         performHaptic()
         val connection = currentInputConnection ?: return
+        val selfEditWasPending = selfEdit
         selfEdit = true
-        connection.commitText(emoji, 1)
+        val finish = finishComposing(connection)
+        if (!finish.settled) {
+            selfEdit = SelfEditFallback.afterAttempt(
+                selfEditWasPending,
+                finish.callbackPossible,
+                selfEdit,
+            )
+            return
+        }
+        val committed = if (editorInputPolicy.usesRawKeyEvents) {
+            handleRawText(connection, emoji)
+        } else {
+            connection.commitText(emoji, 1)
+        }
+        if (!committed) {
+            selfEdit = SelfEditFallback.afterAttempt(
+                selfEditWasPending,
+                callbackPossible = finish.callbackPossible,
+                fallbackStillArmed = selfEdit,
+            )
+            return
+        }
+        selfEdit = SelfEditFallback.afterAttempt(
+            selfEditWasPending,
+            callbackPossible = true,
+            fallbackStillArmed = selfEdit,
+        )
         // Whatever the undo record pointed at is no longer what sits before the cursor.
         lastAutocorrect = null
         literalWordInProgress = false
@@ -1999,10 +2245,16 @@ class SlideInputMethodService :
         // Routed like every other edit the keyboard makes: ordered behind a swipe still decoding,
         // and announced, so the selection change it causes is recognized as ours rather than read
         // as the user having moved the cursor.
+        val selfEditWasPending = selfEdit
         selfEdit = true
         // Emoji are often multi-code-point ZWJ, tone, flag or keycap clusters, so this borrows the
         // key row's ICU grapheme-aware delete rather than leaving a partial glyph behind.
-        handleDelete(connection)
+        val callbackPossible = handleDelete(connection)
+        selfEdit = SelfEditFallback.afterAttempt(
+            selfEditWasPending,
+            callbackPossible,
+            selfEdit,
+        )
     }
 
     override fun onEmojiPanelClosed() {
@@ -2019,33 +2271,122 @@ class SlideInputMethodService :
 
     // region Input handling
 
+    /** Sends printable text the way TYPE_NULL editors request it: as virtual hardware events. */
+    private fun handleRawText(connection: InputConnection, text: String): Boolean {
+        if (text.isEmpty()) return false
+        val generated = runCatching {
+            KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD).getEvents(text.toCharArray())
+        }.getOrNull()
+        val sent = if (!generated.isNullOrEmpty()) {
+            var anyTextKeyAccepted = false
+            generated.forEach { event ->
+                val accepted = connection.sendKeyEvent(
+                    KeyEvent.changeFlags(event, event.flags or KeyEvent.FLAG_SOFT_KEYBOARD),
+                )
+                // ACTION_UP and modifier presses complete a virtual hardware sequence but do not
+                // insert text themselves. A connection accepting only those cannot produce the
+                // edit callback for which selfEdit is armed.
+                if (
+                    accepted &&
+                    event.action == KeyEvent.ACTION_DOWN &&
+                    !KeyEvent.isModifierKey(event.keyCode)
+                ) {
+                    anyTextKeyAccepted = true
+                }
+            }
+            anyTextKeyAccepted
+        } else {
+            // Some Unicode strings have no key-code representation. ACTION_MULTIPLE preserves the
+            // characters while still honouring TYPE_NULL's request not to use commitText().
+            connection.sendKeyEvent(
+                KeyEvent(
+                    SystemClock.uptimeMillis(),
+                    text,
+                    KeyCharacterMap.VIRTUAL_KEYBOARD,
+                    KeyEvent.FLAG_SOFT_KEYBOARD,
+                ),
+            )
+        }
+        if (sent) rawEditSucceeded()
+        return sent
+    }
+
+    /** Sends Delete/Enter with both halves of a virtual soft-keyboard press. */
+    private fun handleRawKey(connection: InputConnection, keyCode: Int): Boolean {
+        val sent = sendSoftKeyPair(connection, keyCode)
+        if (sent) rawEditSucceeded()
+        return sent
+    }
+
+    private fun sendSoftKeyPair(connection: InputConnection, keyCode: Int): Boolean {
+        val now = SystemClock.uptimeMillis()
+        val down = KeyEvent(
+            now,
+            now,
+            KeyEvent.ACTION_DOWN,
+            keyCode,
+            0,
+            0,
+            KeyCharacterMap.VIRTUAL_KEYBOARD,
+            0,
+            KeyEvent.FLAG_SOFT_KEYBOARD,
+            InputDevice.SOURCE_KEYBOARD,
+        )
+        if (!connection.sendKeyEvent(down)) return false
+        // Delete and Enter take effect on ACTION_DOWN. A connection rejecting only the matching
+        // key-up can still produce a selection callback for the accepted edit.
+        connection.sendKeyEvent(KeyEvent.changeAction(down, KeyEvent.ACTION_UP))
+        return true
+    }
+
+    private fun rawEditSucceeded() {
+        lastAutocorrect = null
+        literalWordInProgress = false
+        cachedSelectionStart = -1
+        cachedSelectionEnd = -1
+        clearSuggestions()
+        if (shiftState() == ShiftState.SHIFTED) setShift(ShiftState.OFF)
+    }
+
     private fun handleCharacter(
         connection: InputConnection,
         text: String,
         touchX: Float = Float.NaN,
         touchY: Float = Float.NaN,
-    ) {
+    ): Boolean {
+        var callbackPossible = false
         // Typing with the cursor parked in the middle of a reopened word: the region can only grow
         // at its end, so settling it first is the only way the letter lands where the user is
         // looking.
-        if (composing.isNotEmpty() && !composingAtEnd) abandonComposing()
+        if (composing.isNotEmpty() && !composingAtEnd) {
+            val abandonment = abandonComposing(connection)
+            callbackPossible = abandonment.callbackPossible || callbackPossible
+            if (!abandonment.settled) return callbackPossible
+        }
 
         if (isWordCharacter(text)) {
             // Delay automatic spacing until a word actually starts. This turns `hello,w` into
             // `hello, w`, while leaving `hello?!` and a manually entered space exactly as typed.
             // Non-language editors opt out through the same policy as correction and prediction,
             // so an address or URL is never rewritten behind the user's back.
-            val autoSpace = composing.isEmpty() &&
+            val wantsAutoSpace = composing.isEmpty() &&
                 editorInputPolicy.allowsSuggestions &&
-                AutoSpacing.beforeWord(connection.getTextBeforeCursor(1, 0)?.lastOrNull())
+                AutoSpacing.beforeWord(
+                    connection.getTextBeforeCursor(AUTO_SPACING_CONTEXT_CHARS, 0),
+                    typingAfterApostrophe = true,
+                    continuingTypedWord = true,
+                )
 
             // The space and the letter it makes room for are one edit. Reported separately they
             // produce two selection callbacks against a single one-shot [selfEdit], so the second
             // is read as the user moving the cursor: candidates cleared, the word in progress
             // abandoned, and the cursor mid-word taken as an invitation to reopen it.
-            if (autoSpace) connection.beginBatchEdit()
+            if (wantsAutoSpace) connection.beginBatchEdit()
+            var autoSpaceCommitted = false
+            var characterCommitted = false
+            var autoSpaceRolledBack = false
             try {
-                if (autoSpace) connection.commitText(" ", 1)
+                autoSpaceCommitted = wantsAutoSpace && connection.commitText(" ", 1)
 
                 // A cursor can arrive at the edge of existing text without a useful selection
                 // callback (notably on initial focus). Starting a one-character composing suffix
@@ -2062,38 +2403,71 @@ class SlideInputMethodService :
                 val keys = suggester?.let { currentGestureKeyMap() }
                 if (literalWordInProgress || suggester == null || keys == null) {
                     if (composing.isNotEmpty()) {
+                        val abandonment = abandonComposing(connection)
+                        callbackPossible = abandonment.callbackPossible || callbackPossible
+                        if (!abandonment.settled) return callbackPossible
                         literalWordInProgress = true
-                        abandonComposing()
                     }
-                    literalWordInProgress = true
-                    connection.commitText(text, 1)
-                    clearSuggestions()
+                    characterCommitted = connection.commitText(text, 1)
+                    if (characterCommitted) {
+                        literalWordInProgress = true
+                        clearSuggestions()
+                    }
                 } else {
-                    recordTouch(composing.length, touchX, touchY)
-                    composing.append(text)
-                    connection.setComposingText(composing, 1)
-                    updateTypingSuggestions(suggester, keys)
+                    val next = composing.toString() + text
+                    if (connection.setComposingText(next, 1)) {
+                        recordTouch(composing.length, touchX, touchY)
+                        composing.append(text)
+                        characterCommitted = true
+                        updateTypingSuggestions(suggester, keys)
+                    } else if (composing.isEmpty() && connection.commitText(text, 1)) {
+                        // The editor declined composing text from the outset. Continue literally
+                        // rather than tracking a region that does not exist and duplicating it on
+                        // the next character.
+                        characterCommitted = true
+                        literalWordInProgress = true
+                        clearSuggestions()
+                    }
+                }
+
+                if (!characterCommitted && autoSpaceCommitted) {
+                    // Do not leave an automatic separator behind when the character it was making
+                    // room for was rejected.
+                    autoSpaceRolledBack = connection.deleteSurroundingText(1, 0)
                 }
             } finally {
-                if (autoSpace) connection.endBatchEdit()
+                if (wantsAutoSpace) connection.endBatchEdit()
             }
+            if (!characterCommitted) {
+                return callbackPossible || (autoSpaceCommitted && !autoSpaceRolledBack)
+            }
+            callbackPossible = true
         } else {
             // Punctuation ends a word, so it settles whatever was pending first -- typing "teh,"
             // should correct exactly as "teh " does.
-            finishComposing(connection)
-            connection.commitText(text, 1)
-            literalWordInProgress = false
+            val finish = finishComposing(connection)
+            callbackPossible = finish.callbackPossible || callbackPossible
+            if (!finish.settled) return callbackPossible
+            val committed = connection.commitText(text, 1)
+            callbackPossible = callbackPossible || committed
+            if (committed) literalWordInProgress = false
         }
 
         if (shiftState() == ShiftState.SHIFTED) setShift(ShiftState.OFF)
         updateShiftFromCursor()
+        return callbackPossible
     }
 
     /** Whether a new composing region here would cover only a suffix of an existing word. */
     private fun cursorTouchesWord(connection: InputConnection): Boolean {
-        val before = connection.getTextBeforeCursor(1, 0)?.lastOrNull()
-        val after = connection.getTextAfterCursor(1, 0)?.firstOrNull()
-        return before?.let(::isWordCharacter) == true || after?.let(::isWordCharacter) == true
+        val before = connection.getTextBeforeCursor(2, 0)
+        val after = connection.getTextAfterCursor(2, 0)
+        val beforeCodePoint = before?.takeIf { it.isNotEmpty() }
+            ?.let { Character.codePointBefore(it, it.length) }
+        val afterCodePoint = after?.takeIf { it.isNotEmpty() }
+            ?.let { Character.codePointAt(it, 0) }
+        return beforeCodePoint?.let(::isWordCharacter) == true ||
+            afterCodePoint?.let(::isWordCharacter) == true
     }
 
     /**
@@ -2120,16 +2494,19 @@ class SlideInputMethodService :
         composingTouches.fill(Float.NaN)
     }
 
-    /** Letters and the apostrophe build a word; everything else ends one. */
+    /** Letters, combining marks, and common apostrophes build a word; everything else ends one. */
     private fun isWordCharacter(text: String): Boolean =
-        text.length == 1 && isWordCharacter(text[0])
+        text.codePointCount(0, text.length) == 1 && isWordCharacter(text.codePointAt(0))
 
-    private fun isWordCharacter(character: Char): Boolean =
-        character.isLetter() || character == '\''
+    private fun isWordCharacter(codePoint: Int): Boolean =
+        Character.isLetter(codePoint) ||
+            codePoint in WORD_APOSTROPHES ||
+            Character.getType(codePoint) in COMBINING_MARK_TYPES
 
-    private fun handleSpace(connection: InputConnection, text: String, pressedAtMs: Long) {
+    private fun handleSpace(connection: InputConnection, text: String, pressedAtMs: Long): Boolean {
         // Space is where a typed word is settled, and so where autocorrect actually happens.
-        finishComposing(connection)
+        val finish = finishComposing(connection)
+        if (!finish.settled) return finish.callbackPossible
 
         // The interval between the two presses, not between the two moments the keyboard got round
         // to applying them.
@@ -2137,27 +2514,50 @@ class SlideInputMethodService :
             pressedAtMs - lastSpaceCommitMs < DOUBLE_SPACE_WINDOW_MS &&
             endsWithLetterThenSpace(connection)
 
+        var separatorCommitted = false
+        var editorChanged = false
         if (isDoubleSpace) {
             // One edit, so the editor reports one selection change: the intermediate position
             // between the delete and the full stop matches no expectation and would be read as the
             // user moving the cursor.
             connection.beginBatchEdit()
+            var punctuated = false
             try {
-                connection.deleteSurroundingText(1, 0)
-                connection.commitText(". ", 1)
+                val replacement = GestureEditTransaction.replace(
+                    original = " ",
+                    replacement = ". ",
+                    deleteBeforeCursor = { connection.deleteSurroundingText(it, 0) },
+                    commit = { connection.commitText(it, 1) },
+                )
+                punctuated = replacement.replaced
+                separatorCommitted = punctuated
+                editorChanged = replacement.replaced ||
+                    (replacement.deleted && !replacement.restoredOriginal)
+                if (!separatorCommitted && (!replacement.deleted || replacement.restoredOriginal)) {
+                    // Falling back to the literal second Space is safe only if the first one is
+                    // still present. If restoration failed, another mutation would make the
+                    // damage larger.
+                    separatorCommitted = connection.commitText(text, 1)
+                    editorChanged = editorChanged || separatorCommitted
+                    if (separatorCommitted) lastSpaceCommitMs = pressedAtMs
+                }
             } finally {
                 connection.endBatchEdit()
             }
-            lastSpaceCommitMs = 0L
-            // The word before the full stop is no longer where the undo record says it is.
-            lastAutocorrect = null
+            if (punctuated) {
+                lastSpaceCommitMs = 0L
+                // The word before the full stop is no longer where the undo record says it is.
+                lastAutocorrect = null
+            }
         } else {
-            connection.commitText(text, 1)
-            lastSpaceCommitMs = pressedAtMs
+            separatorCommitted = connection.commitText(text, 1)
+            editorChanged = separatorCommitted
+            if (separatorCommitted) lastSpaceCommitMs = pressedAtMs
         }
-        literalWordInProgress = false
+        if (separatorCommitted) literalWordInProgress = false
         updateShiftFromCursor()
-        updatePredictions()
+        if (separatorCommitted) updatePredictions()
+        return finish.callbackPossible || editorChanged
     }
 
     /** True when the text is "<letter><space>", the only case where double-space should punctuate. */
@@ -2166,57 +2566,71 @@ class SlideInputMethodService :
         return before.length == 2 && before[1] == ' ' && before[0].isLetterOrDigit()
     }
 
-    private fun handleDelete(connection: InputConnection) {
-        if (deleteLastGestureCommit(connection)) return
-        if (revertAutocorrect(connection)) return
+    private fun handleDelete(connection: InputConnection): Boolean {
+        if (deleteLastGestureCommit(connection)) return true
+        val revert = revertAutocorrect(connection)
+        if (revert.consumed) return revert.callbackPossible
+
+        var callbackPossible = false
 
         // Same reasoning as typing: with the cursor inside a reopened word, shortening the region
         // would delete its last letter rather than the one before the cursor.
-        if (composing.isNotEmpty() && !composingAtEnd) abandonComposing()
+        if (composing.isNotEmpty() && !composingAtEnd) {
+            val abandonment = abandonComposing(connection)
+            callbackPossible = abandonment.callbackPossible || callbackPossible
+            if (!abandonment.settled) return callbackPossible
+        }
 
         // Mid-word, backspace shortens the composing region rather than deleting from the editor,
         // so the suggestions keep up with what is actually in front of the cursor.
         if (composing.isNotEmpty()) {
-            composing.setLength(AndroidGraphemeBoundaries.previousBoundary(composing, composing.length))
-            recordTouch(composing.length, Float.NaN, Float.NaN)
-            if (composing.isEmpty()) {
+            val nextLength = AndroidGraphemeBoundaries.previousBoundary(composing, composing.length)
+            val next = composing.substring(0, nextLength)
+            if (!connection.setComposingText(next, 1)) return callbackPossible
+            composing.setLength(nextLength)
+            recordTouch(nextLength, Float.NaN, Float.NaN)
+            if (next.isEmpty()) {
                 // The empty string has to be committed before the region is finished. On its own,
                 // finishComposingText() settles what is there rather than removing it, which would
                 // leave the letter this backspace just deleted sitting in the editor.
-                connection.setComposingText("", 1)
                 connection.finishComposingText()
                 clearSuggestions()
             } else {
-                connection.setComposingText(composing, 1)
                 updateTypingSuggestions()
             }
             literalWordInProgress = false
             updateShiftFromCursor()
-            return
+            return true
         }
 
         val selected = connection.getSelectedText(0)
         if (!selected.isNullOrEmpty()) {
-            connection.commitText("", 1)
-            val collapsed = minOf(cachedSelectionStart, cachedSelectionEnd).takeIf { it >= 0 }
-            if (collapsed != null) {
-                cachedSelectionStart = collapsed
-                cachedSelectionEnd = collapsed
+            val deleted = connection.commitText("", 1)
+            callbackPossible = callbackPossible || deleted
+            if (deleted) {
+                val collapsed = minOf(cachedSelectionStart, cachedSelectionEnd).takeIf { it >= 0 }
+                if (collapsed != null) {
+                    cachedSelectionStart = collapsed
+                    cachedSelectionEnd = collapsed
+                }
             }
         } else {
             val before = connection.getTextBeforeCursor(MAX_GRAPHEME_CONTEXT_CHARS, 0)?.toString().orEmpty()
             if (before.isNotEmpty()) {
                 val boundary = AndroidGraphemeBoundaries.previousBoundary(before, before.length)
                 val toDelete = before.length - boundary
-                connection.deleteSurroundingText(toDelete, 0)
-                if (cachedSelectionStart == cachedSelectionEnd && cachedSelectionStart >= 0) {
-                    cachedSelectionStart = (cachedSelectionStart - toDelete).coerceAtLeast(0)
-                    cachedSelectionEnd = cachedSelectionStart
+                if (connection.deleteSurroundingText(toDelete, 0)) {
+                    callbackPossible = true
+                    if (cachedSelectionStart == cachedSelectionEnd && cachedSelectionStart >= 0) {
+                        cachedSelectionStart = (cachedSelectionStart - toDelete).coerceAtLeast(0)
+                        cachedSelectionEnd = cachedSelectionStart
+                    }
                 }
             }
         }
         literalWordInProgress = cursorTouchesWord(connection)
         updateShiftFromCursor()
+        return callbackPossible
     }
 
     /** Deletes the exact text from the immediately preceding swipe as one atomic Backspace. */
@@ -2346,19 +2760,28 @@ class SlideInputMethodService :
                 ?.toString(),
         )
 
-    private fun handleEnter(connection: InputConnection) {
-        finishComposing(connection)
+    private fun handleEnter(connection: InputConnection): Boolean {
+        val finish = finishComposing(connection)
+        if (!finish.settled) return finish.callbackPossible
         val info = currentInputEditorInfo
         val action = info?.imeOptions?.and(EditorInfo.IME_MASK_ACTION) ?: EditorInfo.IME_ACTION_NONE
         val suppressed = (info?.imeOptions?.and(EditorInfo.IME_FLAG_NO_ENTER_ACTION) ?: 0) != 0
 
-        if (!suppressed && action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED) {
-            connection.performEditorAction(action)
-        } else {
-            connection.commitText("\n", 1)
+        val actionRequested = !suppressed &&
+            action != EditorInfo.IME_ACTION_NONE &&
+            action != EditorInfo.IME_ACTION_UNSPECIFIED
+        val handled = actionRequested && connection.performEditorAction(action)
+        val editorMutated = !handled && (
+            connection.commitText("\n", 1) ||
+                handleRawKey(connection, KeyEvent.KEYCODE_ENTER)
+            )
+        if (handled || editorMutated) {
+            literalWordInProgress = false
+            updateShiftFromCursor()
         }
-        literalWordInProgress = false
-        updateShiftFromCursor()
+        // An editor action can submit or advance a form without moving this field's selection. It
+        // consumes Enter, but only a successful text/key fallback can produce our edit callback.
+        return finish.callbackPossible || editorMutated
     }
 
     private fun handleShiftTap(pressedAtMs: Long) {
@@ -2390,10 +2813,40 @@ class SlideInputMethodService :
         updateGestureAvailability()
     }
 
-    private fun layoutFor(layer: Layer) = when (layer) {
-        Layer.ALPHA -> editorBaseLayout
-        Layer.SYMBOLS -> Layouts.SymbolsEn
-        Layer.SYMBOLS_ALT -> Layouts.SymbolsAltEn
+    private fun layoutFor(layer: Layer): KeyboardLayout {
+        val base = when (layer) {
+            Layer.ALPHA -> editorBaseLayout
+            Layer.SYMBOLS -> Layouts.SymbolsEn
+            Layer.SYMBOLS_ALT -> Layouts.SymbolsAltEn
+        }
+        return Layouts.withImeSwitcher(base, imeSwitcherOffered)
+    }
+
+    private fun shouldOfferImeSwitcher(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            return shouldOfferSwitchingToNextInputMethod()
+        }
+        val token = window?.window?.attributes?.token ?: return false
+        val manager = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            ?: return false
+        @Suppress("DEPRECATION")
+        return manager.shouldOfferSwitchingToNextInputMethod(token)
+    }
+
+    private fun switchToNextIme() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            if (!switchToNextInputMethod(false)) announce("No other input method is available")
+            return
+        }
+        val token = window?.window?.attributes?.token ?: run {
+            announce("Input method switcher is unavailable")
+            return
+        }
+        val manager = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+        @Suppress("DEPRECATION")
+        if (manager?.switchToNextInputMethod(token, false) != true) {
+            announce("No other input method is available")
+        }
     }
 
     private fun layoutFor(mode: EditorKeyboardMode): KeyboardLayout = when (mode) {
@@ -2755,29 +3208,52 @@ class SlideInputMethodService :
     /**
      * Settles the word in progress, applying a pending autocorrection on the way out.
      *
-     * Returns whether anything was corrected, which is what decides if the next backspace should
-     * undo rather than delete.
+     * The result distinguishes an accepted settlement from a fully rejected attempt so callers
+     * never apply an edit that assumes the composing region is gone.
      */
-    private fun finishComposing(connection: InputConnection): Boolean {
-        if (composing.isEmpty()) return false
+    private data class ComposingFinishResult(
+        /** True when no region existed or the editor accepted an operation that settled it. */
+        val settled: Boolean,
+        val corrected: Boolean,
+        /** At least one accepted editor operation can result in a selection/candidate callback. */
+        val callbackPossible: Boolean,
+    )
+
+    private fun finishComposing(connection: InputConnection): ComposingFinishResult {
+        if (composing.isEmpty()) return ComposingFinishResult(true, false, false)
 
         val typed = composing.toString()
         val correction = pendingAutocorrection
+            ?.takeUnless { it.equals(typed, ignoreCase = true) }
+            ?.let { matchTypedCase(typed, it) }
         val previous = precedingWord()
-        var corrected = false
+        val settlement = EditorComposingSettlement.finish(
+            typed = typed,
+            correction = correction,
+            finish = connection::finishComposingText,
+            commit = { connection.commitText(it, 1) },
+        )
+        if (!settlement.settled) {
+            // The editor still owns this exact region. Keep every piece of state needed to retry;
+            // clearing it would let a following separator or gesture land inside live composition.
+            return ComposingFinishResult(
+                settled = false,
+                corrected = false,
+                callbackPossible = settlement.callbackPossible,
+            )
+        }
 
-        if (correction != null && !correction.equals(typed, ignoreCase = true)) {
-            val cased = matchTypedCase(typed, correction)
-            connection.setComposingText(cased, 1)
-            lastAutocorrect = Autocorrect(
+        val autocorrect = correction?.takeIf { settlement.corrected }?.let { applied ->
+            Autocorrect(
                 original = typed,
-                applied = cased,
+                applied = applied,
                 previous = previous,
                 touches = composingTouches.copyOf(typed.length * 2),
                 keys = currentGestureKeyMap(),
             )
-            corrected = true
-        } else if (!recomposed) {
+        }
+        lastAutocorrect = autocorrect
+        if (settlement.learnTypedWord && !recomposed) {
             // Settled exactly as typed, with the keyboard offering no objection. That is the
             // ordinary way a word the dictionary has never heard of gets into the language.
             // Reopened words are excluded: the user went back to look at one, not to write it.
@@ -2785,35 +3261,70 @@ class SlideInputMethodService :
             learnTouches(typed, typed)
         }
 
-        // Whatever actually landed in the text is what followed the previous word, whether that is
-        // what was typed or what it was corrected to. Read before the region is settled, so the
-        // word in progress is still there to be stepped over.
-        learnPair(previous, if (corrected) lastAutocorrect?.applied.orEmpty() else typed)
-
-        connection.finishComposingText()
+        // Whatever actually landed in the text is what followed the previous word. Read before
+        // clearing our copy, so a composing word is still correctly stepped over.
+        if (settlement.learnAppliedPair && !recomposed) {
+            learnPair(previous, settlement.appliedText)
+        }
         composing.setLength(0)
         clearTouches()
         pendingAutocorrection = null
         recomposed = false
         composingAtEnd = true
         clearSuggestions()
-        return corrected
+        if (settlement.callbackPossible) selfEdit = true
+        return ComposingFinishResult(
+            settled = true,
+            corrected = settlement.corrected,
+            callbackPossible = settlement.callbackPossible,
+        )
     }
 
     /**
      * Drops the word in progress without changing it, for when the cursor has moved out from under
      * us or the field has been swapped. Correcting text we may no longer own is not worth the risk.
      */
-    private fun abandonComposing() {
-        val wasComposing = composing.isNotEmpty()
+    private fun abandonComposing(
+        connection: InputConnection? = currentInputConnection,
+    ): EditorComposingSettlement.AbandonResult {
+        if (composing.isEmpty()) {
+            lastAutocorrect = null
+            clearSuggestions()
+            return EditorComposingSettlement.AbandonResult(
+                settled = true,
+                callbackPossible = false,
+            )
+        }
+        val editor = connection ?: return EditorComposingSettlement.AbandonResult(
+            settled = false,
+            callbackPossible = false,
+        )
+        val settlement = EditorComposingSettlement.abandon(
+            typed = composing.toString(),
+            finish = editor::finishComposingText,
+            commit = { editor.commitText(it, 1) },
+        )
+        if (!settlement.settled) return settlement
+
         composing.setLength(0)
         clearTouches()
         pendingAutocorrection = null
         lastAutocorrect = null
         recomposed = false
         composingAtEnd = true
-        if (wasComposing) selfEdit = true
-        currentInputConnection?.finishComposingText()
+        if (settlement.callbackPossible) selfEdit = true
+        clearSuggestions()
+        return settlement
+    }
+
+    /** Drops state that can no longer refer to the framework's current InputConnection. */
+    private fun discardComposingForEditorTransition() {
+        composing.setLength(0)
+        clearTouches()
+        pendingAutocorrection = null
+        lastAutocorrect = null
+        recomposed = false
+        composingAtEnd = true
         clearSuggestions()
     }
 
@@ -2825,30 +3336,55 @@ class SlideInputMethodService :
      * The applied text is checked against the field first, so a stale record can never eat
      * something else the user has since typed.
      */
-    private fun revertAutocorrect(connection: InputConnection): Boolean {
-        val undo = lastAutocorrect ?: return false
+    private data class AutocorrectRevertResult(
+        val consumed: Boolean,
+        val callbackPossible: Boolean,
+    )
+
+    private fun revertAutocorrect(connection: InputConnection): AutocorrectRevertResult {
+        val notConsumed = AutocorrectRevertResult(false, false)
+        val undo = lastAutocorrect ?: return notConsumed
         lastAutocorrect = null
-        if (composing.isNotEmpty()) return false
+        if (composing.isNotEmpty()) return notConsumed
 
         // The separator committed after the word, if the user has already pressed one.
-        val before = connection.getTextBeforeCursor(undo.applied.length + 1, 0)?.toString() ?: return false
+        val before = connection.getTextBeforeCursor(undo.applied.length + 1, 0)?.toString()
+            ?: return notConsumed
         val separator = when {
             before == undo.applied -> ""
             before.length == undo.applied.length + 1 &&
                 before.startsWith(undo.applied) &&
                 !before.last().isLetterOrDigit() -> before.substring(undo.applied.length)
-            else -> return false
+            else -> return notConsumed
         }
 
         // Closed from a finally: batch nesting is counted by the editor, so a throw between the two
         // calls would leave it permanently open and the keyboard would never hear about a selection
         // again for as long as the field is on screen.
         connection.beginBatchEdit()
-        try {
-            connection.deleteSurroundingText(undo.applied.length + separator.length, 0)
-            connection.commitText(undo.original + separator, 1)
+        val replacement = try {
+            GestureEditTransaction.replace(
+                original = undo.applied + separator,
+                replacement = undo.original + separator,
+                deleteBeforeCursor = { connection.deleteSurroundingText(it, 0) },
+                commit = { connection.commitText(it, 1) },
+            )
         } finally {
             connection.endBatchEdit()
+        }
+        if (!replacement.deleted) return notConsumed
+        if (!replacement.replaced) {
+            // The helper restored the correction where possible. Either way the editor has already
+            // accepted a mutation, so consuming this Backspace is safer than applying a second,
+            // unrelated deletion to uncertain text.
+            cachedSelectionStart = -1
+            cachedSelectionEnd = -1
+            return AutocorrectRevertResult(
+                consumed = true,
+                // A successful restoration leaves the batch observably unchanged, so no final
+                // selection callback is guaranteed. A failed restoration leaves text deleted.
+                callbackPossible = !replacement.restoredOriginal,
+            )
         }
 
         // The clearest signal a keyboard ever gets. The user was shown what it thought they meant
@@ -2868,7 +3404,7 @@ class SlideInputMethodService :
         }
 
         updateShiftFromCursor()
-        return true
+        return AutocorrectRevertResult(true, true)
     }
 
     /**
@@ -2889,30 +3425,58 @@ class SlideInputMethodService :
         // The dictionary is lowercase. Whether this word is new or reopened, swapping it for a
         // correction must not quietly undo the capitalization the person typed.
         val replacement = matchTypedCase(composing.toString(), word)
+        val typed = composing.toString()
         val previous = precedingWord()
 
-        // A strip tap is explicit confirmation, including when it chooses a correction. Learn
-        // before clearing the composing trace; insertions in the intended word are aligned and
-        // skipped by the spatial model because no physical touch exists for them.
-        learnTouches(composing.toString(), replacement)
-        learnPair(previous, replacement)
-
-        // Reaching past the keyboard's own first choice to pick out what they wrote is a deliberate
-        // choice, and means the same thing as undoing a correction.
-        if (word.equals(composing.toString(), ignoreCase = true)) {
-            learnWord(word, weight = TRUSTED_AT_ONCE)
-        }
-
+        val selfEditWasPending = selfEdit
         selfEdit = true
         // Closed from a finally; an unbalanced begin leaves the editor's nesting count open for
         // good, and with it every further selection callback.
         connection.beginBatchEdit()
+        lateinit var suggestion: EditorComposingSettlement.SuggestionResult
+        var spaceCommitted = !appendSpace
         try {
-            connection.setComposingText(replacement, 1)
-            connection.finishComposingText()
-            if (appendSpace) connection.commitText(" ", 1)
+            suggestion = EditorComposingSettlement.commitSuggestion(
+                replacement = replacement,
+                setComposing = { connection.setComposingText(it, 1) },
+                finish = connection::finishComposingText,
+                commit = { connection.commitText(it, 1) },
+            )
+            if (suggestion.settled && appendSpace) {
+                spaceCommitted = connection.commitText(" ", 1)
+            }
         } finally {
             connection.endBatchEdit()
+        }
+        selfEdit = SelfEditFallback.afterAttempt(
+            selfEditWasPending,
+            callbackPossible = suggestion.callbackPossible,
+            fallbackStillArmed = selfEdit,
+        )
+        if (!suggestion.settled) {
+            if (suggestion.replacementApplied) {
+                // The replacement landed as composing text but both settlement operations were
+                // rejected. Keep tracking the editor's new live value so a retry or following key
+                // cannot overwrite it with the stale word that preceded the explicit strip tap.
+                composing.setLength(0)
+                composing.append(replacement)
+                clearTouches()
+                pendingAutocorrection = null
+                lastAutocorrect = null
+                composingAtEnd = true
+                literalWordInProgress = false
+                cachedSelectionStart = -1
+                cachedSelectionEnd = -1
+            }
+            return
+        }
+
+        // A strip tap is explicit confirmation. Learn only after the editor confirms the chosen
+        // word landed; failed custom connections must not train a model from text they rejected.
+        learnTouches(typed, replacement)
+        learnPair(previous, replacement)
+        if (word.equals(typed, ignoreCase = true)) {
+            learnWord(word, weight = TRUSTED_AT_ONCE)
         }
 
         composing.setLength(0)
@@ -2926,7 +3490,7 @@ class SlideInputMethodService :
         clearSuggestions()
         updateShiftFromCursor()
         // Picking a suggestion appends a space, so the word is finished and the next one is open.
-        if (appendSpace) updatePredictions()
+        if (appendSpace && spaceCommitted) updatePredictions()
     }
 
     /**
@@ -2969,17 +3533,26 @@ class SlideInputMethodService :
         val connection = currentInputConnection ?: return
         // Read before the commit; afterwards the preceding word is the one just put down.
         val previous = precedingWordForSwipe()
-        val before = connection.getTextBeforeCursor(1, 0)
-        val needsSpace = !before.isNullOrEmpty() && isWordCharacter(before[0])
+        val before = connection.getTextBeforeCursor(AUTO_SPACING_CONTEXT_CHARS, 0)
+        val needsSpace = AutoSpacing.beforeWord(before)
 
+        val selfEditWasPending = selfEdit
         selfEdit = true
         // Closed from a finally; an unbalanced begin leaves the editor's nesting count open for
         // good, and with it every further selection callback.
         connection.beginBatchEdit()
-        try {
+        val committed = try {
             connection.commitText(if (needsSpace) " $word " else "$word ", 1)
         } finally {
             connection.endBatchEdit()
+        }
+        selfEdit = SelfEditFallback.afterAttempt(
+            selfEditWasPending,
+            callbackPossible = committed,
+            fallbackStillArmed = selfEdit,
+        )
+        if (!committed) {
+            return
         }
 
         // Taking a prediction is a deliberate choice of what comes next, and worth learning from
@@ -3068,7 +3641,10 @@ class SlideInputMethodService :
         }
         // Dropping one word and reopening another are the same gesture — a tap somewhere else in
         // the sentence — so the tap that ends the first must be allowed to start the second.
-        if (composing.isNotEmpty()) abandonComposing()
+        if (composing.isNotEmpty()) {
+            val abandonment = abandonComposing(currentInputConnection)
+            if (!abandonment.settled) return
+        }
 
         if (update.externalSelectionChanged) {
             // Gesture and prediction candidates describe the old cursor context. Clear first so
@@ -3131,9 +3707,17 @@ class SlideInputMethodService :
         val after = connection.getTextAfterCursor(MAX_REOPEN_CHARS, 0)?.toString() ?: return
 
         var start = before.length
-        while (start > 0 && isWordCharacter(before[start - 1])) start--
+        while (start > 0) {
+            val codePoint = Character.codePointBefore(before, start)
+            if (!isWordCharacter(codePoint)) break
+            start -= Character.charCount(codePoint)
+        }
         var end = 0
-        while (end < after.length && isWordCharacter(after[end])) end++
+        while (end < after.length) {
+            val codePoint = Character.codePointAt(after, end)
+            if (!isWordCharacter(codePoint)) break
+            end += Character.charCount(codePoint)
+        }
 
         // A run that reaches either end of the window may well continue past it, and reopening half
         // of a word would offer replacements for something the user never typed.
@@ -3141,14 +3725,27 @@ class SlideInputMethodService :
         if (end == after.length && after.length == MAX_REOPEN_CHARS) return
 
         val word = before.substring(start) + after.substring(0, end)
-        if (word.length !in MIN_REOPEN_LENGTH..MAX_REOPEN_LENGTH) return
-        if (word.none(Char::isLetter)) return
+        if (word.codePointCount(0, word.length) !in MIN_REOPEN_LENGTH..MAX_REOPEN_LENGTH) return
+        if (word.codePoints().noneMatch(Character::isLetter)) return
 
         val regionStart = cursorPosition - (before.length - start)
         if (regionStart < 0) return
 
+        val selfEditWasPending = selfEdit
         selfEdit = true
-        connection.setComposingRegion(regionStart, regionStart + word.length)
+        if (!connection.setComposingRegion(regionStart, regionStart + word.length)) {
+            selfEdit = SelfEditFallback.afterAttempt(
+                selfEditWasPending,
+                callbackPossible = false,
+                fallbackStillArmed = selfEdit,
+            )
+            return
+        }
+        selfEdit = SelfEditFallback.afterAttempt(
+            selfEditWasPending,
+            callbackPossible = true,
+            fallbackStillArmed = selfEdit,
+        )
         composing.setLength(0)
         clearTouches()
         composing.append(word)
@@ -3292,6 +3889,16 @@ class SlideInputMethodService :
 
         /** Enough to reach back over the word in progress and the one before it. */
         const val MAX_CONTEXT_CHARS = 64
+
+        /** Enough to classify a supplementary symbol and an opening-versus-closing quote. */
+        const val AUTO_SPACING_CONTEXT_CHARS = 64
+
+        val WORD_APOSTROPHES = setOf('\''.code, '\u2019'.code, '\u02bc'.code, '\uff07'.code)
+        val COMBINING_MARK_TYPES = setOf(
+            Character.NON_SPACING_MARK.toInt(),
+            Character.COMBINING_SPACING_MARK.toInt(),
+            Character.ENCLOSING_MARK.toInt(),
+        )
 
         /**
          * Weight enough to trust a word on the spot.

@@ -22,7 +22,7 @@ class MicPermissionActivity : Activity() {
         super.onCreate(savedInstanceState)
 
         if (hasPermission(this)) {
-            finish()
+            finishPermissionTask()
             return
         }
         requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_CODE)
@@ -34,7 +34,16 @@ class MicPermissionActivity : Activity() {
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        finish()
+        finishPermissionTask()
+    }
+
+    /**
+     * The permission proxy owns a deliberately isolated, invisible task. Remove that task rather
+     * than merely finishing its only activity so Android always returns to the editor that was
+     * under the IME, never to Slide's launcher/settings task.
+     */
+    private fun finishPermissionTask() {
+        finishAndRemoveTask()
     }
 
     companion object {
@@ -44,9 +53,17 @@ class MicPermissionActivity : Activity() {
             ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
                 PackageManager.PERMISSION_GRANTED
 
-        /** Started from a service context, hence the new task. */
+        /**
+         * Started from a service context, hence the new task. The manifest gives the proxy no task
+         * affinity, and these flags keep its transient task out of Recents and task restoration.
+         */
         fun intent(context: Context): Intent =
             Intent(context, MicPermissionActivity::class.java)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                .addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS or
+                        Intent.FLAG_ACTIVITY_NO_HISTORY or
+                        Intent.FLAG_ACTIVITY_NO_ANIMATION,
+                )
     }
 }

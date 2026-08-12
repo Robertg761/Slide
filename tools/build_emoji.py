@@ -2,10 +2,9 @@
 """
 Converts the Unicode emoji test data into Slide's packed emoji asset.
 
-Sources:
-    https://unicode.org/Public/emoji/latest/emoji-test.txt        (Unicode, UTS #51)
-    https://raw.githubusercontent.com/unicode-org/cldr/main/common/annotations/en.xml
-        and .../annotationsDerived/en.xml                          (CLDR, search keywords)
+Sources are locked by immutable revision and SHA-256 in tools/language_sources.json:
+    Unicode 17.0 emoji-test.txt                                   (Unicode, UTS #51)
+    CLDR English annotations and derived annotations             (CLDR, search keywords)
 
 Output: core/src/main/assets/emoji.bin
 
@@ -38,13 +37,18 @@ Search text is the emoji's name followed by its CLDR keywords, lowercased and se
 spaces, so a substring match over it is the whole of search.
 
 Usage:
-    python3 tools/build_emoji.py                       # downloads its own sources
+    python3 tools/build_emoji.py                       # downloads verified locked sources
     python3 tools/build_emoji.py --emoji-test PATH --annotations PATH --derived PATH
+
+Local inputs are checked against the same lock. To adopt a newer release, update the source
+revision and digest deliberately; an arbitrary local file is never accepted as provenance.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import re
 import struct
 import sys
@@ -52,13 +56,15 @@ import urllib.request
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
+from fetch_language_sources import read_verified_stream
+
 MAGIC = b"SEMJ"
 VERSION = 1
 
-EMOJI_TEST_URL = "https://unicode.org/Public/emoji/latest/emoji-test.txt"
-CLDR_BASE = "https://raw.githubusercontent.com/unicode-org/cldr/main/common"
-ANNOTATIONS_URL = f"{CLDR_BASE}/annotations/en.xml"
-DERIVED_URL = f"{CLDR_BASE}/annotationsDerived/en.xml"
+SOURCE_LOCK = Path(__file__).with_name("language_sources.json")
+EMOJI_TEST_SOURCE = "unicode_emoji_test"
+ANNOTATIONS_SOURCE = "cldr_annotations_en"
+DERIVED_SOURCE = "cldr_annotations_derived_en"
 
 DEFAULT_OUTPUT = Path("core/src/main/assets/emoji.bin")
 
@@ -103,14 +109,56 @@ class Entry:
         self.variants: dict[str, str] = {}
 
 
-def fetch(url: str) -> str:
+def load_source_specs() -> dict[str, dict[str, object]]:
+    document = json.loads(SOURCE_LOCK.read_text(encoding="utf-8"))
+    if document.get("schema_version") != 1 or not isinstance(
+        document.get("sources"), dict
+    ):
+        raise ValueError(f"unsupported or malformed source lock: {SOURCE_LOCK}")
+    return document["sources"]
+
+
+def verify_source(data: bytes, spec: dict[str, object], label: str) -> bytes:
+    expected_size = spec.get("size")
+    expected_hash = spec.get("sha256")
+    if not isinstance(expected_size, int) or not isinstance(expected_hash, str):
+        raise ValueError(f"incomplete source lock for {label}")
+
+    actual_hash = hashlib.sha256(data).hexdigest()
+    if len(data) != expected_size or actual_hash != expected_hash:
+        raise ValueError(
+            f"{label} does not match the locked source: expected {expected_size} bytes and "
+            f"SHA-256 {expected_hash}, got {len(data)} bytes and {actual_hash}"
+        )
+    return data
+
+
+def fetch(spec: dict[str, object], label: str) -> bytes:
+    url = spec.get("retrieval_url")
+    expected_size = spec.get("size")
+    expected_hash = spec.get("sha256")
+    if not isinstance(url, str) or not url.startswith("https://"):
+        raise ValueError(f"invalid retrieval URL for {label}")
+    if not isinstance(expected_size, int) or not isinstance(expected_hash, str):
+        raise ValueError(f"incomplete source lock for {label}")
     print(f"  fetching {url}", file=sys.stderr)
     with urllib.request.urlopen(url, timeout=60) as response:
-        return response.read().decode("utf-8")
+        return read_verified_stream(
+            response,
+            expected_size=expected_size,
+            expected_sha256=expected_hash,
+            label=label,
+            content_length=response.headers.get("Content-Length"),
+        )
 
 
-def read_source(path: str | None, url: str) -> str:
-    return Path(path).read_text(encoding="utf-8") if path else fetch(url)
+def read_source(path: str | None, spec: dict[str, object], label: str) -> str:
+    data = (
+        verify_source(Path(path).read_bytes(), spec, label)
+        if path
+        else fetch(spec, label)
+    )
+    return data.decode("utf-8")
 
 
 def parse_emoji_test(text: str) -> list[Entry]:
@@ -136,8 +184,9 @@ def parse_emoji_test(text: str) -> list[Entry]:
             continue
         category = CATEGORY_NAMES.get(group)
         if category is None:
-            print(f"warning: unknown group {group!r}, skipping", file=sys.stderr)
-            continue
+            raise ValueError(
+                f"unknown emoji group {group!r}; update the category mapping explicitly"
+            )
 
         emoji = "".join(chr(int(point, 16)) for point in match.group("code").split())
         name = match.group("name")
@@ -164,9 +213,15 @@ def parse_emoji_test(text: str) -> list[Entry]:
             continue
         entry.variants[tone] = emoji
     if orphans:
-        print(f"note: {orphans} toned sequences had no untoned base and were dropped", file=sys.stderr)
+        print(
+            f"note: {orphans} toned sequences had no untoned base and were dropped",
+            file=sys.stderr,
+        )
     if multi_toned:
-        print(f"note: {multi_toned} multi-person tone combinations were dropped", file=sys.stderr)
+        print(
+            f"note: {multi_toned} multi-person tone combinations were dropped",
+            file=sys.stderr,
+        )
 
     return entries
 
@@ -221,7 +276,9 @@ def search_text(entry: Entry, keywords: dict[str, list[str]]) -> str:
     return " ".join(seen)
 
 
-def pack(entries: list[Entry], categories: list[str], keywords: dict[str, list[str]]) -> bytes:
+def pack(
+    entries: list[Entry], categories: list[str], keywords: dict[str, list[str]]
+) -> bytes:
     out = bytearray(MAGIC)
     out.append(VERSION)
 
@@ -235,7 +292,9 @@ def pack(entries: list[Entry], categories: list[str], keywords: dict[str, list[s
         out.append(index_of[entry.category])
         write_short_string(out, entry.emoji, f"emoji {entry.name!r}")
 
-        variants = [entry.variants[tone] for tone in TONE_ORDER if tone in entry.variants]
+        variants = [
+            entry.variants[tone] for tone in TONE_ORDER if tone in entry.variants
+        ]
         # A partial set would leave the long-press row with gaps that mean nothing to a user,
         # so it is all five tones or none.
         if len(variants) != len(TONE_ORDER):
@@ -254,7 +313,9 @@ def pack(entries: list[Entry], categories: list[str], keywords: dict[str, list[s
 def write_short_string(out: bytearray, value: str, what: str) -> None:
     encoded = value.encode("utf-8")
     if len(encoded) > 255:
-        raise ValueError(f"{what} is {len(encoded)} bytes, over the 255 the format allows")
+        raise ValueError(
+            f"{what} is {len(encoded)} bytes, over the 255 the format allows"
+        )
     out.append(len(encoded))
     out += encoded
 
@@ -263,23 +324,38 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--emoji-test", help="local copy of emoji-test.txt")
     parser.add_argument("--annotations", help="local copy of CLDR annotations/en.xml")
-    parser.add_argument("--derived", help="local copy of CLDR annotationsDerived/en.xml")
+    parser.add_argument(
+        "--derived", help="local copy of CLDR annotationsDerived/en.xml"
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     args = parser.parse_args()
 
-    entries = parse_emoji_test(read_source(args.emoji_test, EMOJI_TEST_URL))
-    if not entries:
-        print("error: no emoji parsed; the source format may have changed", file=sys.stderr)
-        return 1
-
     try:
-        keywords = parse_annotations(
-            read_source(args.annotations, ANNOTATIONS_URL),
-            read_source(args.derived, DERIVED_URL),
+        specs = load_source_specs()
+        entries = parse_emoji_test(
+            read_source(args.emoji_test, specs[EMOJI_TEST_SOURCE], EMOJI_TEST_SOURCE)
         )
-    except Exception as error:  # noqa: BLE001 - keywords improve search, they do not gate it
-        print(f"warning: no CLDR keywords ({error}); search will use names alone", file=sys.stderr)
-        keywords = {}
+        if not entries:
+            raise ValueError("no emoji parsed; the source format may have changed")
+        keywords = parse_annotations(
+            read_source(
+                args.annotations, specs[ANNOTATIONS_SOURCE], ANNOTATIONS_SOURCE
+            ),
+            read_source(args.derived, specs[DERIVED_SOURCE], DERIVED_SOURCE),
+        )
+        if not keywords:
+            raise ValueError(
+                "no CLDR keywords parsed; refusing to build a degraded search index"
+            )
+    except (
+        KeyError,
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+        ElementTree.ParseError,
+    ) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
 
     categories = list(CATEGORY_NAMES.values())
     used = {entry.category for entry in entries}

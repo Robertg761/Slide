@@ -8,8 +8,17 @@ REVISION="18328c3042b066952c0936b3771d492fe2ec289a"
 BASE_URL="https://huggingface.co/futo-org/futo-swipe/resolve/$REVISION"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEST_DIR="$ROOT/engine/src/main/assets/swipe"
+DEST_DIR="${SLIDE_SWIPE_MODEL_DEST_DIR:-$ROOT/engine/src/main/assets/swipe}"
 mkdir -p "$DEST_DIR"
+
+ACTIVE_STAGE_DIR=""
+cleanup_active_stage() {
+    if [[ -n "$ACTIVE_STAGE_DIR" ]]; then
+        rm -rf -- "$ACTIVE_STAGE_DIR"
+        ACTIVE_STAGE_DIR=""
+    fi
+}
+trap cleanup_active_stage EXIT
 
 download() {
     local remote="$1"
@@ -31,15 +40,16 @@ download() {
     fi
 
     echo "Downloading $name"
-    trap 'rm -f "$destination.part"' RETURN
+    ACTIVE_STAGE_DIR="$(mktemp -d "$DEST_DIR/.$name.download.XXXXXX")"
+    local staged="$ACTIVE_STAGE_DIR/$name"
     curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --progress-bar \
-        "$BASE_URL/$remote" -o "$destination.part"
-    if ! verify "$destination.part"; then
+        "$BASE_URL/$remote" -o "$staged"
+    if ! verify "$staged"; then
         echo "Downloaded swipe model failed SHA-256 verification: $name" >&2
         exit 1
     fi
-    mv "$destination.part" "$destination"
-    trap - RETURN
+    mv -f "$staged" "$destination"
+    cleanup_active_stage
 }
 
 download \

@@ -227,6 +227,7 @@ class KeyboardView @JvmOverloads constructor(
         var cursorMove: Boolean = false,
         var deleteWordGesture: Boolean = false,
         var slidOff: Boolean = false,
+        var cancelled: Boolean = false,
     )
 
     private val pointers = HashMap<Int, Pointer>()
@@ -477,7 +478,11 @@ class KeyboardView @JvmOverloads constructor(
 
         placedKeys.forEach { placed ->
             val held = pointers.any { (pointerId, pointer) ->
-                pointerId != gesturePointerId && pointer.placed === placed
+                KeyPressRouting.isVisuallyHeld(
+                    isGesturePointer = pointerId == gesturePointerId,
+                    cancelled = pointer.cancelled,
+                    isPlacedKey = pointer.placed === placed,
+                )
             }
             val overlay = if (held) {
                 1f
@@ -936,7 +941,7 @@ class KeyboardView @JvmOverloads constructor(
      *
      * Returns true when the header consumed the event. The header owns exactly one finger:
      * a second finger landing in it is swallowed rather than handed to the key hit-test —
-     * [KeyGeometry.hitTest] never returns null, so falling through would type the nearest
+     * points within its footprint overlap the top keyboard row, so falling through can type a
      * top-row letter into the query. Fingers on the keys keep working while the header is
      * held, and only the header's own finger can resolve it, whether it lifts as ACTION_UP
      * or, with a key still down, as ACTION_POINTER_UP.
@@ -1100,11 +1105,25 @@ class KeyboardView @JvmOverloads constructor(
         // Slide-off: the finger moved to a different key before lifting.
         if (travelled > touchSlop) {
             val nowOver = KeyGeometry.hitTest(placedKeys, x, y)
-            if (nowOver != null && nowOver !== pointer.placed) {
+            if (nowOver == null && !pointer.cancelled) {
                 cancelPendingLongPress(pointerId)
                 cancelRepeat(pointerId)
                 beginPressFade(pointer.placed.key)
+                dismissPreviewFor(pointerId)
+                pointer.cancelled = true
+                pointer.slidOff = true
+                invalidate()
+            } else if (nowOver != null && (pointer.cancelled || nowOver !== pointer.placed)) {
+                val changedKey = nowOver !== pointer.placed
+                val cancellation = KeyPressRouting.pendingCancellationForRollover(changedKey)
+                // A hold belongs to the key it began on. Letting either callback survive a direct
+                // A-to-B slide can open A's alternates over B or repeat Backspace while the finger
+                // visibly rests on another key.
+                if (cancellation.longPress) cancelPendingLongPress(pointerId)
+                if (cancellation.repeat) cancelRepeat(pointerId)
+                if (!pointer.cancelled) beginPressFade(pointer.placed.key)
                 pointer.placed = nowOver
+                pointer.cancelled = false
                 pointer.slidOff = true
                 showPreviewFor(pointerId, nowOver)
                 invalidate()
@@ -1117,7 +1136,35 @@ class KeyboardView @JvmOverloads constructor(
         cancelPendingLongPress(pointerId)
         cancelRepeat(pointerId)
         releasePreview(pointerId)
-        beginPressFade(pointer.placed.key)
+
+        // ACTION_UP carries the authoritative release coordinates. A sparse event stream can move
+        // from a key into empty padding without an intervening MOVE, so re-run the bounded hit test
+        // here instead of trusting the last sampled cell and committing a stale key.
+        if (
+            gesturePointerId != pointerId &&
+            !pointer.cursorMove &&
+            !pointer.deleteWordGesture &&
+            !pointer.longPressFired
+        ) {
+            val releaseOver = KeyGeometry.hitTest(placedKeys, x, y)
+            val release = KeyPressRouting.resolveRelease(
+                hasValidKey = releaseOver != null,
+                isCurrentKey = releaseOver === pointer.placed,
+                movedBeyondSlop = hypot(x - pointer.downX, y - pointer.downY) > touchSlop,
+                wasSlidOff = pointer.slidOff,
+            )
+            pointer.cancelled = release.cancelled
+            pointer.slidOff = release.slidOff
+            if (release.retarget && releaseOver != null) pointer.placed = releaseOver
+        }
+        if (
+            KeyPressRouting.shouldFadeOnRelease(
+                cancelled = pointer.cancelled,
+                isGesturePointer = gesturePointerId == pointerId,
+            )
+        ) {
+            beginPressFade(pointer.placed.key)
+        }
 
         if (pointer.cursorMove) {
             cursorRemainderPx = 0f
@@ -1151,7 +1198,7 @@ class KeyboardView @JvmOverloads constructor(
         }
 
         // A press whose auto-repeat fired must not commit the key a second time on release.
-        if (!pointer.longPressFired && !pointer.repeatFired) {
+        if (!pointer.cancelled && !pointer.longPressFired && !pointer.repeatFired) {
             announceForAccessibility(accessibilityLabel(pointer.placed.key))
             listener?.onKeyCommit(
                 pointer.placed.key,
@@ -1205,12 +1252,14 @@ class KeyboardView @JvmOverloads constructor(
         previewPointerId = null
         val survivor = pointers.entries
             .filter { (id, pointer) ->
-                id != pointerId &&
-                    id != gesturePointerId &&
-                    pointer.placed.key.type == KeyType.CHARACTER &&
-                    !pointer.longPressFired &&
-                    !pointer.cursorMove &&
-                    !pointer.deleteWordGesture
+                id != pointerId && PointerOwnership.mayInheritPreview(
+                    isGesturePointer = id == gesturePointerId,
+                    cancelled = pointer.cancelled,
+                    isCharacter = pointer.placed.key.type == KeyType.CHARACTER,
+                    longPressFired = pointer.longPressFired,
+                    cursorMove = pointer.cursorMove,
+                    deleteWordGesture = pointer.deleteWordGesture,
+                )
             }
             .maxByOrNull { (_, pointer) -> pointer.downTime }
             ?: return
@@ -1513,15 +1562,86 @@ internal object PointerOwnership {
     /** True when [pointerId] may hide or hand over the shared key preview. */
     fun ownsPreview(owner: Int?, pointerId: Int): Boolean = owner == null || owner == pointerId
 
+    /** A surviving contact may inherit the shared preview only while it remains a live key tap. */
+    fun mayInheritPreview(
+        isGesturePointer: Boolean,
+        cancelled: Boolean,
+        isCharacter: Boolean,
+        longPressFired: Boolean,
+        cursorMove: Boolean,
+        deleteWordGesture: Boolean,
+    ): Boolean =
+        !isGesturePointer &&
+            !cancelled &&
+            isCharacter &&
+            !longPressFired &&
+            !cursorMove &&
+            !deleteWordGesture
+
     /** A contact that arrives while a swipe is in flight is not a key press. */
     fun ignoresKeyDown(gesturePointerId: Int?): Boolean = gesturePointerId != null
+}
+
+/** Rollover and final-release policy, separated from MotionEvent plumbing for JVM coverage. */
+internal object KeyPressRouting {
+    data class PendingCancellation(
+        val longPress: Boolean,
+        val repeat: Boolean,
+    )
+
+    data class Release(
+        val cancelled: Boolean,
+        val slidOff: Boolean,
+        val retarget: Boolean,
+    )
+
+    /** A pending hold/repeat is owned by its original key, not the cell rolled onto. */
+    fun pendingCancellationForRollover(overDifferentKey: Boolean): PendingCancellation =
+        PendingCancellation(
+            longPress = overDifferentKey,
+            repeat = overDifferentKey,
+        )
+
+    /** Padding-cancelled contacts fade their old key even while the finger remains down. */
+    fun isVisuallyHeld(
+        isGesturePointer: Boolean,
+        cancelled: Boolean,
+        isPlacedKey: Boolean,
+    ): Boolean = !isGesturePointer && !cancelled && isPlacedKey
+
+    /** Slide-off and gesture transitions already began their fade; lifting must not restart it. */
+    fun shouldFadeOnRelease(cancelled: Boolean, isGesturePointer: Boolean): Boolean =
+        !cancelled && !isGesturePointer
+
+    /**
+     * ACTION_UP is authoritative. A valid final cell revives a press cancelled by an earlier move,
+     * including the sparse padding-to-original-key case where it is identical to the tracked key.
+     */
+    fun resolveRelease(
+        hasValidKey: Boolean,
+        isCurrentKey: Boolean,
+        movedBeyondSlop: Boolean,
+        wasSlidOff: Boolean,
+    ): Release {
+        if (!hasValidKey) {
+            return Release(cancelled = true, slidOff = wasSlidOff, retarget = false)
+        }
+        return Release(
+            cancelled = false,
+            slidOff = wasSlidOff || movedBeyondSlop,
+            // ACTION_UP is authoritative even if the final hop back to another key is within the
+            // original down slop. Once a prior rollover occurred, keeping the stale tracked cell
+            // would commit B for an A -> B -> A sequence that visibly ends on A.
+            retarget = !isCurrentKey && (movedBeyondSlop || wasSlidOff),
+        )
+    }
 }
 
 /**
  * How the emoji-search header claims fingers.
  *
- * The header is layered over the keys, and [KeyGeometry.hitTest] never returns null, so a header
- * touch that is not claimed here becomes a stray letter in the search query.
+ * The header is layered over the top-row key region, so a header touch that is not claimed here
+ * can become a stray letter in the search query.
  */
 internal object SearchHeaderRouting {
 

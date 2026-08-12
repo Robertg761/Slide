@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <new>
 #include <string>
@@ -247,7 +248,7 @@ Java_com_slide_asr_WhisperNative_closeCancellationToken(JNIEnv *, jclass, jlong 
     delete as_cancellation_token(handle);
 }
 
-JNI_EXPORT jstring JNICALL
+JNI_EXPORT jbyteArray JNICALL
 Java_com_slide_asr_WhisperNative_transcribe(
         JNIEnv *env, jclass, jlong handle, jfloatArray samples, jint threads,
         jlong cancellation_handle) {
@@ -298,8 +299,28 @@ Java_com_slide_asr_WhisperNative_transcribe(
             if (segment != nullptr) text += segment;
         }
         const std::string cleaned = tidy(text);
-        jstring result = env->NewStringUTF(cleaned.c_str());
-        if (result == nullptr) clear_pending_java_exception(env, "transcript conversion");
+        if (cleaned.size() > static_cast<size_t>(std::numeric_limits<jsize>::max())) {
+            LOGE("Transcript is too large for a Java byte array");
+            return nullptr;
+        }
+        const jsize length = static_cast<jsize>(cleaned.size());
+        jbyteArray result = env->NewByteArray(length);
+        if (result == nullptr) {
+            clear_pending_java_exception(env, "transcript allocation");
+            return nullptr;
+        }
+        if (length > 0) {
+            env->SetByteArrayRegion(
+                    result,
+                    0,
+                    length,
+                    reinterpret_cast<const jbyte *>(cleaned.data()));
+            if (env->ExceptionCheck()) {
+                clear_pending_java_exception(env, "transcript copy");
+                env->DeleteLocalRef(result);
+                return nullptr;
+            }
+        }
         return result;
     } catch (const std::bad_alloc &) {
         LOGE("Out of memory while building the transcript");

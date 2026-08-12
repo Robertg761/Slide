@@ -39,12 +39,18 @@ internal object WhisperNative {
     @JvmStatic
     external fun closeCancellationToken(token: Long)
 
-    /** [samples] is mono 16kHz PCM in -1..1. Returns null if decoding failed. */
+    /**
+     * [samples] is mono 16kHz PCM in -1..1.
+     *
+     * Whisper produces ordinary UTF-8. Returning its bytes keeps that encoding out of JNI's
+     * Modified-UTF-8 string API; [WhisperTranscriber] performs the standards-compliant decode.
+     * Returns null if recognition failed.
+     */
     @JvmStatic
     external fun transcribe(
         handle: Long,
         samples: FloatArray,
         threads: Int,
         cancellationToken: Long,
-    ): String?
+    ): ByteArray?
 }

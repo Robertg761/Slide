@@ -8,6 +8,7 @@ set -euo pipefail
 
 VERSION="1.2.0"
 FBJNI_VERSION="0.7.0"
+OUTPUT_SHA256="9752979140e20abb2f7ec24d6ec85ff2b5614c4b4ab916da68d1b71e501bca8e"
 MAVEN="https://repo1.maven.org/maven2"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST_DIR="$ROOT/third_party/executorch"
@@ -25,7 +26,13 @@ fi
 
 mkdir -p "$DEST_DIR"
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+stage_dir=""
+staged=""
+cleanup() {
+    rm -rf "$work"
+    [[ -z "$stage_dir" ]] || rm -rf "$stage_dir"
+}
+trap cleanup EXIT
 
 fetch() {
     local url="$1"
@@ -60,6 +67,27 @@ mkdir -p \
     "$work/classes-jar"
 unzip -q "$work/executorch.aar" -d "$work/executorch"
 unzip -q "$work/fbjni.aar" classes.jar -d "$work/fbjni"
+
+# Upstream's runtime AAR accidentally ships its own AndroidJUnitRunner declaration. A library
+# manifest is merged into every consumer, so leaving it in would advertise a test-only class that
+# is neither packaged nor targeted at Slide. Remove all instrumentation components before repack.
+python3 - "$work/executorch/AndroidManifest.xml" <<'PY'
+import sys
+import xml.etree.ElementTree as ElementTree
+
+manifest = sys.argv[1]
+tree = ElementTree.parse(manifest)
+root = tree.getroot()
+for child in list(root):
+    if child.tag.rsplit("}", 1)[-1] == "instrumentation":
+        root.remove(child)
+tree.write(manifest, encoding="utf-8", xml_declaration=True)
+PY
+if grep -q '<instrumentation' "$work/executorch/AndroidManifest.xml"; then
+    echo "ExecuTorch instrumentation could not be removed from the runtime manifest." >&2
+    exit 1
+fi
+
 unzip -p "$work/executorch-sources.jar" org/pytorch/executorch/Tensor.java \
     > "$work/source/org/pytorch/executorch/Tensor.java"
 patch --quiet -d "$work/source" -p1 < "$DEST_DIR/tensor-bool.patch"
@@ -82,10 +110,22 @@ rm -f "$work/executorch/classes.jar"
 
 # Repack from a stable file order and timestamp so the locally produced runtime is reproducible.
 find "$work/executorch" -exec touch -d '@0' {} +
-rm -f "$DEST"
+stage_dir="$(mktemp -d "$DEST_DIR/.executorch-android-$VERSION-slide.XXXXXX")"
+staged="$stage_dir/output.aar"
 (
     cd "$work/executorch"
-    find . -type f -printf '%P\n' | LC_ALL=C sort | zip -q -X -9 "$DEST" -@
+    find . -type f -printf '%P\n' | LC_ALL=C sort | zip -q -X -9 "$staged" -@
 )
+
+printf '%s  %s\n' "$OUTPUT_SHA256" "$staged" | sha256sum --check --status || {
+    echo "Generated ExecuTorch runtime is not the reviewed reproducible artifact." >&2
+    exit 1
+}
+# Same-directory rename is atomic: an interrupted or unreviewed rebuild never replaces the last
+# validated runtime that Gradle consumes, and concurrent fetchers each have their own staging file.
+mv -f "$staged" "$DEST"
+rm -rf "$stage_dir"
+stage_dir=""
+staged=""
 
 echo "Wrote patched ExecuTorch runtime: $DEST ($(du -h "$DEST" | cut -f1))"

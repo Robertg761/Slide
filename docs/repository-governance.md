@@ -10,7 +10,8 @@ Create a ruleset for the default branch, `main`, with these controls:
 
 - require pull requests and at least one approval;
 - dismiss stale approvals when new commits are pushed;
-- require the `CI / verify` status check and require the branch to be current before merging;
+- require `CI / verify` and both packaged-runtime matrix checks, and require the branch to be
+  current before merging;
 - block force pushes and deletion;
 - do not allow bypass except a separately controlled emergency administrator role;
 - require conversation resolution and prevent merge commits if linear history is the chosen policy.
@@ -21,7 +22,9 @@ refuses to update an existing release, but server-side enforcement is the author
 
 Under Actions settings:
 
-- keep the default workflow token read-only and grant write access only in the `publish` job;
+- keep the default workflow token read-only. Grant `contents: write` only to `publish`; the `sign`
+  job receives only `artifact-metadata: write`, `attestations: write`, and `id-token: write` (with
+  read-only contents/actions) so GitHub can attest the already-built signed APK;
 - allow only GitHub-owned and explicitly approved actions, and require actions to be pinned to a
   full commit SHA;
 - do not send repository secrets to workflows triggered from forks;
@@ -41,10 +44,12 @@ Require at least one release maintainer to approve deployments to this environme
 self-review where the GitHub plan supports it. Limit deployment branches/tags to protected `v*`
 tags. Do not duplicate signing secrets at repository or organization scope.
 
-The release workflow intentionally builds and tests in a job that cannot access this environment.
-Only the resulting unsigned artifact crosses into the signing job. That job does not check out the
-repository or run Gradle while the key exists, deletes the temporary key before it runs the
-repository-provided verifier, and publishes from a third job that never receives the key.
+The release workflow intentionally builds and tests in jobs that cannot access this environment.
+It requires API 26/API 37 packaged-runtime tests and an independent source-export rebuild to match
+the reviewed unsigned APK byte for byte. Only that approval artifact crosses into the signing job.
+The signing job does not check out the repository or run Gradle while the key exists, deletes the
+temporary key before it runs the repository-provided verifier, and publishes from a third job that
+never receives the key.
 
 ## Release procedure
 
@@ -52,10 +57,15 @@ repository-provided verifier, and publishes from a third job that never receives
 2. Set the same version and code in `app/build.gradle.kts`, and add a dated changelog section.
 3. Merge through a pull request after `CI / verify` succeeds.
 4. Create a protected `v<version>` tag at the current `main` commit.
-5. Review the unprivileged build job, then approve the `release` environment deployment.
-6. Confirm the final job reports the expected package, version, sole pinned model and checksum,
-   STORED model compression, complete ABI set, release certificate, and APK SHA-256.
-7. Download the live release asset and independently run `tools/verify_release_apk.sh` against it.
+5. Confirm both emulator jobs passed and the independent source-export APK matched the reviewed
+   unsigned build, then approve the `release` environment deployment.
+6. Confirm the final job reports the expected package, version, exact runtime-asset hashes, STORED
+   model compression, complete ABI set, native source provenance, release certificate, and APK
+   SHA-256.
+7. Confirm the release attaches the APK, checksum, CycloneDX SBOM, R8 mapping, and native symbols,
+   and that GitHub recorded both build-provenance and SBOM attestations for the signed APK.
+8. Download the live APK and checksum, verify the checksum, and independently run
+   `tools/verify_release_apk.sh` against the APK.
 
 Never replace an asset or move a published tag. A correction gets a new SemVer and versionCode.
 

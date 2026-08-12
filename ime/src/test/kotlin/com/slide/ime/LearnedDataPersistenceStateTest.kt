@@ -8,6 +8,86 @@ import org.junit.Test
 class LearnedDataPersistenceStateTest {
 
     @Test
+    fun `durable clear after fallback load purges on first authoritative epoch`() {
+        val epochs = LearnedDataClearEpochState()
+        val loadedWords = mutableListOf("private")
+
+        assertFalse(epochs.observeEpoch(epoch = -1L, latestDeletionGeneration = 0L))
+        // The settings screen now persists the marker while the repository retry is in flight.
+        if (epochs.observeEpoch(epoch = 7L, latestDeletionGeneration = 1L)) loadedWords.clear()
+
+        assertTrue(loadedWords.isEmpty())
+    }
+
+    @Test
+    fun `epoch rise clears while corruption reset only establishes a lower baseline`() {
+        val epochs = LearnedDataClearEpochState()
+
+        assertFalse(epochs.observeEpoch(epoch = 8L, latestDeletionGeneration = 0L))
+        assertTrue(epochs.observeEpoch(epoch = 9L, latestDeletionGeneration = 0L))
+        assertFalse(epochs.observeEpoch(epoch = 0L, latestDeletionGeneration = 0L))
+        assertTrue(epochs.observeEpoch(epoch = 1L, latestDeletionGeneration = 0L))
+    }
+
+    @Test
+    fun `live marker signal purges once even when its epoch arrives later`() {
+        val epochs = LearnedDataClearEpochState()
+
+        assertFalse(epochs.observeEpoch(epoch = 5L, latestDeletionGeneration = 0L))
+        assertTrue(epochs.observeDeletionRequest(generation = 1L))
+        // Unrelated settings emissions while disk deletion is slow must preserve new learning.
+        assertFalse(epochs.observeEpoch(epoch = 5L, latestDeletionGeneration = 1L))
+        assertFalse(epochs.observeEpoch(epoch = 5L, latestDeletionGeneration = 1L))
+        // The eventual epoch publication acknowledges, rather than repeats, the same clear.
+        assertFalse(epochs.observeEpoch(epoch = 6L, latestDeletionGeneration = 1L))
+        assertFalse(epochs.observeDeletionRequest(generation = 1L))
+    }
+
+    @Test
+    fun `epoch collector catches a marker signal queued behind it without double clearing`() {
+        val epochs = LearnedDataClearEpochState()
+
+        assertFalse(epochs.observeEpoch(epoch = 5L, latestDeletionGeneration = 0L))
+        assertTrue(epochs.observeEpoch(epoch = 6L, latestDeletionGeneration = 1L))
+        assertFalse(epochs.observeDeletionRequest(generation = 1L))
+        assertFalse(epochs.observeEpoch(epoch = 6L, latestDeletionGeneration = 1L))
+    }
+
+    @Test
+    fun `two live clear signals suppress both later epoch acknowledgements`() {
+        val epochs = LearnedDataClearEpochState()
+
+        assertFalse(epochs.observeEpoch(epoch = 5L, latestDeletionGeneration = 0L))
+        assertTrue(epochs.observeDeletionRequest(generation = 1L))
+        assertTrue(epochs.observeDeletionRequest(generation = 2L))
+        assertFalse(epochs.observeEpoch(epoch = 6L, latestDeletionGeneration = 2L))
+        assertFalse(epochs.observeEpoch(epoch = 7L, latestDeletionGeneration = 2L))
+    }
+
+    @Test
+    fun `coalesced epoch delivery acknowledges every already signalled clear`() {
+        val epochs = LearnedDataClearEpochState()
+
+        assertFalse(epochs.observeEpoch(epoch = 5L, latestDeletionGeneration = 0L))
+        assertTrue(epochs.observeDeletionRequest(generation = 1L))
+        assertTrue(epochs.observeDeletionRequest(generation = 2L))
+        assertFalse(epochs.observeEpoch(epoch = 7L, latestDeletionGeneration = 2L))
+        // A later rise without a marker is independent and must still clear.
+        assertTrue(epochs.observeEpoch(epoch = 8L, latestDeletionGeneration = 2L))
+    }
+
+    @Test
+    fun `first old authoritative snapshot does not consume a live clear acknowledgement`() {
+        val epochs = LearnedDataClearEpochState()
+
+        assertTrue(epochs.observeDeletionRequest(generation = 1L))
+        // This is the pre-increment value already in flight when the marker signal arrived.
+        assertFalse(epochs.observeEpoch(epoch = 5L, latestDeletionGeneration = 1L))
+        // The request's eventual increment is an acknowledgement, not a second purge.
+        assertFalse(epochs.observeEpoch(epoch = 6L, latestDeletionGeneration = 1L))
+    }
+
+    @Test
     fun `clear during save makes the old successful result irrelevant`() {
         val state = LearnedDataPersistenceState()
         state.markDirty()

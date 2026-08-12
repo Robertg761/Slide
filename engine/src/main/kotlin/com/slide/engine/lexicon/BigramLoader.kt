@@ -69,12 +69,25 @@ object BigramLoader {
         val contextCount = data.readInt()
         val pairCount = data.readInt()
         val blockLength = data.readInt()
-        if (contextCount <= 0 || pairCount < contextCount || blockLength < pairCount) {
+        if (
+            contextCount !in 1..minOf(wordCount, MAX_CONTEXT_COUNT) ||
+            pairCount !in contextCount..MAX_PAIR_COUNT ||
+            blockLength !in pairCount..minOf(MAX_BLOCK_LENGTH, pairCount * MAX_VARINT_BYTES)
+        ) {
             throw IOException("Header claims $contextCount contexts, $pairCount pairs, $blockLength bytes")
         }
 
         val contexts = IntArray(contextCount)
-        for (i in 0 until contextCount) contexts[i] = data.readInt()
+        for (i in 0 until contextCount) {
+            val context = data.readInt()
+            if (context !in 0 until wordCount) {
+                throw IOException("Context $context is outside the lexicon")
+            }
+            if (i > 0 && context <= contexts[i - 1]) {
+                throw IOException("Contexts are not strictly ordered at index $i")
+            }
+            contexts[i] = context
+        }
 
         val offsets = IntArray(contextCount + 1)
         for (i in 0..contextCount) offsets[i] = data.readInt()
@@ -87,8 +100,10 @@ object BigramLoader {
         // the table once here is the only place that can tell the difference.
         if (offsets[0] != 0) throw IOException("Offsets start at ${offsets[0]}, expected 0")
         for (i in 1..contextCount) {
-            if (offsets[i] < offsets[i - 1]) {
-                throw IOException("Offset $i goes backwards: ${offsets[i - 1]} then ${offsets[i]}")
+            if (offsets[i] <= offsets[i - 1]) {
+                throw IOException(
+                    "Offset $i goes backwards or stalls: ${offsets[i - 1]} then ${offsets[i]}",
+                )
             }
         }
 
@@ -105,11 +120,20 @@ object BigramLoader {
                 while (true) {
                     if (read >= blockLength) throw IOException("Successor block ended early")
                     val byte = block[read++].toInt() and 0xFF
+                    if (shift == 28 && (byte and 0xF8) != 0) {
+                        throw IOException("Successor delta overflows a 32-bit varint")
+                    }
                     delta = delta or ((byte and 0x7F) shl shift)
-                    if (byte < 0x80) break
+                    if (byte < 0x80) {
+                        if (shift > 0 && byte == 0) {
+                            throw IOException("Successor delta uses a non-canonical varint")
+                        }
+                        break
+                    }
                     shift += 7
                     if (shift > 28) throw IOException("Successor delta is not a valid varint")
                 }
+                val prior = previous
                 previous += delta
                 // Negative as well as too large: a varint may run to five bytes, and the fifth
                 // carries the sign bit, so a corrupt one decodes to a negative index that this
@@ -118,12 +142,20 @@ object BigramLoader {
                 if (previous < 0 || previous >= wordCount) {
                     throw IOException("Successor index $previous is outside the lexicon")
                 }
+                if (slot > offsets[context] && previous <= prior) {
+                    throw IOException("Successors are not strictly ordered in context $context")
+                }
                 successors[slot] = previous
             }
+        }
+        if (read != blockLength) {
+            throw IOException("Successor block has ${blockLength - read} unused bytes")
         }
 
         val scores = ByteArray(pairCount)
         data.readFully(scores)
+        if (scores.any { it == 0.toByte() }) throw IOException("Bigram model contains a zero score")
+        if (data.read() != -1) throw IOException("Bigram model has trailing data")
 
         return Bigrams(contexts, offsets, successors, scores)
     }
@@ -159,4 +191,8 @@ object BigramLoader {
 
     private const val BUFFER_SIZE = 1 shl 16
     private const val FINGERPRINT_BUFFER_BYTES = 1 shl 12
+    private const val MAX_CONTEXT_COUNT = 2_000_000
+    private const val MAX_PAIR_COUNT = 10_000_000
+    private const val MAX_BLOCK_LENGTH = 50 * 1024 * 1024
+    private const val MAX_VARINT_BYTES = 5
 }

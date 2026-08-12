@@ -8,6 +8,8 @@ import android.graphics.drawable.GradientDrawable
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
+import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.Checkable
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -212,6 +214,7 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
         val labels = LinearLayout(context).apply {
             orientation = VERTICAL
             gravity = Gravity.CENTER_VERTICAL
+            importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
         }
         labels.addView(primaryLabel(title, 15f), LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         if (description != null) {
@@ -223,16 +226,18 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
 
         val control = Switch(context).apply {
             showText = false
-            contentDescription = title
+            importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
         }
-        val row = LinearLayout(context).apply {
+        val row = AccessibleToggleRow(context, control).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             minimumHeight = dp(if (description == null) 50f else 62f)
             setPadding(dp(8f), dp(4f), dp(4f), dp(4f))
             isClickable = true
             isFocusable = true
-            contentDescription = title
+            descendantFocusability = FOCUS_BLOCK_DESCENDANTS
+            importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
+            contentDescription = if (description == null) title else "$title. $description"
             setOnClickListener { if (control.isEnabled) control.toggle() }
         }
         row.addView(labels, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
@@ -247,6 +252,34 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
             val updated = toggle.update(settings, checked)
             settings = updated
             listener?.onKeyboardSettingsChanged(updated)
+            row.sendAccessibilityEvent(android.view.accessibility.AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)
+        }
+    }
+
+    /**
+     * Makes the full settings row one switch-shaped accessibility target. Its visual labels and
+     * platform Switch remain descendants for layout and touch, but are hidden from accessibility
+     * so TalkBack does not stop on the same setting two or three times.
+     */
+    private class AccessibleToggleRow(
+        context: Context,
+        private val control: Switch,
+    ) : LinearLayout(context), Checkable {
+        override fun isChecked(): Boolean = control.isChecked
+
+        override fun setChecked(checked: Boolean) {
+            control.isChecked = checked
+        }
+
+        override fun toggle() {
+            control.toggle()
+        }
+
+        override fun onInitializeAccessibilityNodeInfo(info: AccessibilityNodeInfo) {
+            super.onInitializeAccessibilityNodeInfo(info)
+            info.className = Switch::class.java.name
+            info.isCheckable = true
+            info.isChecked = isChecked
         }
     }
 

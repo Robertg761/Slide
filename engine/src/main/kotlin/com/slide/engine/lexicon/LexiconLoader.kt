@@ -55,7 +55,11 @@ object LexiconLoader {
         // Front coding shrinks the file but expands on decode, so the character count cannot be
         // derived from the block length; the writer records it for us.
         val charCount = data.readInt()
-        if (wordCount <= 0 || blockLength <= 0 || charCount < wordCount) {
+        if (
+            wordCount !in 1..MAX_WORD_COUNT ||
+            blockLength !in 1..MAX_BLOCK_LENGTH ||
+            charCount !in wordCount..MAX_CHAR_COUNT
+        ) {
             throw IOException("Lexicon header claims $wordCount words, $blockLength bytes, $charCount chars")
         }
 
@@ -104,19 +108,64 @@ object LexiconLoader {
             // Every word is ASCII by construction (see WORD_RE in the build script), so the UTF-8
             // bytes map one-to-one onto chars without a decoder.
             for (i in 0 until suffixLength) {
-                chars[written++] = (block[read + i].toInt() and 0xFF).toChar()
+                val decoded = (block[read + i].toInt() and 0xFF).toChar()
+                if (decoded !in 'a'..'z' && decoded != '\'') {
+                    throw IOException("Entry $index contains invalid byte 0x${decoded.code.toString(16)}")
+                }
+                chars[written++] = decoded
             }
             read += suffixLength
+
+            val currentStart = offsets[index]
+            if (written == currentStart || chars[currentStart] !in 'a'..'z') {
+                throw IOException("Entry $index is not a non-empty lowercase word")
+            }
+            if (
+                index > 0 &&
+                compareWords(chars, offsets[index - 1], currentStart, currentStart, written) >= 0
+            ) {
+                throw IOException("Entry $index is not strictly ordered after entry ${index - 1}")
+            }
         }
         offsets[wordCount] = written
+        if (read != blockLength) {
+            throw IOException("Lexicon word block has ${blockLength - read} unused bytes")
+        }
+        if (written != charCount) {
+            throw IOException("Lexicon decoded $written characters, expected $charCount")
+        }
 
         val frequencies = ByteArray(wordCount)
         data.readFully(frequencies)
         val flags = ByteArray(wordCount)
         data.readFully(flags)
+        for ((index, flag) in flags.withIndex()) {
+            val unknown = (flag.toInt() and 0xFF) and KNOWN_FLAGS.inv()
+            if (unknown != 0) throw IOException("Entry $index has unknown flags 0x${unknown.toString(16)}")
+        }
+        if (data.read() != -1) throw IOException("Lexicon has trailing data")
 
         return Lexicon(chars, offsets, frequencies, flags)
     }
 
+    private fun compareWords(
+        chars: CharArray,
+        leftStart: Int,
+        leftEnd: Int,
+        rightStart: Int,
+        rightEnd: Int,
+    ): Int {
+        val shared = minOf(leftEnd - leftStart, rightEnd - rightStart)
+        for (position in 0 until shared) {
+            val difference = chars[leftStart + position] - chars[rightStart + position]
+            if (difference != 0) return difference
+        }
+        return (leftEnd - leftStart) - (rightEnd - rightStart)
+    }
+
     private const val BUFFER_SIZE = 1 shl 16
+    private const val MAX_WORD_COUNT = 2_000_000
+    private const val MAX_BLOCK_LENGTH = 32 * 1024 * 1024
+    private const val MAX_CHAR_COUNT = 32 * 1024 * 1024
+    private const val KNOWN_FLAGS = 0x07
 }

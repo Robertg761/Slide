@@ -2,11 +2,10 @@
 <!--
   Backup and device-transfer rules for Android 12 and above.
 
-  The learned words and learned pairs are excluded from both. See backup_rules.xml for why; the
-  reasoning applies as much to a transfer to a new phone as to a cloud backup, since neither is a
-  place the user asked their personal vocabulary to go. The legacy settings DataStore is excluded
-  because releases before 0.2.1 stored recent emoji usage there; current releases migrate that
-  history into noBackupFilesDir.
+  Learned words, learned pairs, and device-specific touch calibration are excluded from both. See
+  backup_rules.xml for why. The legacy settings DataStore is excluded because releases before
+  0.2.1 stored recent emoji usage there. Current non-sensitive settings use a separate filename
+  and remain eligible for cloud backup and device transfer.
 
   The update staging directory is excluded from both as well. A staged APK is a few hundred
   megabytes that would swallow the Auto Backup quota whole, and carrying one to a new device would
@@ -18,7 +17,10 @@
         <exclude domain="file" path="learned_words.txt.tmp" />
         <exclude domain="file" path="learned_pairs.txt" />
         <exclude domain="file" path="learned_pairs.txt.tmp" />
+        <exclude domain="file" path="learned_touch_offsets.txt" />
+        <exclude domain="file" path="learned_touch_offsets.txt.tmp" />
         <exclude domain="file" path="datastore/slide_settings.preferences_pb" />
+        <exclude domain="file" path="datastore/slide_settings.preferences_pb.tmp" />
         <exclude domain="file" path="updates/" />
     </cloud-backup>
     <device-transfer>
@@ -26,7 +28,10 @@
         <exclude domain="file" path="learned_words.txt.tmp" />
         <exclude domain="file" path="learned_pairs.txt" />
         <exclude domain="file" path="learned_pairs.txt.tmp" />
+        <exclude domain="file" path="learned_touch_offsets.txt" />
+        <exclude domain="file" path="learned_touch_offsets.txt.tmp" />
         <exclude domain="file" path="datastore/slide_settings.preferences_pb" />
+        <exclude domain="file" path="datastore/slide_settings.preferences_pb.tmp" />
         <exclude domain="file" path="updates/" />
     </device-transfer>
 </data-extraction-rules>

@@ -153,6 +153,46 @@ class LexiconLoaderTest {
         assertTrue(error.message!!, error.message!!.contains("characters"))
     }
 
+    @Test
+    fun `rejects a decoded character count larger than the actual words`() {
+        val corrupt = packedLexicon(WORDS, declaredCharCount = WORDS.sumOf(String::length) + 1)
+
+        val error = assertThrows(IOException::class.java) {
+            LexiconLoader.read(ByteArrayInputStream(corrupt))
+        }
+        assertTrue(error.message!!, error.message!!.contains("decoded"))
+    }
+
+    @Test
+    fun `rejects words that are not strictly sorted`() {
+        val corrupt = packedLexicon(listOf("ant", "bee", "ape"))
+
+        val error = assertThrows(IOException::class.java) {
+            LexiconLoader.read(ByteArrayInputStream(corrupt))
+        }
+        assertTrue(error.message!!, error.message!!.contains("ordered"))
+    }
+
+    @Test
+    fun `rejects characters the asset builder cannot emit`() {
+        val corrupt = packedLexicon(listOf("ant", "bad-word"))
+
+        val error = assertThrows(IOException::class.java) {
+            LexiconLoader.read(ByteArrayInputStream(corrupt))
+        }
+        assertTrue(error.message!!, error.message!!.contains("invalid byte"))
+    }
+
+    @Test
+    fun `rejects trailing data`() {
+        val corrupt = packedLexicon(WORDS) + byteArrayOf(0x42)
+
+        val error = assertThrows(IOException::class.java) {
+            LexiconLoader.read(ByteArrayInputStream(corrupt))
+        }
+        assertTrue(error.message!!, error.message!!.contains("trailing"))
+    }
+
     /** Writes the layout `tools/build_lexicon.py` produces, with room to write it wrongly. */
     private fun packedLexicon(
         words: List<String>,

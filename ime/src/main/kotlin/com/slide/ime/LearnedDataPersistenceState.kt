@@ -107,3 +107,71 @@ internal class LearnedDataPersistenceState {
 
     data class DeletionTicket(val generation: Long)
 }
+
+/** Interprets settings epochs together with the store's durable fail-closed deletion marker. */
+internal class LearnedDataClearEpochState(initialDeletionGeneration: Long = 0L) {
+    private var baseline: Long? = null
+    private var observedDeletionGeneration = initialDeletionGeneration
+    private var pendingEpochAcknowledgements = 0L
+
+    /**
+     * Returns true when live learned state must be purged.
+     *
+     * A negative epoch is the unreadable-settings fallback and is never authoritative. Ordinarily
+     * only a rise above an established baseline denotes a user clear; a lower value is a corruption
+     * reset and simply becomes the new baseline. The durable marker is stronger evidence than the
+     * epoch, however: it covers a clear placed after fallback data loaded but before the first real
+     * settings value arrived, as well as a marker whose epoch publication was interrupted.
+     */
+    fun observeEpoch(epoch: Long, latestDeletionGeneration: Long): Boolean {
+        if (epoch < 0L) return false
+        val previous = baseline
+        baseline = epoch
+
+        // The live signal may be queued behind this settings emission. Claim its generation here
+        // so either arrival order produces exactly one purge. Count every claimed request because
+        // several synchronous marker signals can arrive before DataStore delivers their individual
+        // epoch increments (and DataStore is also free to coalesce those values).
+        val claimedRequests = if (latestDeletionGeneration > observedDeletionGeneration) {
+            val count = latestDeletionGeneration - observedDeletionGeneration
+            observedDeletionGeneration = latestDeletionGeneration
+            pendingEpochAcknowledgements = saturatingAdd(pendingEpochAcknowledgements, count)
+            count
+        } else {
+            0L
+        }
+
+        if (previous == null) {
+            // The first authoritative snapshot may be the old value emitted after a live marker
+            // signal but before its DataStore increment commits. Keep every pending acknowledgement
+            // until positive epoch movement proves it arrived; marker-backed clears always have a
+            // signal, so retaining an acknowledgement cannot hide a real future clear.
+            return claimedRequests > 0L
+        }
+
+        if (epoch < previous) {
+            // Corruption reset or Long.MAX_VALUE wrap: pending signals have already purged memory.
+            // Keep their acknowledgements because this lower value may precede, or itself be, the
+            // persisted epoch for one of those signals; every later real clear has its own signal.
+            return claimedRequests > 0L
+        }
+
+        val epochRises = epoch - previous
+        val acknowledged = minOf(epochRises, pendingEpochAcknowledgements)
+        pendingEpochAcknowledgements -= acknowledged
+        val uncorrelatedEpochRise = epochRises > acknowledged
+        return claimedRequests > 0L || uncorrelatedEpochRise
+    }
+
+    /** Handles the durable-marker signal first and leaves one future epoch rise as its ack. */
+    fun observeDeletionRequest(generation: Long): Boolean {
+        if (generation <= observedDeletionGeneration) return false
+        val count = generation - observedDeletionGeneration
+        observedDeletionGeneration = generation
+        pendingEpochAcknowledgements = saturatingAdd(pendingEpochAcknowledgements, count)
+        return true
+    }
+
+    private fun saturatingAdd(left: Long, right: Long): Long =
+        if (Long.MAX_VALUE - left < right) Long.MAX_VALUE else left + right
+}

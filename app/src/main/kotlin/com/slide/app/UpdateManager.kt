@@ -14,8 +14,10 @@ import androidx.core.content.FileProvider
 import androidx.core.net.toUri
 import androidx.core.content.pm.PackageInfoCompat
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -27,6 +29,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
@@ -38,6 +41,19 @@ data class UpdateInfo(
     val apkUrl: String,
     val apkSha256: String,
     val apkSize: Long,
+)
+
+internal data class ReleaseCandidate(
+    val update: UpdateInfo,
+    val draft: Boolean,
+    val prerelease: Boolean,
+)
+
+internal data class StagedDownloadTarget(
+    val target: File,
+    val partial: File,
+    /** A previously verified download may still back an open Package Installer content URI. */
+    val reuseExisting: Boolean,
 )
 
 /**
@@ -56,12 +72,21 @@ sealed interface InstallOutcome {
     /** A download was already running, so this call did nothing rather than fight it for the file. */
     data object AlreadyRunning : InstallOutcome
 
+    /** The person canceled the in-flight download or left the settings activity. */
+    data object Cancelled : InstallOutcome
+
     /** The download or its checks failed; [message] is what to tell the user. */
     data class Failed(val message: String?) : InstallOutcome
 }
 
 object UpdateManager {
-    private const val RELEASES = "https://api.github.com/repos/Robertg761/Slide/releases?per_page=30"
+    private const val RELEASES = "https://api.github.com/repos/Robertg761/Slide/releases?per_page=100"
+    private const val RELEASES_HOST = "api.github.com"
+    private const val RELEASES_PATH = "/repos/Robertg761/Slide/releases"
+    private const val MAX_RELEASE_PAGES = 20
+    private const val MAX_RELEASE_PAGE_CHARS = 8 * 1024 * 1024
+    private const val MAX_RELEASE_NOTES_CHARS = 16 * 1024
+    private const val MAX_RELEASE_URL_CHARS = 2 * 1024
     private const val TAG = "SlideUpdates"
 
     /** Leave enough room for the download plus Package Installer's separate staging copy. */
@@ -73,11 +98,11 @@ object UpdateManager {
     /**
      * One download at a time, process-wide.
      *
-     * Every download of a given release writes the same `.part` path and wipes the same staging
-     * directory first. A second entry — which a recreated activity produces for free — therefore
-     * does not merely waste bandwidth: it deletes the first download's partial file mid-write and
-     * both then fail on byte counts that have nothing to do with the release. Refusing the second
-     * caller is also what makes the directory wipe safe, because nothing else can own a `.part`.
+     * Every download of a given release writes the same `.part` path. A second entry — which a
+     * recreated activity produces for free — therefore does not merely waste bandwidth: it can
+     * delete the first download's partial file mid-write and both then fail on byte counts that
+     * have nothing to do with the release. Refusing the second caller makes partial cleanup safe;
+     * completed APKs may still be owned by Package Installer and are preserved separately.
      */
     private val downloadInProgress = MutableStateFlow(false)
 
@@ -106,6 +131,9 @@ object UpdateManager {
      * it. [SupervisorJob] keeps one failed install from taking the scope down with it.
      */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val installJobLock = Any()
+    private var activeInstallJob: Job? = null
+    private var activeInstallCancellable = false
 
     private val lastOutcome = MutableStateFlow<InstallOutcome?>(null)
 
@@ -130,22 +158,66 @@ object UpdateManager {
             lastOutcome.value = InstallOutcome.AlreadyRunning
             return
         }
-        scope.launch {
-            try {
-                lastOutcome.value = try {
-                    downloadAndInstall(appContext, update)
-                } catch (t: Throwable) {
-                    // Throwable, not Exception: reading signing certificates out of a large APK is
-                    // an OutOfMemoryError away from failing, and that has to reach the user as a
-                    // failed update rather than as a dead process.
-                    if (t is CancellationException) throw t
-                    Log.w(TAG, "Update install failed", t)
-                    InstallOutcome.Failed(t.message)
-                }
-            } finally {
-                endDownload()
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            lastOutcome.value = try {
+                downloadAndInstall(appContext, update)
+            } catch (t: Throwable) {
+                // Throwable, not Exception: reading signing certificates out of a large APK is
+                // an OutOfMemoryError away from failing, and that has to reach the user as a
+                // failed update rather than as a dead process.
+                if (t is CancellationException) throw t
+                Log.w(TAG, "Update install failed", t)
+                InstallOutcome.Failed(t.message)
             }
         }
+        check(registerInstallJob(job)) { "download slot was claimed without an install job" }
+        job.start()
+    }
+
+    /**
+     * Cancels only the user-started install, never a short staging sweep.
+     *
+     * The job survives configuration changes, but [MainActivity] calls this when it actually
+     * leaves the foreground. The download loop observes cancellation before every read and, most
+     * importantly, immediately before launching Package Installer.
+     */
+    fun cancelInstall(): Boolean {
+        val job = synchronized(installJobLock) {
+            if (!activeInstallCancellable) return false
+            activeInstallCancellable = false
+            activeInstallJob
+        } ?: return false
+        job.cancel(CancellationException("Update canceled by user"))
+        return true
+    }
+
+    /** Stops lifecycle cancellation once Slide intentionally hands control to a system activity. */
+    internal fun markExternalHandoff(): Boolean = synchronized(installJobLock) {
+        // This transition races cancelInstall(). Exactly one must win: after cancellation has
+        // claimed the phase, a still-registered but cancelling Job must never launch an activity.
+        if (activeInstallJob == null || !activeInstallCancellable) return false
+        activeInstallCancellable = false
+        true
+    }
+
+    /** Registers completion cleanup before a lazy job can start or be canceled. */
+    internal fun registerInstallJob(job: Job): Boolean {
+        synchronized(installJobLock) {
+            if (activeInstallJob != null) return false
+            activeInstallJob = job
+            activeInstallCancellable = true
+        }
+        job.invokeOnCompletion { cause ->
+            synchronized(installJobLock) {
+                if (activeInstallJob === job) {
+                    activeInstallJob = null
+                    activeInstallCancellable = false
+                }
+            }
+            if (cause is CancellationException) lastOutcome.value = InstallOutcome.Cancelled
+            endDownload()
+        }
+        return true
     }
 
     /**
@@ -231,31 +303,138 @@ object UpdateManager {
         // the path a user takes far more often than they take an install to completion.
         sweepStagedUpdatesNow(context)
         val current = context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: return@withContext null
-        val connection = (URL(RELEASES).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 10_000; readTimeout = 15_000
-            setRequestProperty("Accept", "application/vnd.github+json")
-            setRequestProperty("User-Agent", "Slide-Android")
-        }
-        val json = try {
-            val status = connection.responseCode
-            if (status != HttpURLConnection.HTTP_OK) {
-                throw IOException("GitHub returned HTTP $status while checking for updates")
+        var bestCandidate: UpdateInfo? = null
+        val seenPages = mutableSetOf<String>()
+        var pageUrl: URL? = URL(RELEASES)
+        while (pageUrl != null) {
+            currentCoroutineContext().ensureActive()
+            requireReleasePageAvailable(seenPages.size)
+            if (!seenPages.add(pageUrl.toExternalForm())) {
+                throw IOException("GitHub returned a release-pagination loop")
             }
-            connection.inputStream.bufferedReader().use { it.readText() }
-        } finally {
-            connection.disconnect()
+            val connection = (pageUrl.openConnection() as HttpURLConnection).apply {
+                connectTimeout = 10_000; readTimeout = 15_000
+                setRequestProperty("Accept", "application/vnd.github+json")
+                setRequestProperty("User-Agent", "Slide-Android")
+            }
+            try {
+                val status = connection.responseCode
+                if (status != HttpURLConnection.HTTP_OK) {
+                    throw IOException("GitHub returned HTTP $status while checking for updates")
+                }
+                bestCandidate = selectReleasePage(
+                    currentVersion = current,
+                    includePrereleases = includePrereleases,
+                    previousBest = bestCandidate,
+                    candidates = parseReleaseCandidates(
+                        readBoundedReleasePage(
+                            input = connection.inputStream,
+                            contentLength = connection.contentLengthLong,
+                        ),
+                    ),
+                )
+                currentCoroutineContext().ensureActive()
+                pageUrl = nextReleasePage(connection.getHeaderField("Link"))
+            } finally {
+                connection.disconnect()
+            }
         }
+        bestCandidate
+    }
+
+    /** Reads one API page with cancellation points and a hard memory bound. */
+    internal suspend fun readBoundedReleasePage(
+        input: InputStream,
+        contentLength: Long,
+        maxChars: Int = MAX_RELEASE_PAGE_CHARS,
+    ): String {
+        require(maxChars > 0) { "release page limit must be positive" }
+        if (contentLength > maxChars) {
+            throw IOException("GitHub's release page was unexpectedly large")
+        }
+        return input.bufferedReader().use { reader ->
+            val body = StringBuilder()
+            val buffer = CharArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                val count = reader.read(buffer)
+                if (count < 0) break
+                if (count > maxChars - body.length) {
+                    throw IOException("GitHub's release page was unexpectedly large")
+                }
+                body.append(buffer, 0, count)
+            }
+            body.toString()
+        }
+    }
+
+    /** Fail visibly instead of declaring the app current from a truncated release set. */
+    internal fun requireReleasePageAvailable(alreadyFetched: Int) {
+        if (alreadyFetched >= MAX_RELEASE_PAGES) {
+            throw IOException("GitHub returned too many release pages")
+        }
+    }
+
+    /**
+     * Returns GitHub's next releases page, refusing to follow a pagination link off the expected
+     * HTTPS API endpoint. Stable releases can otherwise disappear behind an arbitrary number of
+     * newer prereleases, because filtering happens locally rather than on GitHub.
+     */
+    internal fun nextReleasePage(linkHeader: String?): URL? {
+        val nextEntry = linkHeader
+            ?.split(',')
+            ?.firstOrNull { entry ->
+                entry.substringAfter('>', missingDelimiterValue = "")
+                    .split(';')
+                    .any { it.trim() == "rel=\"next\"" }
+            }
+            ?: return null
+        val rawUrl = nextEntry.substringAfter('<', missingDelimiterValue = "")
+            .substringBefore('>', missingDelimiterValue = "")
+        val next = runCatching { URL(rawUrl) }
+            .getOrElse { throw IOException("GitHub returned a malformed release-pagination link", it) }
+        if (next.protocol != "https" || next.host != RELEASES_HOST || next.path != RELEASES_PATH) {
+            throw IOException("GitHub returned an unexpected release-pagination endpoint")
+        }
+        return next
+    }
+
+    internal fun selectReleaseCandidates(
+        currentVersion: String,
+        includePrereleases: Boolean,
+        pages: Iterable<List<ReleaseCandidate>>,
+    ): UpdateInfo? = pages.fold(null) { best, page ->
+        selectReleasePage(currentVersion, includePrereleases, best, page)
+    }
+
+    /** Reduces each response page immediately so notes from earlier pages cannot accumulate. */
+    internal fun selectReleasePage(
+        currentVersion: String,
+        includePrereleases: Boolean,
+        previousBest: UpdateInfo?,
+        candidates: List<ReleaseCandidate>,
+    ): UpdateInfo? {
+        if (!isValidSemVer(currentVersion)) return null
+        return sequenceOf(previousBest)
+            .filterNotNull()
+            .plus(
+                candidates.asSequence()
+                    .filterNot { it.draft }
+                    .filter { includePrereleases || !it.prerelease }
+                    .map { it.update },
+            )
+            .filter { isValidSemVer(it.version) && compare(it.version, currentVersion) > 0 }
+            .maxWithOrNull { left, right -> compare(left.version, right.version) }
+    }
+
+    private fun parseReleaseCandidates(json: String): List<ReleaseCandidate> =
         JSONArray(json).let { releases ->
             (0 until releases.length()).mapNotNull { i -> releases.getJSONObject(i) }
                 .mapNotNull { release ->
-                    if (release.optBoolean("draft")) return@mapNotNull null
-                    val version = release.getString("tag_name").removePrefix("v")
+                    val rawTag = release.getString("tag_name")
+                    if (rawTag.length > 128) return@mapNotNull null
+                    val version = rawTag.removePrefix("v")
                     if (!isValidSemVer(version)) return@mapNotNull null
-                    if (!includePrereleases &&
-                        (release.optBoolean("prerelease") || isPrerelease(version))
-                    ) {
-                        return@mapNotNull null
-                    }
                     val asset = release.getJSONArray("assets").let { assets ->
                         (0 until assets.length()).map { assets.getJSONObject(it) }
                             .firstOrNull { it.getString("name") == "Slide-$version.apk" }
@@ -264,28 +443,39 @@ object UpdateManager {
                     if (!digest.matches(Regex("[0-9a-f]{64}"))) return@mapNotNull null
                     val size = asset.optLong("size", -1L)
                     if (size <= 0) return@mapNotNull null
-                    UpdateInfo(
-                        version = version,
-                        notes = release.optString("body"),
-                        apkUrl = asset.getString("browser_download_url"),
-                        apkSha256 = digest,
-                        apkSize = size,
+                    val apkUrl = asset.getString("browser_download_url")
+                    if (apkUrl.length > MAX_RELEASE_URL_CHARS || !apkUrl.startsWith("https://")) {
+                        return@mapNotNull null
+                    }
+                    ReleaseCandidate(
+                        update = UpdateInfo(
+                            version = version,
+                            notes = boundReleaseNotes(release.optString("body")),
+                            apkUrl = apkUrl,
+                            apkSha256 = digest,
+                            apkSize = size,
+                        ),
+                        draft = release.optBoolean("draft"),
+                        prerelease = release.optBoolean("prerelease") || isPrerelease(version),
                     )
                 }
-                .let { newest(current, it) }
         }
-    }
 
     /** The body of [install]: runs under the single-flight slot its caller claimed. */
     private suspend fun downloadAndInstall(context: Context, update: UpdateInfo): InstallOutcome {
         check(downloadInProgress.value) { "downloadAndInstall() must hold the single-flight slot" }
         if (!context.packageManager.canRequestPackageInstalls()) {
+            if (!markExternalHandoff()) {
+                currentCoroutineContext().ensureActive()
+                error("permission handoff lost its tracked install job")
+            }
             context.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, "package:${context.packageName}".toUri()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
             return InstallOutcome.NeedsPermission
         }
         require(update.apkUrl.startsWith("https://")) { "Update URL is not HTTPS" }
 
-        val target = download(context, update)
+        val staged = download(context, update)
+        val target = staged.target
         try {
             verify(context, target, update.version)
 
@@ -295,6 +485,10 @@ object UpdateManager {
             currentCoroutineContext().ensureActive()
 
             val uri: Uri = FileProvider.getUriForFile(context, "${context.packageName}.files", target)
+            if (!markExternalHandoff()) {
+                currentCoroutineContext().ensureActive()
+                error("installer handoff lost its tracked install job")
+            }
             context.startActivity(Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(uri, "application/vnd.android.package-archive")
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -304,7 +498,7 @@ object UpdateManager {
             // user a few hundred permanent megabytes. A file that failed its checks must go for a
             // second reason — the next attempt would otherwise be judged on the same bad bytes, and
             // the whole point of retrying is to get different ones.
-            target.delete()
+            if (!staged.reuseExisting) target.delete()
             throw t
         }
         // Deliberately not deleted here: the installer opens the content URI only after the user
@@ -326,30 +520,41 @@ object UpdateManager {
      * can be deleted between handing it to the package installer and the user confirming the
      * install, on exactly the low-storage devices where that check mattered.
      */
-    private suspend fun download(context: Context, update: UpdateInfo): File {
+    private suspend fun download(context: Context, update: UpdateInfo): StagedDownloadTarget {
         require(update.apkSize > 0) { "Update size is missing" }
         check(downloadInProgress.value) { "download() must hold the single-flight guard" }
-        val directory = stagingDirectory(context).apply { mkdirs() }
-        // Only the download in progress belongs here, and the single-flight guard is what makes
-        // this safe: no other caller can own a `.part` file for this wipe to destroy mid-write.
-        directory.listFiles()?.forEach { it.delete() }
-
-        val target = File(directory, "Slide-${update.version}.apk")
-        val partial = File(directory, "Slide-${update.version}.apk.part")
+        val installedVersion = runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull()
+        val staged = prepareDownloadTarget(
+            directory = stagingDirectory(context),
+            update = update,
+            installedVersion = installedVersion,
+        )
+        if (staged.reuseExisting) return staged
+        val directory = staged.target.parentFile ?: throw IOException("Update staging has no parent")
+        val target = staged.target
+        val partial = staged.partial
 
         val storage = context.getSystemService(StorageManager::class.java)
-        val allocatableBytes = runCatching {
-            storage.getAllocatableBytes(StorageManager.UUID_DEFAULT)
-        }.getOrElse { directory.usableSpace }
-        if (allocatableBytes < requiredFreeBytes(update.apkSize)) {
+        // filesDir can live on adopted storage. Resolve the staging path's actual volume instead
+        // of querying/allocating internal storage while writing somewhere else.
+        val storageUuid = runCatching { storage.getUuidForPath(directory) }.getOrNull()
+        val requiredBytes = requiredFreeBytes(update.apkSize)
+        val allocatableBytes = storageUuid?.let { uuid ->
+            runCatching { storage.getAllocatableBytes(uuid) }.getOrNull()
+        } ?: directory.usableSpace
+        if (allocatableBytes < requiredBytes) {
             throw IOException(
                 "Not enough free space: downloading and staging this update needs about " +
-                    "${requiredFreeBytes(update.apkSize) / (1024 * 1024)} MB free",
+                    "${requiredBytes / (1024 * 1024)} MB free",
             )
         }
         // Best effort: ask the platform to actually make the space it just said it could, so the
         // download is not racing other apps for it. A refusal here is not a reason to stop trying.
-        runCatching { storage.allocateBytes(StorageManager.UUID_DEFAULT, update.apkSize) }
+        storageUuid?.let { uuid ->
+            runCatching { storage.allocateBytes(uuid, requiredBytes) }
+        }
 
         val connection = (URL(update.apkUrl).openConnection() as HttpURLConnection).apply {
             connectTimeout = 15_000; readTimeout = 60_000; instanceFollowRedirects = true
@@ -408,12 +613,69 @@ object UpdateManager {
             connection.disconnect()
         }
 
-        target.delete()
+        if (target.exists()) {
+            partial.delete()
+            throw IOException("A staged update became busy before the download completed")
+        }
         if (!partial.renameTo(target)) {
             partial.delete()
             throw IOException("Could not move the downloaded update into place")
         }
-        return target
+        return staged
+    }
+
+    /**
+     * Preserves completed APKs that may still back Package Installer, while reclaiming files that
+     * are provably stale. An identical target is reused and its grace period refreshed; a different
+     * fresh target is never overwritten because an earlier installer may still hold its URI.
+     */
+    internal fun prepareDownloadTarget(
+        directory: File,
+        update: UpdateInfo,
+        installedVersion: String?,
+        nowMillis: Long = System.currentTimeMillis(),
+    ): StagedDownloadTarget {
+        require(update.apkSize > 0) { "Update size is missing" }
+        require(isValidSemVer(update.version)) { "Update version is invalid" }
+        if (!directory.exists() && !directory.mkdirs()) {
+            throw IOException("Could not create update staging directory")
+        }
+        if (!directory.isDirectory) throw IOException("Update staging path is not a directory")
+
+        val target = File(directory, "Slide-${update.version}.apk")
+        val partial = File(directory, "Slide-${update.version}.apk.part")
+        directory.listFiles()?.forEach { file ->
+            if (isStagedFileStale(file.name, file.lastModified(), nowMillis, installedVersion) &&
+                file.exists() && !file.delete()
+            ) {
+                throw IOException("Could not remove stale update ${file.name}")
+            }
+        }
+
+        if (!target.exists()) {
+            return StagedDownloadTarget(target, partial, reuseExisting = false)
+        }
+        if (!stagedApkMatches(target, update.apkSize, update.apkSha256)) {
+            throw IOException("A recent staged update is still in use; retry later")
+        }
+        if (!target.setLastModified(nowMillis)) {
+            throw IOException("Could not refresh the staged update's installer grace period")
+        }
+        return StagedDownloadTarget(target, partial, reuseExisting = true)
+    }
+
+    private fun stagedApkMatches(file: File, expectedSize: Long, expectedSha256: String): Boolean {
+        if (file.length() != expectedSize || !looksLikeZip(file)) return false
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().toHex() == expectedSha256
     }
 
     /** Every APK is a zip, and an error page served in its place is the thing this catches. */
@@ -479,14 +741,26 @@ object UpdateManager {
     @RequiresApi(Build.VERSION_CODES.P)
     private fun requireSameSigner(pm: PackageManager, packageName: String, candidate: PackageInfo) {
         val installed = packageInfo(pm, packageName, PackageManager.GET_SIGNING_CERTIFICATES)
-        val candidateSigners = candidate.signingInfo?.apkContentsSigners?.map { it.toCharsString() }?.toSet()
-        val installedSigners = installed.signingInfo?.apkContentsSigners?.map { it.toCharsString() }?.toSet()
-        if (candidateSigners == null || installedSigners == null) {
+        val candidateHistory = candidate.signingInfo?.signingCertificateHistory
+            ?.map { it.toCharsString() }
+            ?.toSet()
+        val installedSigners = installed.signingInfo?.apkContentsSigners
+            ?.map { it.toCharsString() }
+            ?.toSet()
+        if (candidateHistory == null || installedSigners == null) {
             Log.w(TAG, "Signing certificates unreadable; leaving the signature check to Android")
             return
         }
-        require(candidateSigners == installedSigners) { "Downloaded APK is not signed by Slide's release key" }
+        require(signerLineageAccepts(installedSigners, candidateHistory)) {
+            "Downloaded APK is not signed by Slide's release key"
+        }
     }
+
+    /** Android accepts a proof-of-rotation update when its history contains every current signer. */
+    internal fun signerLineageAccepts(
+        installedSigners: Set<String>,
+        candidateHistory: Set<String>,
+    ): Boolean = installedSigners.isNotEmpty() && candidateHistory.containsAll(installedSigners)
 
     /**
      * [PackageManager.getPackageArchiveInfo] across API levels.
@@ -549,6 +823,24 @@ object UpdateManager {
         Long.MAX_VALUE
     }
 
+    /** Keeps update UI and saved instance state far below Android's Binder transaction limit. */
+    internal fun boundReleaseNotes(
+        notes: String,
+        maxChars: Int = MAX_RELEASE_NOTES_CHARS,
+    ): String {
+        require(maxChars > 0) { "release notes limit must be positive" }
+        if (notes.length <= maxChars) return notes
+        var end = maxChars
+        if (
+            Character.isHighSurrogate(notes[end - 1]) &&
+            end < notes.length &&
+            Character.isLowSurrogate(notes[end])
+        ) {
+            end--
+        }
+        return notes.substring(0, end)
+    }
+
     private fun ByteArray.toHex(): String = joinToString(separator = "") { byte ->
         "%02x".format(byte.toInt() and 0xff)
     }
@@ -596,6 +888,7 @@ object UpdateManager {
             )
 
             fun parse(raw: String): SemVer? {
+                if (raw.length > 128) return null
                 val match = pattern.matchEntire(raw.removePrefix("v")) ?: return null
                 val prerelease = match.groupValues[4]
                     .takeIf(String::isNotEmpty)

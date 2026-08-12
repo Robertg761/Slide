@@ -24,8 +24,8 @@ always enforces the installed app's signing identity.
 
 Typing, themes, and gesture decoding were verified on a Galaxy S24 Ultra (Android 16). The native
 Base Whisper model also loaded and transcribed an 11-second fixture on that phone in a prior
-benchmark (about 100 ms load and 1.7 seconds decode). The 0.3.0 app packaging, neural swipe model,
-and complete microphone-to-editor flow have not yet been rerun on physical hardware.
+benchmark (about 100 ms load and 1.7 seconds decode). The current 0.3.2 packaging and fixes, neural
+swipe model, and complete microphone-to-editor flow have not yet been rerun on physical hardware.
 
 **Working**
 - QWERTY typing with multi-touch rollover and slide-off correction
@@ -137,46 +137,37 @@ tools/vendor_whisper.sh
 The pinned commit lives in `tools/vendor_whisper.sh`; the vendored copy records what it was
 built from in `third_party/whisper.cpp/VENDORED_COMMIT`.
 
-**The lexicon** is generated from the AOSP wordlist and committed, so it needs no network. To
-regenerate it:
+**Generated language data** is committed, but every input is locked by byte length and SHA-256 in
+`tools/language_sources.json`. Unicode is fixed at 17.0; CLDR and the LineageOS copy of AOSP
+LatinIME are fixed at full Git commits. Neither `latest`, `main`, nor a mutable branch is accepted.
+
+The lexicon comes from that locked AOSP wordlist. The context models let autocorrect read the
+sentence rather than guess from spelling — "at ocne" reaches "once" because the corpus knows what
+follows "at". They use the locked 2026-08-08 Tatoeba English snapshot and are keyed by lexicon
+index, so the lexicon, bigrams, trigrams, and held-out evaluation sample rebuild as one unit. A
+tenth of the corpus is held back by sentence id and never trains the model.
+
+Tatoeba publishes its per-language export at a moving URL. Slide therefore preserves the exact
+authenticated compressed snapshot under `third_party/language-data`; the URL is only an origin
+record and refresh hint. The recorded size and SHA-256 remain authoritative, and a newer export is
+never silently substituted.
+
+The emoji catalogue uses the locked Unicode file and CLDR English annotations. Missing, malformed,
+or wrong-revision annotations abort the build rather than silently producing name-only search.
+
+To download the locked inputs and prove all five committed outputs reproduce byte-for-byte:
 
 ```bash
-curl -sL -o /tmp/aosp_en.gz https://raw.githubusercontent.com/LineageOS/android_packages_inputmethods_LatinIME/lineage-21.0/dictionaries/en_wordlist.combined.gz
-gunzip -c /tmp/aosp_en.gz > /tmp/aosp_en.txt
-python3 tools/build_lexicon.py /tmp/aosp_en.txt engine/src/main/assets/lexicon_en.bin
-./gradlew :engine:testDebugUnitTest
+python3 tools/fetch_language_sources.py --output-dir /tmp/slide-language-sources
+python3 tools/rebuild_language_assets.py \
+    --sources-dir /tmp/slide-language-sources --check
+python3 tools/test_language_sources.py
+./gradlew :core:testDebugUnitTest :engine:testDebugUnitTest
 ```
 
-**The context models** let autocorrect read the sentence rather than guess from spelling —
-"at ocne" reaches "once" because the corpus knows what follows "at". They are generated from
-Tatoeba's English sentence export and committed alongside the lexicon, which they are keyed
-against by index, so they must be rebuilt whenever the lexicon is:
-
-```bash
-curl -sL -o /tmp/tatoeba.tsv.bz2 https://downloads.tatoeba.org/exports/per_language/eng/eng_sentences.tsv.bz2
-bunzip2 -kf /tmp/tatoeba.tsv.bz2
-python3 tools/build_bigrams.py /tmp/tatoeba.tsv \
-    engine/src/main/assets/lexicon_en.bin \
-    engine/src/main/assets/bigrams_en.bin \
-    engine/src/test/resources/heldout_en.txt \
-    engine/src/main/assets/trigrams_en.bin
-./gradlew :engine:testDebugUnitTest
-```
-
-A tenth of the corpus is held back by sentence id and written to `heldout_en.txt`, which the model
-is never trained on. `ContextualCorrectionTest` measures against those sentences, so the numbers it
-reports are not the model marking its own homework.
-
-**The emoji catalogue** is generated from Unicode's `emoji-test.txt` and CLDR's English
-annotations, and is likewise committed. The script downloads its own sources:
-
-```bash
-python3 tools/build_emoji.py
-./gradlew :core:testDebugUnitTest
-```
-
-Rebuilding it against a newer Unicode release is how new emoji arrive. Nothing else needs to
-change: the panel filters out whatever the device's font cannot draw.
+Use `--write` instead of `--check` only when intentionally replacing all generated outputs. See
+[`docs/data-provenance.md`](docs/data-provenance.md) for the exact revisions, hashes, and refresh
+procedure. New Unicode emoji still depend on the device font; unsupported glyphs are filtered out.
 
 ## Building
 
@@ -186,14 +177,17 @@ manager.
 
 ```bash
 export JAVA_HOME=/usr/lib/jvm/temurin-17-jdk
-tools/fetch_model.sh base.en-q5_1
+tools/prepare_assets.sh
 ./gradlew :app:assembleDebug
 ```
 
 Gradle transitive versions are locked per module and downloaded artifacts are authenticated by
 `gradle/verification-metadata.xml`. A dependency update must regenerate and review both controls;
 see `docs/repository-governance.md`. Pull requests and `main` run JVM tests, release lint, an
-unsigned R8 build, and the same model/package/ABI assertions used by releases.
+unsigned R8 build, final model/package/native-provenance assertions, and packaged-runtime tests on
+Android API 26 and API 37 emulators. Tagged releases additionally compare the reviewed APK with an
+independent Git source-export rebuild. Signed releases carry a SHA-256 file, CycloneDX SBOM, R8
+mapping, native symbols, and GitHub build-provenance and SBOM attestations.
 
 Release APKs package `libslide_asr.so` for `armeabi-v7a`, `arm64-v8a`, `x86`, and `x86_64`, matching
 the app's Android 8 minimum rather than silently excluding supported devices.
@@ -209,20 +203,22 @@ it from the input-method switcher.
 
 ### Instrumented tests
 
-The speech tests need a connected device, since they load and run the real model:
+The speech and neural swipe tests need a device because they load and execute the packaged models:
 
 ```bash
-./gradlew :asr:connectedDebugAndroidTest
+./gradlew :asr:connectedDebugAndroidTest :engine:connectedDebugAndroidTest
 ```
 
 `measuresEveryModel` prints load time, decode time, and speed relative to realtime for the packaged
-Base model. Instrumented tests are not run by ordinary CI and were not run in this hardening pass.
+Base model. CI and release workflows run both suites on isolated API 26 and API 37 emulators through
+`tools/run_android_instrumentation.sh`; emulator coverage is still not physical-device signoff.
 
 ## Privacy
 
 Nothing leaves the device during typing: speech is recognised locally, and audio is held in memory
 only for as long as it takes to transcribe. If the user enables update checks, Slide contacts the
-public GitHub Releases API when settings opens and when **Check now** is tapped. Password, email,
+public GitHub Releases API when settings opens with checks enabled, when checks are enabled or the
+prerelease preference changes, and when **Check now** is tapped. Password, email,
 URL, no-suggestions, and incognito fields are
 excluded from learning. A manual Incognito mode in Slide's settings stops learning in every app
 without hiding ordinary language suggestions.
@@ -236,7 +232,9 @@ not leave the phone just because the phone was backed up. Hold a word in the sug
 teach it or to take it back, or use **Clear learned data** in settings to remove learned words,
 phrases, and per-key touch calibration from both the running keyboard and storage.
 Recent emoji usage is stored under Android's no-backup directory and is not included in cloud
-backup or device transfer.
+backup or device transfer. Per-key touch calibration and its temporary files are also excluded;
+ordinary keyboard preferences use Android backup and device transfer so a new device keeps the
+chosen layout and appearance without receiving the old device's personalised touch model.
 
 ## Licence and provenance
 

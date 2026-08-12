@@ -1,10 +1,18 @@
 package com.slide.core.settings
 
+import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.emptyPreferences
+import androidx.datastore.preferences.core.longPreferencesKey
+import androidx.datastore.preferences.core.mutablePreferencesOf
+import androidx.datastore.preferences.core.stringPreferencesKey
 import java.io.IOException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
@@ -42,6 +50,142 @@ class KeyboardSettingsTest {
 
         assertFalse(settings.incognitoModeEnabled)
         assertEquals(0L, settings.learnedDataClearEpoch)
+    }
+
+    @Test
+    fun `legacy migration copies settings but never recent emoji or unknown private data`() {
+        val theme = stringPreferencesKey("theme_id")
+        val epoch = longPreferencesKey("learned_data_clear_epoch")
+        val recentEmoji = stringPreferencesKey("recent_emoji")
+        val unknownUsage = stringPreferencesKey("future_usage_history")
+        val legacy = mutablePreferencesOf(
+            theme to "midnight",
+            epoch to 9L,
+            recentEmoji to "🙂\u001F❤️",
+            unknownUsage to "private",
+        )
+
+        val migrated = migrateLegacySettings(legacy, emptyPreferences())
+
+        assertEquals("midnight", migrated[theme])
+        assertEquals(9L, migrated[epoch])
+        assertEquals(null, migrated[recentEmoji])
+        assertEquals(null, migrated[unknownUsage])
+        assertEquals(
+            true,
+            migrated[booleanPreferencesKey("legacy_settings_migration_complete")],
+        )
+    }
+
+    @Test
+    fun `legacy migration never overwrites a setting already written to the new store`() {
+        val theme = stringPreferencesKey("theme_id")
+        val legacy = mutablePreferencesOf(theme to "legacy")
+        val current = mutablePreferencesOf(theme to "current")
+
+        val migrated = migrateLegacySettings(legacy, current)
+
+        assertEquals("current", migrated[theme])
+    }
+
+    @Test
+    fun `legacy migration skips an allowlisted name stored under the wrong type`() {
+        val malformedTheme = booleanPreferencesKey("theme_id")
+        val canonicalTheme = stringPreferencesKey("theme_id")
+        val malformedEpoch = stringPreferencesKey("learned_data_clear_epoch")
+        val canonicalEpoch = longPreferencesKey("learned_data_clear_epoch")
+        val legacy = mutablePreferencesOf(
+            malformedTheme to true,
+            malformedEpoch to "nine",
+        )
+
+        val migrated = migrateLegacySettings(legacy, emptyPreferences())
+
+        assertEquals(null, migrated[canonicalTheme])
+        assertEquals(null, migrated[canonicalEpoch])
+    }
+
+    @Test
+    fun `corruption reset cannot reimport the stale pre-upgrade settings snapshot`() {
+        val theme = stringPreferencesKey("theme_id")
+        val incognito = booleanPreferencesKey("incognito_mode_enabled")
+        val recentEmoji = stringPreferencesKey("recent_emoji")
+        val unknownUsage = stringPreferencesKey("future_usage_history")
+        val legacy = mutablePreferencesOf(
+            theme to "legacy",
+            incognito to false,
+            recentEmoji to "🙂\u001F❤️",
+            unknownUsage to "private",
+        )
+
+        val firstMigration = migrateLegacySettings(legacy, emptyPreferences())
+        val cleanedLegacy = removeMigratedLegacySettings(legacy)
+        // Model the new DataStore's corruption handler replacing its contents with empty prefs.
+        val afterCorruption = migrateLegacySettings(cleanedLegacy, emptyPreferences())
+
+        assertEquals("legacy", firstMigration[theme])
+        assertEquals(false, firstMigration[incognito])
+        assertEquals(null, cleanedLegacy[theme])
+        assertEquals(null, cleanedLegacy[incognito])
+        assertEquals("🙂\u001F❤️", cleanedLegacy[recentEmoji])
+        assertEquals("private", cleanedLegacy[unknownUsage])
+        assertEquals(null, afterCorruption[theme])
+        assertEquals(null, afterCorruption[incognito])
+        assertEquals(true, afterCorruption[booleanPreferencesKey("legacy_settings_migration_complete")])
+    }
+
+    @Test
+    fun `restart retries legacy scrub after migration output committed before cleanup`() {
+        val theme = stringPreferencesKey("theme_id")
+        val legacy = mutablePreferencesOf(theme to "legacy")
+        val current = migrateLegacySettings(legacy, emptyPreferences()).toMutablePreferences().apply {
+            this[theme] = "newer"
+        }.toPreferences()
+
+        // Model a process death after DataStore committed migrate(), but before cleanUp().
+        assertTrue(legacySettingsMigrationRequired(legacy, current))
+        val retried = migrateLegacySettings(legacy, current)
+        assertEquals("newer", retried[theme])
+
+        val cleaned = removeMigratedLegacySettings(legacy)
+        assertFalse(legacySettingsMigrationRequired(cleaned, retried))
+    }
+
+    @Test
+    fun `clear waits for an in-flight recent emoji migration and wins`() = runBlocking {
+        val gate = RecentEmojiMigrationGate()
+        var legacyHistory: String? = "🙂"
+        var privateHistory: String? = null
+        val legacyRead = CompletableDeferred<Unit>()
+        val continueMigration = CompletableDeferred<Unit>()
+
+        val migration = async {
+            gate.migrate {
+                val captured = legacyHistory
+                legacyRead.complete(Unit)
+                continueMigration.await()
+                if (privateHistory == null) privateHistory = captured
+                legacyHistory = null
+                true
+            }
+        }
+        legacyRead.await()
+
+        val clear = async {
+            gate.clear {
+                legacyHistory = null
+                privateHistory = null
+            }
+        }
+        yield()
+        assertFalse("clear must wait for the migration transaction", clear.isCompleted)
+
+        continueMigration.complete(Unit)
+        migration.await()
+        clear.await()
+
+        assertEquals(null, legacyHistory)
+        assertEquals(null, privateHistory)
     }
 
     // region Surviving preference read failures

@@ -45,9 +45,158 @@ class PointerOwnershipTest {
     }
 
     @Test
+    fun `a pointer cancelled in padding cannot inherit another fingers preview`() {
+        assertFalse(
+            PointerOwnership.mayInheritPreview(
+                isGesturePointer = false,
+                cancelled = true,
+                isCharacter = true,
+                longPressFired = false,
+                cursorMove = false,
+                deleteWordGesture = false,
+            ),
+        )
+        assertTrue(
+            PointerOwnership.mayInheritPreview(
+                isGesturePointer = false,
+                cancelled = false,
+                isCharacter = true,
+                longPressFired = false,
+                cursorMove = false,
+                deleteWordGesture = false,
+            ),
+        )
+    }
+
+    @Test
     fun `contacts during a swipe are not key presses`() {
         assertTrue(PointerOwnership.ignoresKeyDown(gesturePointerId = 0))
         assertFalse(PointerOwnership.ignoresKeyDown(gesturePointerId = null))
+    }
+
+    @Test
+    fun `direct rollover cancels backspace repeat`() {
+        val different = KeyPressRouting.pendingCancellationForRollover(overDifferentKey = true)
+        val same = KeyPressRouting.pendingCancellationForRollover(overDifferentKey = false)
+
+        assertTrue(different.repeat)
+        assertFalse(same.repeat)
+    }
+
+    @Test
+    fun `direct rollover cancels the original key alternate popup timer`() {
+        val different = KeyPressRouting.pendingCancellationForRollover(overDifferentKey = true)
+        val same = KeyPressRouting.pendingCancellationForRollover(overDifferentKey = false)
+
+        assertTrue(different.longPress)
+        assertFalse(same.longPress)
+    }
+
+    @Test
+    fun `a contact cancelled in padding lets its old key fade`() {
+        assertFalse(
+            KeyPressRouting.isVisuallyHeld(
+                isGesturePointer = false,
+                cancelled = true,
+                isPlacedKey = true,
+            ),
+        )
+        assertTrue(
+            KeyPressRouting.isVisuallyHeld(
+                isGesturePointer = false,
+                cancelled = false,
+                isPlacedKey = true,
+            ),
+        )
+        assertFalse(
+            KeyPressRouting.isVisuallyHeld(
+                isGesturePointer = true,
+                cancelled = false,
+                isPlacedKey = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `lifting in padding does not resurrect the old key highlight`() {
+        assertFalse(
+            KeyPressRouting.shouldFadeOnRelease(
+                cancelled = true,
+                isGesturePointer = false,
+            ),
+        )
+        assertTrue(
+            KeyPressRouting.shouldFadeOnRelease(
+                cancelled = false,
+                isGesturePointer = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `gesture lift does not restart the start key fade`() {
+        assertFalse(
+            KeyPressRouting.shouldFadeOnRelease(
+                cancelled = false,
+                isGesturePointer = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `authoritative up on original key revives a press cancelled in padding`() {
+        val release = KeyPressRouting.resolveRelease(
+            hasValidKey = true,
+            isCurrentKey = true,
+            movedBeyondSlop = true,
+            wasSlidOff = true,
+        )
+
+        assertFalse(release.cancelled)
+        assertTrue(release.slidOff)
+        assertFalse(release.retarget)
+    }
+
+    @Test
+    fun `sparse up over another key retargets and clears cancellation`() {
+        val release = KeyPressRouting.resolveRelease(
+            hasValidKey = true,
+            isCurrentKey = false,
+            movedBeyondSlop = true,
+            wasSlidOff = false,
+        )
+
+        assertFalse(release.cancelled)
+        assertTrue(release.slidOff)
+        assertTrue(release.retarget)
+    }
+
+    @Test
+    fun `authoritative up retargets after an earlier rollover even within down slop`() {
+        val release = KeyPressRouting.resolveRelease(
+            hasValidKey = true,
+            isCurrentKey = false,
+            movedBeyondSlop = false,
+            wasSlidOff = true,
+        )
+
+        assertFalse(release.cancelled)
+        assertTrue(release.slidOff)
+        assertTrue(release.retarget)
+    }
+
+    @Test
+    fun `authoritative up in padding remains cancelled`() {
+        val release = KeyPressRouting.resolveRelease(
+            hasValidKey = false,
+            isCurrentKey = false,
+            movedBeyondSlop = true,
+            wasSlidOff = true,
+        )
+
+        assertTrue(release.cancelled)
+        assertTrue(release.slidOff)
+        assertFalse(release.retarget)
     }
 
     @Test

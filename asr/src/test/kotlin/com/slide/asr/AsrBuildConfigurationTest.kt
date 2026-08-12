@@ -50,6 +50,21 @@ class AsrBuildConfigurationTest {
         assertTrue(bridge.contains("if (name.get() == nullptr)"))
         assertTrue(bridge.contains("env->ExceptionCheck()"))
         assertTrue(bridge.contains("env->ExceptionClear()"))
+        assertTrue(bridge.contains("env->NewByteArray(length)"))
+        assertTrue(bridge.contains("env->SetByteArrayRegion("))
+        assertTrue("ordinary UTF-8 must never enter JNI's MUTF-8 API", !bridge.contains("NewStringUTF"))
+    }
+
+    @Test
+    fun nativeBuildUsesTrackedWhisperProvenance() {
+        val cmake = File(root, "asr/src/main/cpp/CMakeLists.txt").readText()
+        val ggml = File(root, "third_party/whisper.cpp/ggml/CMakeLists.txt").readText()
+        val vendored = File(root, "third_party/whisper.cpp/VENDORED_COMMIT").readText().trim()
+
+        assertTrue(vendored.matches(Regex("[0-9a-f]{40}")))
+        assertTrue(cmake.contains("file(READ \"\${WHISPER_ROOT}/VENDORED_COMMIT\""))
+        assertTrue(cmake.contains("GGML_BUILD_COMMIT_OVERRIDE"))
+        assertTrue(ggml.contains("if(GGML_BUILD_COMMIT_OVERRIDE)"))
     }
 
     @Test

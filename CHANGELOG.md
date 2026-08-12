@@ -2,17 +2,55 @@
 
 ## Unreleased
 
+## [0.3.2] - 2026-08-12
+
 ### Fixed
 
+- Reopening a finished word now respects an editor that rejects `setComposingRegion`, and ordinary
+  editor mutations update Slide's composing, learning, and autocorrect state only after the
+  corresponding `InputConnection` operation succeeds. Raw `TYPE_NULL` editors receive key events
+  for typing, Backspace, and Enter.
+- Swipe and dictation spacing now use shared, code-point-aware context for Unicode punctuation,
+  paired quotes, brackets, ellipsis, and emoji. Sentence and word context recognises smart
+  apostrophes and Unicode sentence/paragraph boundaries instead of learning across them.
+- The emoji grid exposes accessibility scroll actions and preserves virtual focus as it scrolls;
+  tone selection can be cancelled vertically, and taps or drags in distant padding no longer
+  commit the nearest key.
+- Native Whisper transcripts cross JNI as ordinary UTF-8 bytes, so supplementary Unicode such as
+  emoji is decoded correctly instead of being handed to JNI's incompatible Modified UTF-8 API.
+- Leaving or cancelling an update download now cancels the process-owned job and prevents Package
+  Installer from appearing over another app. Certificate rotation history is accepted without
+  accepting an unrelated signer.
+- Clearing learned words, phrases, and touch calibration now fsyncs every affected directory before
+  removing its fail-closed deletion marker. Personal touch offsets and residues are excluded from
+  backup and transfer, while ordinary settings migrate to a backup-eligible, privacy-filtered store.
+- Lexicon and n-gram loaders reject noncanonical, unsorted, out-of-range, truncated, trailing, or
+  otherwise malformed assets instead of silently mis-scoring corrupt data.
+- The patched ExecuTorch runtime no longer contributes a test instrumentation declaration to the
+  release manifest, and native builds identify the tracked whisper.cpp snapshot rather than an
+  ambient or stale Slide Git revision.
+- Slide now honours Android's IME-switching contract with a working globe key, and hides voice input
+  on devices without microphone hardware.
 - Neural swipe ranking now applies the model's calibrated language weight to the lexicon's raw
   `0..255` frequency value. The previous extra logarithm almost erased the language prior; this
   removes a concrete scoring cause of everyday contractions losing to much less common names.
 - One Backspace immediately after a swipe now removes the complete committed word as a unit,
   including Slide's automatic leading space and the word's casing. The deletion is verified
   against the editor's actual text and also rolls back the provisional learned phrase.
+- The packaged-runtime emulator runner now defaults to Lavapipe. This avoids emulator 37.1.11's
+  SwiftShader initialization crash and restores reliable API 26 instrumentation on current hosts.
 
 ### Changed
 
+- The app now targets Android API 37 as version 0.3.2 (`versionCode` 11). Fresh builds prepare all
+  speech, swipe, and ExecuTorch assets through one checked entry point.
+- CI and release workflows require packaged speech/swipe instrumentation on API 26 and API 37.
+  Tagged builds also require an independent source-export rebuild, exact runtime-asset and native
+  provenance checks, a CycloneDX SBOM, checksum, R8 mapping, native symbols, and signed GitHub
+  provenance/SBOM attestations.
+- Unicode, CLDR, and AOSP language inputs are now locked to immutable releases/commits and exact
+  hashes. The exact Tatoeba snapshot is preserved in-tree because its official URL rotates, and
+  the complete emoji/lexicon/context rebuild fails closed unless all inputs and outputs match.
 - Finger-up decoding runs away from the IME thread. Completed swipes and immediately following
   keys, cursor gestures, panel requests, or second swipes are applied in release order, while
   field and gesture-setting invalidation cancels the sequence. A live preview still in native
@@ -23,15 +61,16 @@
 
 ### Verification
 
-- Full JVM suites for `:engine` and `:ime` pass, including focused raw-frequency calibration,
-  common-contraction, ordered-input, exact whole-swipe undo, stale-editor, selection, mismatch,
-  transaction-failure, and one-shot tests.
+- Full JVM suites for all five modules pass, together with module lint, the minified release build,
+  the strict release-APK verifier, release-script contracts, and CycloneDX schema validation.
+- Packaged runtime instrumentation passes on API 26: Engine 2/2 and ASR 5/5, including the
+  bundled models and a regression for digitally silent PCM input.
 - The deterministic fallback was measured on 20,000 donated real-finger QWERTY traces as a
   diagnostic. Its 50.23% top-1 result confirms it must remain failover rather than broadly
   overriding neural output.
-- The reported `that's` trace has not yet been replayed through the packaged neural model, and a
-  physical install remains pending: no phone was visible to ADB in this pass, and three existing
-  x86_64 AVDs exited during cold boot before instrumentation could run (the last with SIGSEGV).
+- The API 37 preview system image could not reach app tests on this host because its ranchu graphics
+  stack repeatedly aborted SurfaceFlinger. The reported `that's` trace has not yet been replayed
+  through the packaged neural model, and physical-phone validation remains pending.
 
 ## [0.3.1] - 2026-08-10
 

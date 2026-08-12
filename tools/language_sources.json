@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "sources": {
+    "unicode_emoji_test": {
+      "filename": "emoji-test-17.0.txt",
+      "retrieval_url": "https://www.unicode.org/Public/17.0.0/emoji/emoji-test.txt",
+      "revision": "Unicode 17.0.0, dated 2025-08-04",
+      "sha256": "1d8a944f88d7952f7ef7c5167fef3c67995bcae24543949710231b03a201acda",
+      "size": 669326,
+      "mutable_origin": false,
+      "group": "emoji"
+    },
+    "cldr_annotations_en": {
+      "filename": "cldr-annotations-en.xml",
+      "retrieval_url": "https://raw.githubusercontent.com/unicode-org/cldr/f67d16c9f472012cf324b36ce37cf757d3185cc8/common/annotations/en.xml",
+      "revision": "unicode-org/cldr f67d16c9f472012cf324b36ce37cf757d3185cc8",
+      "sha256": "091807d3ec993e2bde057c39f75ce3a051764c2a12a6a96204c475c8f3fea817",
+      "size": 296588,
+      "mutable_origin": false,
+      "group": "emoji"
+    },
+    "cldr_annotations_derived_en": {
+      "filename": "cldr-annotations-derived-en.xml",
+      "retrieval_url": "https://raw.githubusercontent.com/unicode-org/cldr/f67d16c9f472012cf324b36ce37cf757d3185cc8/common/annotationsDerived/en.xml",
+      "revision": "unicode-org/cldr f67d16c9f472012cf324b36ce37cf757d3185cc8",
+      "sha256": "c3d08ed66d4f840ba8b1202a5c7f6c4336e3c65363c08144811dc3f587e92a80",
+      "size": 550115,
+      "mutable_origin": false,
+      "group": "emoji"
+    },
+    "aosp_english_wordlist": {
+      "filename": "aosp-en-wordlist.combined.gz",
+      "retrieval_url": "https://raw.githubusercontent.com/LineageOS/android_packages_inputmethods_LatinIME/c692b1224009953fb4677c99ad498e13bad6c85f/dictionaries/en_wordlist.combined.gz",
+      "revision": "LineageOS/android_packages_inputmethods_LatinIME c692b1224009953fb4677c99ad498e13bad6c85f",
+      "sha256": "07682388185c285d307e341d1733331af8699f735b4137e9f22571017fab69d2",
+      "size": 914050,
+      "mutable_origin": false,
+      "group": "lexicon"
+    },
+    "tatoeba_english_sentences": {
+      "filename": "tatoeba-eng-sentences-2026-08-08.tsv.bz2",
+      "retrieval_url": "https://downloads.tatoeba.org/exports/per_language/eng/eng_sentences.tsv.bz2",
+      "revision": "Tatoeba English per-language export, last modified 2026-08-08T06:29:57Z",
+      "sha256": "34fc76cc177ca65b56cb3b966a2b8f33efd8a1b0551eb855f31b5ab940d05e60",
+      "size": 24813679,
+      "mutable_origin": true,
+      "group": "context",
+      "bundled_path": "third_party/language-data/tatoeba-eng-sentences-2026-08-08.tsv.bz2"
+    }
+  },
+  "generated_outputs": {
+    "core/src/main/assets/emoji.bin": "543a5883b9dfb0521bf8440f72fe000e37ae43de1ff6c70432ae9e02b646188f",
+    "engine/src/main/assets/lexicon_en.bin": "9dac9defeb43453fb98a14b5ffa1e54aa112a4b3c6a1a5959090f79cc3d96e26",
+    "engine/src/main/assets/bigrams_en.bin": "7e07306e153a0e4a1429e6fc8d0aa3c1be6f0bf20b78459d2c69deb80d8c37f3",
+    "engine/src/main/assets/trigrams_en.bin": "dd85903183a89ddd957978636e5366e1e11e2aed14ef5d8c9b13abea48dcb3e1",
+    "engine/src/test/resources/heldout_en.txt": "53887968dced24db0a188270f8e452ede1e5bdebdfcd12cfaf189d7e662a848c"
+  }
+}

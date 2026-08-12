@@ -21,6 +21,7 @@ class EditorInputPolicyTest {
             assertTrue(policy.allowsPersonalizedLearning)
             assertFalse(policy.isPassword)
             assertTrue(policy.allowsVoice)
+            assertFalse(policy.usesRawKeyEvents)
             assertEquals(EditorKeyboardMode.TEXT, policy.keyboardMode)
         }
     }
@@ -78,6 +79,17 @@ class EditorInputPolicyTest {
             assertFalse(policy.allowsSuggestions)
             assertFalse(policy.allowsVoice)
         }
+    }
+
+    @Test
+    fun `TYPE_NULL uses raw hardware-style key events`() {
+        val policy = EditorInputPolicy.from(InputType.TYPE_NULL)
+
+        assertTrue(policy.usesRawKeyEvents)
+        assertFalse(policy.allowsSuggestions)
+        assertFalse(policy.allowsPersonalizedLearning)
+        assertFalse(policy.allowsVoice)
+        assertEquals(EditorKeyboardMode.TEXT, policy.keyboardMode)
     }
 
     @Test

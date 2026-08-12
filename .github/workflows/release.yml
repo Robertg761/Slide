@@ -104,17 +104,16 @@ jobs:
           VERSION_CODE: ${{ steps.metadata.outputs.version_code }}
         run: bash tools/verify_version_history.sh "$VERSION" "$VERSION_CODE"
 
-      - name: Test release metadata scripts
+      - name: Prepare every pinned runtime asset
+        run: bash tools/prepare_assets.sh
+
+      - name: Export exact resolved release runtime artifacts
+        run: >-
+          ./gradlew --no-daemon --no-build-cache --no-configuration-cache
+          :app:writeReleaseRuntimeArtifacts
+
+      - name: Test release metadata and artifact scripts
         run: bash tools/test_release_scripts.sh
-
-      - name: Fetch and verify the pinned speech model
-        run: bash tools/fetch_model.sh base.en-q5_1
-
-      - name: Prepare the pinned on-device inference runtime
-        run: bash tools/fetch_executorch.sh
-
-      - name: Fetch and verify the pinned swipe models
-        run: bash tools/fetch_swipe_models.sh
 
       - name: Run all JVM tests and release lint
         run: >-
@@ -146,6 +145,10 @@ jobs:
           }
           mkdir -p dist
           cp "$second" "dist/Slide-${VERSION}-unsigned.apk"
+          cp app/build/outputs/mapping/release/mapping.txt \
+            "dist/Slide-${VERSION}-mapping.txt"
+          cp app/build/outputs/native-debug-symbols/release/native-debug-symbols.zip \
+            "dist/Slide-${VERSION}-native-debug-symbols.zip"
 
       - name: Verify unsigned APK package, model, compression, and ABIs
         env:
@@ -163,6 +166,19 @@ jobs:
           VERSION: ${{ steps.metadata.outputs.version }}
         run: bash tools/extract_release_notes.sh "$VERSION" CHANGELOG.md > dist/release-notes.md
 
+      - name: Generate the reviewed runtime SBOM
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --no-build-cache --no-configuration-cache \
+            :app:writeReleaseRuntimeArtifacts
+          python3 tools/build_sbom.py \
+            "$VERSION" \
+            "$GITHUB_SHA" \
+            "dist/Slide-${VERSION}.cdx.json"
+
       - name: Include verification tooling in the approval artifact
         run: cp tools/verify_release_apk.sh dist/verify_release_apk.sh
 
@@ -174,14 +190,128 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  sign:
+  instrumentation:
+    name: Packaged runtime (Android ${{ matrix.api }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        api: ["26", "37.0"]
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install pinned Android build toolchain
+        shell: bash
+        run: |
+          set -eu
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          "$sdk_root/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platforms;android-37.0" \
+            "build-tools;36.0.0" \
+            "ndk;28.2.13676358" \
+            "cmake;3.22.1" </dev/null >/dev/null
+
+      - name: Allow the emulator to use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Prepare every pinned runtime asset
+        run: bash tools/prepare_assets.sh
+
+      - name: Run packaged speech and neural swipe tests
+        run: bash tools/run_android_instrumentation.sh "${{ matrix.api }}"
+
+      - name: Upload instrumentation diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-instrumentation-api-${{ matrix.api }}-${{ github.sha }}
+          path: |
+            asr/build/reports/androidTests/**
+            asr/build/outputs/androidTest-results/**
+            engine/build/reports/androidTests/**
+            engine/build/outputs/androidTest-results/**
+            build/reports/instrumentation-api-*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  reproduce-source-export:
     needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Download the reference unsigned build
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: unsigned-release-${{ github.sha }}
+          path: reference
+
+      - name: Set up Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install pinned Android toolchain
+        shell: bash
+        run: |
+          set -eu
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          "$sdk_root/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platforms;android-37.0" \
+            "build-tools;36.0.0" \
+            "ndk;28.2.13676358" \
+            "cmake;3.22.1" </dev/null >/dev/null
+
+      - name: Rebuild from an independent source export
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export_dir="$RUNNER_TEMP/slide-source-export"
+          mkdir -p "$export_dir"
+          git archive --format=tar "$GITHUB_SHA" | tar -xf - -C "$export_dir"
+          cd "$export_dir"
+          bash tools/prepare_assets.sh
+          ./gradlew --no-daemon --no-build-cache --no-configuration-cache :app:assembleRelease
+          rebuilt="$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' -print -quit)"
+          [[ -n "$rebuilt" ]] || { echo "Source-export APK was not found." >&2; exit 1; }
+          cmp --silent "$GITHUB_WORKSPACE/reference/Slide-${VERSION}-unsigned.apk" "$rebuilt" || {
+            sha256sum "$GITHUB_WORKSPACE/reference/Slide-${VERSION}-unsigned.apk" "$rebuilt" >&2
+            echo "The source-export build differs from the reviewed unsigned artifact." >&2
+            exit 1
+          }
+
+  sign:
+    needs: [build, instrumentation, reproduce-source-export]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: release
     permissions:
       actions: read
+      artifact-metadata: write
+      attestations: write
       contents: read
+      id-token: write
     outputs:
       apk_sha256: ${{ steps.digest.outputs.apk_sha256 }}
     steps:
@@ -253,7 +383,26 @@ jobs:
           set -euo pipefail
           digest="$(sha256sum "dist/Slide-${VERSION}.apk" | awk '{print $1}')"
           echo "apk_sha256=$digest" >> "$GITHUB_OUTPUT"
-          cp input/release-notes.md dist/release-notes.md
+          (
+            cd dist
+            sha256sum "Slide-${VERSION}.apk" > "Slide-${VERSION}.apk.sha256"
+          )
+          cp input/release-notes.md \
+            input/Slide-${VERSION}.cdx.json \
+            input/Slide-${VERSION}-mapping.txt \
+            input/Slide-${VERSION}-native-debug-symbols.zip \
+            dist/
+
+      - name: Attest signed APK build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/Slide-${{ needs.build.outputs.version }}.apk
+
+      - name: Attest the signed APK SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/Slide-${{ needs.build.outputs.version }}.apk
+          sbom-path: dist/Slide-${{ needs.build.outputs.version }}.cdx.json
 
       - name: Upload signed release artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -282,7 +431,10 @@ jobs:
           EXPECTED_SHA256: ${{ needs.sign.outputs.apk_sha256 }}
           VERSION: ${{ needs.build.outputs.version }}
         shell: bash
-        run: echo "$EXPECTED_SHA256  dist/Slide-${VERSION}.apk" | sha256sum --check --strict
+        run: |
+          echo "$EXPECTED_SHA256  dist/Slide-${VERSION}.apk" | sha256sum --check --strict
+          cd dist
+          sha256sum --check --strict "Slide-${VERSION}.apk.sha256"
 
       - name: Refuse to mutate an existing release
         env:
@@ -309,11 +461,63 @@ jobs:
               ;;
           esac
 
-      - name: Publish GitHub release
+      - name: Stage GitHub release and upload immutable assets
+        id: staged_release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: ${{ github.ref_name }}
           body_path: dist/release-notes.md
-          files: dist/Slide-${{ needs.build.outputs.version }}.apk
+          files: |
+            dist/Slide-${{ needs.build.outputs.version }}.apk
+            dist/Slide-${{ needs.build.outputs.version }}.apk.sha256
+            dist/Slide-${{ needs.build.outputs.version }}.cdx.json
+            dist/Slide-${{ needs.build.outputs.version }}-mapping.txt
+            dist/Slide-${{ needs.build.outputs.version }}-native-debug-symbols.zip
+          # Immutable releases reject asset uploads after publication. Keep stable and prerelease
+          # releases draft until every asset is attached, then publish in the next fail-closed step.
+          draft: true
           prerelease: ${{ needs.build.outputs.prerelease == 'true' }}
           fail_on_unmatched_files: true
+
+      - name: Publish the fully populated draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+          RELEASE_ID: ${{ steps.staged_release.outputs.id }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]] || {
+            echo "The staged release did not return a numeric release ID." >&2
+            exit 1
+          }
+          case "$PRERELEASE" in
+            true|false) ;;
+            *) echo "Invalid prerelease flag: $PRERELEASE" >&2; exit 1 ;;
+          esac
+
+          printf '{"draft":false,"prerelease":%s}\n' "$PRERELEASE" \
+            > "$RUNNER_TEMP/publish-release.json"
+          status="$(curl --silent --show-error \
+            --output "$RUNNER_TEMP/published-release.json" \
+            --write-out '%{http_code}' \
+            --request PATCH \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Content-Type: application/json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --data-binary "@$RUNNER_TEMP/publish-release.json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+          [[ "$status" == 200 ]] || {
+            echo "Could not publish staged release $RELEASE_ID (HTTP $status)." >&2
+            exit 1
+          }
+          jq --exit-status \
+            --arg tag "$RELEASE_TAG" \
+            --argjson prerelease "$PRERELEASE" \
+            '.tag_name == $tag and .draft == false and .prerelease == $prerelease' \
+            "$RUNNER_TEMP/published-release.json" >/dev/null || {
+              echo "GitHub did not publish the staged release with the requested state." >&2
+              exit 1
+            }

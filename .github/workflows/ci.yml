@@ -46,14 +46,13 @@ jobs:
             "ndk;28.2.13676358" \
             "cmake;3.22.1" </dev/null >/dev/null
 
-      - name: Fetch and verify the pinned speech model
-        run: bash tools/fetch_model.sh base.en-q5_1
+      - name: Prepare every pinned runtime asset
+        run: bash tools/prepare_assets.sh
 
-      - name: Prepare the pinned on-device inference runtime
-        run: bash tools/fetch_executorch.sh
-
-      - name: Fetch and verify the pinned swipe models
-        run: bash tools/fetch_swipe_models.sh
+      - name: Export exact resolved release runtime artifacts
+        run: >-
+          ./gradlew --no-daemon --no-build-cache --no-configuration-cache
+          :app:writeReleaseRuntimeArtifacts
 
       - name: Verify monotonic release version history
         shell: bash
@@ -85,3 +84,62 @@ jobs:
           version="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)"/\1/p' app/build.gradle.kts)"
           code="$(sed -nE 's/^[[:space:]]*versionCode[[:space:]]*=[[:space:]]*([0-9]+)/\1/p' app/build.gradle.kts)"
           bash tools/verify_release_apk.sh "$apk" "$version" "$code" unsigned
+
+  instrumentation:
+    name: Packaged runtime (Android ${{ matrix.api }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        api: ["26", "37.0"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Install pinned Android build toolchain
+        shell: bash
+        run: |
+          set -eu
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          "$sdk_root/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platforms;android-37.0" \
+            "build-tools;36.0.0" \
+            "ndk;28.2.13676358" \
+            "cmake;3.22.1" </dev/null >/dev/null
+
+      - name: Allow the emulator to use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Prepare every pinned runtime asset
+        run: bash tools/prepare_assets.sh
+
+      - name: Run packaged speech and neural swipe tests
+        run: bash tools/run_android_instrumentation.sh "${{ matrix.api }}"
+
+      - name: Upload instrumentation diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: instrumentation-api-${{ matrix.api }}-${{ github.sha }}
+          path: |
+            asr/build/reports/androidTests/**
+            asr/build/outputs/androidTest-results/**
+            engine/build/reports/androidTests/**
+            engine/build/outputs/androidTest-results/**
+            build/reports/instrumentation-api-*.log
+          if-no-files-found: ignore
+          retention-days: 7

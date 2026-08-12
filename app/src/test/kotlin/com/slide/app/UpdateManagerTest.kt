@@ -1,13 +1,21 @@
 package com.slide.app
 
+import java.io.ByteArrayInputStream
 import java.io.File
+import java.io.IOException
+import java.io.InputStream
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -52,6 +60,7 @@ class UpdateManagerTest {
         assertFalse(UpdateManager.isValidSemVer("1.0.0-alpha.01"))
         assertTrue(UpdateManager.isValidSemVer("v1.0.0-rc.1"))
         assertTrue(UpdateManager.isValidSemVer("1.0.0+build.42"))
+        assertFalse(UpdateManager.isValidSemVer("1." + "0".repeat(200) + ".0"))
         assertTrue(UpdateManager.isPrerelease("1.0.0-rc.1+build.42"))
         assertFalse(UpdateManager.isPrerelease("1.0.0+build.42"))
         assertEquals(0, UpdateManager.compare("1.0.0+one", "1.0.0+two"))
@@ -90,6 +99,137 @@ class UpdateManagerTest {
     }
 
     @Test
+    fun `stable channel searches later pages after newer prereleases`() {
+        fun release(version: String, prerelease: Boolean) = ReleaseCandidate(
+            update = UpdateInfo(
+                version = version,
+                notes = "notes",
+                apkUrl = "https://example.test/Slide-$version.apk",
+                apkSha256 = "a".repeat(64),
+                apkSize = 123L,
+            ),
+            draft = false,
+            prerelease = prerelease,
+        )
+
+        val firstPage = (1..30).map { index ->
+            release("2.0.0-alpha.$index", prerelease = true)
+        }
+        val secondPage = listOf(release("1.0.0", prerelease = false))
+
+        assertEquals(
+            "1.0.0",
+            UpdateManager.selectReleaseCandidates(
+                currentVersion = "0.3.2",
+                includePrereleases = false,
+                pages = listOf(firstPage, secondPage),
+            )?.version,
+        )
+    }
+
+    @Test
+    fun `pagination reduces each page to one best candidate`() {
+        fun release(version: String, notes: String) = ReleaseCandidate(
+            update = UpdateInfo(
+                version = version,
+                notes = notes,
+                apkUrl = "https://example.test/Slide-$version.apk",
+                apkSha256 = "a".repeat(64),
+                apkSize = 123L,
+            ),
+            draft = false,
+            prerelease = false,
+        )
+        val first = UpdateManager.selectReleasePage(
+            currentVersion = "0.3.2",
+            includePrereleases = false,
+            previousBest = null,
+            candidates = listOf(release("0.4.0", "old page")),
+        )
+        val second = UpdateManager.selectReleasePage(
+            currentVersion = "0.3.2",
+            includePrereleases = false,
+            previousBest = first,
+            candidates = listOf(
+                release("0.3.3", "older on current page"),
+                release("0.5.0", "newest page only"),
+            ),
+        )
+
+        assertEquals("0.5.0", second?.version)
+        assertEquals("newest page only", second?.notes)
+    }
+
+    @Test
+    fun `release pagination follows only the expected GitHub endpoint`() {
+        val next = "https://api.github.com/repos/Robertg761/Slide/releases?per_page=100&page=2"
+        val header = "<$next>; rel=\"next\", <https://api.github.com/repos/Robertg761/Slide/releases?per_page=100&page=4>; rel=\"last\""
+
+        assertEquals(next, UpdateManager.nextReleasePage(header)?.toExternalForm())
+        assertEquals(null, UpdateManager.nextReleasePage(null))
+        assertEquals(null, UpdateManager.nextReleasePage("<$next>; rel=\"last\""))
+    }
+
+    @Test(expected = java.io.IOException::class)
+    fun `release pagination rejects an off-origin next link`() {
+        UpdateManager.nextReleasePage(
+            "<https://example.test/repos/Robertg761/Slide/releases?page=2>; rel=\"next\"",
+        )
+    }
+
+    @Test
+    fun `release pagination fails closed at its page and response limits`() = runBlocking {
+        UpdateManager.requireReleasePageAvailable(19)
+        assertThrows(IOException::class.java) {
+            UpdateManager.requireReleasePageAvailable(20)
+        }
+        assertThrows(IOException::class.java) {
+            runBlocking {
+                UpdateManager.readBoundedReleasePage(
+                    input = ByteArrayInputStream("12345".toByteArray()),
+                    contentLength = -1L,
+                    maxChars = 4,
+                )
+            }
+        }
+        assertThrows(IOException::class.java) {
+            runBlocking {
+                UpdateManager.readBoundedReleasePage(
+                    input = ByteArrayInputStream(byteArrayOf()),
+                    contentLength = 5L,
+                    maxChars = 4,
+                )
+            }
+        }
+        Unit
+    }
+
+    @Test
+    fun `canceled release page read stops before another blocking read`() = runBlocking {
+        lateinit var readerJob: Job
+        var reads = 0
+        val input = object : InputStream() {
+            override fun read(): Int = error("buffered reader must use the bounded bulk read")
+
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                reads++
+                buffer[offset] = 'x'.code.toByte()
+                readerJob.cancel()
+                return 1
+            }
+        }
+        readerJob = launch(start = CoroutineStart.LAZY) {
+            UpdateManager.readBoundedReleasePage(input, contentLength = -1L, maxChars = 4)
+        }
+
+        readerJob.start()
+        readerJob.join()
+
+        assertTrue(readerJob.isCancelled)
+        assertEquals(1, reads)
+    }
+
+    @Test
     fun `sha256 is stable and zero padded`() {
         assertEquals(
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
@@ -109,6 +249,54 @@ class UpdateManagerTest {
         assertFalse(UpdateManager.isDownloading.value)
         assertTrue(UpdateManager.beginDownload())
         UpdateManager.endDownload()
+    }
+
+    @Test
+    fun `tracked install can be canceled and releases the single-flight guard`() {
+        assertTrue(UpdateManager.beginDownload())
+        val job = Job()
+        assertTrue(UpdateManager.registerInstallJob(job))
+
+        assertTrue(UpdateManager.cancelInstall())
+
+        assertTrue(job.isCancelled)
+        assertFalse(UpdateManager.isDownloading.value)
+        assertEquals(InstallOutcome.Cancelled, UpdateManager.outcome.value)
+        UpdateManager.consumeOutcome()
+        assertFalse(UpdateManager.cancelInstall())
+    }
+
+    @Test
+    fun `intentional external handoff is not canceled by activity stop`() {
+        assertTrue(UpdateManager.beginDownload())
+        val job = Job()
+        assertTrue(UpdateManager.registerInstallJob(job))
+
+        assertTrue(UpdateManager.markExternalHandoff())
+        assertFalse(UpdateManager.cancelInstall())
+        assertFalse(job.isCancelled)
+
+        job.complete()
+        assertFalse(UpdateManager.isDownloading.value)
+    }
+
+    @Test
+    fun `cancellation wins atomically over a later external handoff`() {
+        assertTrue(UpdateManager.beginDownload())
+        val job = Job()
+        assertTrue(UpdateManager.registerInstallJob(job))
+
+        assertTrue(UpdateManager.cancelInstall())
+        assertFalse(UpdateManager.markExternalHandoff())
+        assertTrue(job.isCancelled)
+    }
+
+    @Test
+    fun `signer lineage accepts rotation but rejects unrelated certificates`() {
+        assertTrue(UpdateManager.signerLineageAccepts(setOf("old"), setOf("old", "new")))
+        assertTrue(UpdateManager.signerLineageAccepts(setOf("same"), setOf("same")))
+        assertFalse(UpdateManager.signerLineageAccepts(setOf("old"), setOf("new")))
+        assertFalse(UpdateManager.signerLineageAccepts(emptySet(), setOf("new")))
     }
 
     @Test
@@ -236,9 +424,107 @@ class UpdateManagerTest {
     }
 
     @Test
+    fun `a repeated install reuses the handed APK without invalidating its content URI`() {
+        val staging = newDirectory()
+        val now = 10_000_000L
+        val apk = byteArrayOf(0x50, 0x4b, 0x03, 0x04, 1, 2, 3, 4)
+        val handed = File(staging, "Slide-0.4.0.apk").apply {
+            writeBytes(apk)
+            assertTrue(setLastModified(now - 60_000L))
+        }
+        val abandonedPartial = File(staging, "Slide-0.4.0.apk.part").apply {
+            writeText("partial")
+        }
+        val update = UpdateInfo(
+            version = "0.4.0",
+            notes = "",
+            apkUrl = "https://example.invalid/Slide-0.4.0.apk",
+            apkSha256 = UpdateManager.sha256Hex(apk),
+            apkSize = apk.size.toLong(),
+        )
+
+        val target = UpdateManager.prepareDownloadTarget(
+            directory = staging,
+            update = update,
+            installedVersion = "0.3.2",
+            nowMillis = now,
+        )
+
+        assertTrue(target.reuseExisting)
+        assertEquals(handed, target.target)
+        assertTrue("the first Package Installer URI lost its file", handed.exists())
+        assertEquals(now, handed.lastModified())
+        assertFalse(abandonedPartial.exists())
+        staging.deleteRecursively()
+    }
+
+    @Test
+    fun `a different fresh handed APK is preserved while another version downloads`() {
+        val staging = newDirectory()
+        val now = 10_000_000L
+        val handed = File(staging, "Slide-0.4.0.apk").apply {
+            writeBytes(byteArrayOf(0x50, 0x4b, 0x03, 0x04, 1))
+            assertTrue(setLastModified(now - 60_000L))
+        }
+        val updateBytes = byteArrayOf(0x50, 0x4b, 0x03, 0x04, 2)
+        val target = UpdateManager.prepareDownloadTarget(
+            directory = staging,
+            update = UpdateInfo(
+                version = "0.5.0",
+                notes = "",
+                apkUrl = "https://example.invalid/Slide-0.5.0.apk",
+                apkSha256 = UpdateManager.sha256Hex(updateBytes),
+                apkSize = updateBytes.size.toLong(),
+            ),
+            installedVersion = "0.3.2",
+            nowMillis = now,
+        )
+
+        assertFalse(target.reuseExisting)
+        assertTrue("another pending installer's APK was deleted", handed.exists())
+        assertEquals("Slide-0.5.0.apk", target.target.name)
+        staging.deleteRecursively()
+    }
+
+    @Test
+    fun `a fresh same-version mismatch fails without deleting the handed file`() {
+        val staging = newDirectory()
+        val now = 10_000_000L
+        val handed = File(staging, "Slide-0.4.0.apk").apply {
+            writeBytes(byteArrayOf(0x50, 0x4b, 0x03, 0x04, 1))
+            assertTrue(setLastModified(now - 60_000L))
+        }
+        val expected = byteArrayOf(0x50, 0x4b, 0x03, 0x04, 2)
+
+        assertThrows(IOException::class.java) {
+            UpdateManager.prepareDownloadTarget(
+                directory = staging,
+                update = UpdateInfo(
+                    version = "0.4.0",
+                    notes = "",
+                    apkUrl = "https://example.invalid/Slide-0.4.0.apk",
+                    apkSha256 = UpdateManager.sha256Hex(expected),
+                    apkSize = expected.size.toLong(),
+                ),
+                installedVersion = "0.3.2",
+                nowMillis = now,
+            )
+        }
+        assertTrue("a mismatched target may still back Package Installer", handed.exists())
+        staging.deleteRecursively()
+    }
+
+    @Test
     fun `free space accounts for download and installer staging copies`() {
         val mib = 1024L * 1024L
         assertEquals(264L * mib, UpdateManager.requiredFreeBytes(100L * mib))
         assertEquals(Long.MAX_VALUE, UpdateManager.requiredFreeBytes(Long.MAX_VALUE))
+    }
+
+    @Test
+    fun `release notes are bounded without splitting a supplementary character`() {
+        assertEquals("short", UpdateManager.boundReleaseNotes("short", maxChars = 8))
+        assertEquals("abc", UpdateManager.boundReleaseNotes("abc😀tail", maxChars = 4))
+        assertEquals("abcd", UpdateManager.boundReleaseNotes("abcdef", maxChars = 4))
     }
 }

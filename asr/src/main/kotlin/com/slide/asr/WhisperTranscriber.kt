@@ -2,6 +2,7 @@ package com.slide.asr
 
 import android.content.Context
 import android.util.Log
+import kotlin.math.abs
 import kotlin.math.min
 import kotlin.coroutines.resume
 import kotlinx.coroutines.CoroutineDispatcher
@@ -89,6 +90,12 @@ class WhisperTranscriber(
             mutex.withLock {
                 if (handle == 0L) return@withLock Result.Failed("No speech model loaded")
                 if (samples.isEmpty()) return@withLock Result.NoSpeech
+                // Whisper's learned no-speech token is probabilistic and can still hallucinate a
+                // short word from digital silence (the packaged base model has produced "you" on
+                // both API 26 and API 37 emulators). Reject audio with no meaningful signal before
+                // inference. Peak amplitude is intentionally used rather than RMS so a brief real
+                // consonant is not erased by a long quiet lead-in or tail.
+                if (isDigitallySilent(samples)) return@withLock Result.NoSpeech
 
                 val token = WhisperNative.createCancellationToken()
                 if (token == 0L) return@withLock Result.Failed("Speech recognition failed")
@@ -100,11 +107,13 @@ class WhisperTranscriber(
                         // This handler runs immediately on cancellation, even while the dispatcher
                         // thread is blocked inside JNI.
                         continuation.invokeOnCancellation { cancelToken(token) }
-                        val decoded = WhisperNative.transcribe(
-                            handle,
-                            samples,
-                            threadCount(),
-                            token,
+                        val decoded = decodeTranscript(
+                            WhisperNative.transcribe(
+                                handle,
+                                samples,
+                                threadCount(),
+                                token,
+                            ),
                         )
                         if (continuation.isActive) continuation.resume(decoded)
                     }
@@ -182,5 +191,21 @@ class WhisperTranscriber(
 
         private const val DEFAULT_THREADS = 4
         private const val TAG = "SlideAsr"
+
+        /** Decodes Whisper's ordinary UTF-8 and erases the native transfer buffer afterwards. */
+        internal fun decodeTranscript(bytes: ByteArray?): String? {
+            if (bytes == null) return null
+            return try {
+                bytes.toString(Charsets.UTF_8)
+            } finally {
+                bytes.fill(0)
+            }
+        }
+
+        /** True only for effectively zero PCM, below one 16-bit capture quantisation step. */
+        internal fun isDigitallySilent(samples: FloatArray): Boolean =
+            samples.none { abs(it) >= MIN_AUDIBLE_PEAK }
+
+        private const val MIN_AUDIBLE_PEAK = 1f / 32768f
     }
 }

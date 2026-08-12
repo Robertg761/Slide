@@ -2,6 +2,7 @@ package com.slide.core.settings
 
 import android.content.Context
 import android.util.Log
+import androidx.datastore.core.DataMigration
 import androidx.datastore.core.DataStore
 import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.Preferences
@@ -145,10 +146,103 @@ data class KeyboardSettings(
 private fun preferencesCorruptionHandler() =
     ReplaceFileCorruptionHandler<Preferences> { emptyPreferences() }
 
-private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(
+/** Legacy settings shared a file with private recent-emoji usage; it stays excluded from backup. */
+private val Context.legacyDataStore: DataStore<Preferences> by preferencesDataStore(
     name = "slide_settings",
     corruptionHandler = preferencesCorruptionHandler(),
 )
+
+/** Current, non-sensitive settings have their own backup-eligible file. */
+private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(
+    name = "keyboard_settings",
+    corruptionHandler = preferencesCorruptionHandler(),
+    produceMigrations = { context ->
+        listOf(LegacySettingsMigration(context.legacyDataStore))
+    },
+)
+
+private class LegacySettingsMigration(
+    private val legacyStore: DataStore<Preferences>,
+) : DataMigration<Preferences> {
+    override suspend fun shouldMigrate(currentData: Preferences): Boolean =
+        legacySettingsMigrationRequired(legacyStore.data.first(), currentData)
+
+    override suspend fun migrate(currentData: Preferences): Preferences =
+        migrateLegacySettings(legacyStore.data.first(), currentData)
+
+    // Keep the old file for the independent recent-emoji migration, but remove every setting that
+    // was eligible for copying. Otherwise a later corruption reset of the new store would lose its
+    // completion bit and resurrect this stale pre-upgrade snapshot over newer privacy/preferences.
+    override suspend fun cleanUp() {
+        legacyStore.updateData(::removeMigratedLegacySettings)
+    }
+}
+
+/** Copies only known user preferences, never usage history or an unknown future private key. */
+internal fun migrateLegacySettings(
+    legacy: Preferences,
+    current: Preferences,
+): Preferences {
+    val migrated = current.toMutablePreferences()
+    val currentNames = current.asMap().keys.mapTo(mutableSetOf()) { it.name }
+    for ((key, value) in legacy.asMap()) {
+        if (!isBackupEligibleSetting(key.name, value) || key.name in currentNames) continue
+        @Suppress("UNCHECKED_CAST")
+        migrated[key as Preferences.Key<Any>] = value
+    }
+    migrated[LEGACY_SETTINGS_MIGRATION_COMPLETE] = true
+    return migrated.toPreferences()
+}
+
+/** Removes only settings the migration understands, preserving private/unknown legacy payloads. */
+internal fun removeMigratedLegacySettings(legacy: Preferences): Preferences {
+    val scrubbed = legacy.toMutablePreferences()
+    for ((key, value) in legacy.asMap()) {
+        if (!isBackupEligibleSetting(key.name, value)) continue
+        @Suppress("UNCHECKED_CAST")
+        scrubbed.remove(key as Preferences.Key<Any>)
+    }
+    return scrubbed.toPreferences()
+}
+
+/**
+ * Cleanup is a separate DataStore migration phase and can fail after the new data was committed.
+ * Retry while any understood legacy setting remains, even when the new store already says its copy
+ * completed. [migrateLegacySettings] preserves every current value, so this retry only re-attempts
+ * the stale-source scrub and can never overwrite a newer preference.
+ */
+internal fun legacySettingsMigrationRequired(
+    legacy: Preferences,
+    current: Preferences,
+): Boolean = current[LEGACY_SETTINGS_MIGRATION_COMPLETE] != true ||
+    legacy.asMap().any { (key, value) -> isBackupEligibleSetting(key.name, value) }
+
+private val LEGACY_SETTINGS_MIGRATION_COMPLETE =
+    booleanPreferencesKey("legacy_settings_migration_complete")
+
+/** Preferences keys are name-based, so validate the erased value before copying the legacy key. */
+private fun isBackupEligibleSetting(name: String, value: Any): Boolean = when (name) {
+    "theme_id", "voice_model" -> value is String
+    "key_height_scale", "bottom_padding_dp", "haptic_strength", "sound_volume" -> value is Float
+    "learned_data_clear_epoch" -> value is Long
+    "emoji_skin_tone" -> value is Int
+    "follow_system_dark",
+    "key_borders",
+    "key_preview",
+    "number_row",
+    "haptic_enabled",
+    "sound_enabled",
+    "gesture_typing",
+    "suggestions_enabled",
+    "autocorrect_enabled",
+    "incognito_mode_enabled",
+    "block_offensive_words",
+    "auto_capitalize",
+    "double_space_period",
+    "update_checks_enabled",
+    "include_alpha_updates" -> value is Boolean
+    else -> false
+}
 
 /** One DataStore per file per process, rooted where Android backup cannot see it. */
 private object NoBackupRecentEmojiStore {
@@ -169,6 +263,47 @@ private object NoBackupRecentEmojiStore {
                     file
                 },
             )
+        }
+    }
+}
+
+/**
+ * One process-wide gate per recent-emoji file.
+ *
+ * [SettingsRepository] is created independently by the settings activity and IME. An instance
+ * mutex therefore cannot prevent one repository from clearing history while another is midway
+ * through copying the legacy value. Keying the gate by the actual no-backup path keeps those
+ * repository instances in one transaction without conflating separate test/application roots.
+ */
+private object RecentEmojiMigrationCoordinator {
+    private val gates = mutableMapOf<String, RecentEmojiMigrationGate>()
+
+    @Synchronized
+    fun get(context: Context): RecentEmojiMigrationGate {
+        val path = File(context.noBackupFilesDir, "datastore/recent_emoji.preferences_pb").absolutePath
+        return gates.getOrPut(path, ::RecentEmojiMigrationGate)
+    }
+}
+
+/** Serializes the legacy copy with destructive clears and remembers only completed migrations. */
+internal class RecentEmojiMigrationGate {
+    private val mutex = Mutex()
+
+    @Volatile
+    private var migrationComplete = false
+
+    suspend fun migrate(block: suspend () -> Boolean) {
+        if (migrationComplete) return
+        mutex.withLock {
+            if (!migrationComplete && block()) migrationComplete = true
+        }
+    }
+
+    suspend fun clear(block: suspend () -> Unit) {
+        mutex.withLock {
+            block()
+            // A successful clear also makes a later legacy copy unnecessary in this process.
+            migrationComplete = true
         }
     }
 }
@@ -239,10 +374,8 @@ private const val MAX_RETRY_DOUBLINGS = 7L // 250 ms up to 32 s.
 class SettingsRepository(private val context: Context) {
 
     private val recentEmojiStore = NoBackupRecentEmojiStore.get(context.applicationContext)
-    private val recentEmojiMigration = Mutex()
-
-    @Volatile
-    private var recentEmojiMigrated = false
+    private val recentEmojiMigration =
+        RecentEmojiMigrationCoordinator.get(context.applicationContext)
 
     /**
      * Deduplicated because recently-used emoji share this store, and they change on every tap.
@@ -316,35 +449,37 @@ class SettingsRepository(private val context: Context) {
     }
 
     suspend fun clearRecentEmoji() {
-        recentEmojiStore.edit { it.remove(Keys.RECENT_EMOJI) }
-        // Remove any pre-0.2.1 value even when migration had not run yet.
-        context.dataStore.edit { it.remove(Keys.RECENT_EMOJI) }
+        recentEmojiMigration.clear {
+            // Remove the source first. If the second write fails, a retry can still clear the
+            // private copy, while no later repository instance can resurrect it from legacy data.
+            context.legacyDataStore.edit { it.remove(Keys.RECENT_EMOJI) }
+            recentEmojiStore.edit { it.remove(Keys.RECENT_EMOJI) }
+        }
     }
 
     /**
-     * Moves pre-0.2.1 emoji history out of the backed-up settings file exactly once.
+     * Moves pre-0.2.1 emoji history out of the legacy settings file exactly once.
      *
      * Once done it is never attempted again, and a failed attempt is not recorded as done: each
      * half is idempotent (copy only into an empty list, then drop the legacy key), so a retry
      * after a transient failure resumes rather than duplicating.
      */
     private suspend fun migrateLegacyRecentEmoji() {
-        if (recentEmojiMigrated) return
-        recentEmojiMigration.withLock {
-            if (recentEmojiMigrated) return@withLock
+        recentEmojiMigration.migrate {
             try {
-                val legacy = context.dataStore.data.first()[Keys.RECENT_EMOJI]
+                val legacy = context.legacyDataStore.data.first()[Keys.RECENT_EMOJI]
                 if (legacy != null) {
                     recentEmojiStore.edit { privatePrefs ->
                         if (privatePrefs[Keys.RECENT_EMOJI].isNullOrEmpty()) {
                             privatePrefs[Keys.RECENT_EMOJI] = legacy
                         }
                     }
-                    context.dataStore.edit { it.remove(Keys.RECENT_EMOJI) }
+                    context.legacyDataStore.edit { it.remove(Keys.RECENT_EMOJI) }
                 }
-                recentEmojiMigrated = true
+                true
             } catch (e: IOException) {
                 Log.w(TAG, "Could not move the legacy emoji history; will retry later", e)
+                false
             }
         }
     }

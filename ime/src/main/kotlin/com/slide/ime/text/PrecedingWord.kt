@@ -12,12 +12,12 @@ object PrecedingWord {
 
     data class Context(val older: String?, val previous: String?)
 
-    /** Past one of these, the preceding word belongs to a different sentence. */
-    private const val SENTENCE_ENDS = ".!?\n"
+    /** Matches the corrector's notion of a word, including decomposed letters and smart apostrophes. */
+    private fun isWordCharacter(codePoint: Int): Boolean =
+        Character.isLetter(codePoint) || isCombiningMark(codePoint) || isApostrophe(codePoint)
 
-    /** Matches the corrector's notion of a word: letters and the apostrophe. */
-    private fun isWordCharacter(character: Char): Boolean =
-        character.isLetter() || character == '\''
+    private fun isWordCore(codePoint: Int): Boolean =
+        Character.isLetter(codePoint) || isCombiningMark(codePoint)
 
     /**
      * The word before the one currently being typed.
@@ -29,7 +29,11 @@ object PrecedingWord {
      */
     fun of(before: String): String? {
         var cursor = before.length
-        while (cursor > 0 && isWordCharacter(before[cursor - 1])) cursor--
+        while (cursor > 0) {
+            val codePoint = Character.codePointBefore(before, cursor)
+            if (!isWordCharacter(codePoint)) break
+            cursor -= Character.charCount(codePoint)
+        }
         return wordEndingAt(before, cursor)
     }
 
@@ -45,7 +49,11 @@ object PrecedingWord {
     /** The two words before the fragment currently being typed, without crossing a sentence. */
     fun contextOf(before: String): Context {
         var cursor = before.length
-        while (cursor > 0 && isWordCharacter(before[cursor - 1])) cursor--
+        while (cursor > 0) {
+            val codePoint = Character.codePointBefore(before, cursor)
+            if (!isWordCharacter(codePoint)) break
+            cursor -= Character.charCount(codePoint)
+        }
         return contextEndingAt(before, cursor)
     }
 
@@ -56,13 +64,20 @@ object PrecedingWord {
         var cursor = from
 
         fun previousWord(): String? {
-            while (cursor > 0 && !before[cursor - 1].isLetter()) {
-                if (before[cursor - 1] in SENTENCE_ENDS) return null
-                cursor--
+            while (cursor > 0) {
+                val codePoint = Character.codePointBefore(before, cursor)
+                if (isWordCore(codePoint)) break
+                if (isSentenceBoundary(codePoint)) return null
+                cursor -= Character.charCount(codePoint)
             }
             val end = cursor
-            while (cursor > 0 && isWordCharacter(before[cursor - 1])) cursor--
-            return before.substring(cursor, end).takeIf { it.isNotEmpty() }
+            while (cursor > 0) {
+                val codePoint = Character.codePointBefore(before, cursor)
+                if (!isWordCharacter(codePoint)) break
+                cursor -= Character.charCount(codePoint)
+            }
+            return before.substring(trimLeadingApostrophes(before, cursor, end), end)
+                .takeIf { word -> word.codePoints().anyMatch(Character::isLetter) }
         }
 
         val previous = previousWord() ?: return Context(null, null)
@@ -83,13 +98,53 @@ object PrecedingWord {
         // not yet typed, and returning "'" as the preceding word hands the decoder a bogus context
         // and learns a bigram keyed on punctuation.
         var cursor = from
-        while (cursor > 0 && !before[cursor - 1].isLetter()) {
-            if (before[cursor - 1] in SENTENCE_ENDS) return null
-            cursor--
+        while (cursor > 0) {
+            val codePoint = Character.codePointBefore(before, cursor)
+            if (isWordCore(codePoint)) break
+            if (isSentenceBoundary(codePoint)) return null
+            cursor -= Character.charCount(codePoint)
         }
 
         val end = cursor
-        while (cursor > 0 && isWordCharacter(before[cursor - 1])) cursor--
-        return before.substring(cursor, end).takeIf { it.isNotEmpty() }
+        while (cursor > 0) {
+            val codePoint = Character.codePointBefore(before, cursor)
+            if (!isWordCharacter(codePoint)) break
+            cursor -= Character.charCount(codePoint)
+        }
+        return before.substring(trimLeadingApostrophes(before, cursor, end), end)
+            .takeIf { word -> word.codePoints().anyMatch(Character::isLetter) }
     }
+
+    private fun trimLeadingApostrophes(text: String, start: Int, end: Int): Int {
+        var cursor = start
+        while (cursor < end) {
+            val codePoint = Character.codePointAt(text, cursor)
+            if (!isApostrophe(codePoint)) break
+            cursor += Character.charCount(codePoint)
+        }
+        return cursor
+    }
+
+    private fun isApostrophe(codePoint: Int): Boolean = codePoint in APOSTROPHES
+
+    private fun isCombiningMark(codePoint: Int): Boolean = when (Character.getType(codePoint)) {
+        Character.NON_SPACING_MARK.toInt(),
+        Character.COMBINING_SPACING_MARK.toInt(),
+        Character.ENCLOSING_MARK.toInt(),
+        -> true
+        else -> false
+    }
+
+    private fun isSentenceBoundary(codePoint: Int): Boolean =
+        codePoint in SENTENCE_ENDS ||
+            codePoint == '\n'.code || codePoint == '\r'.code ||
+            codePoint == LINE_SEPARATOR || codePoint == PARAGRAPH_SEPARATOR
+
+    private val APOSTROPHES = setOf('\''.code, '\u2019'.code, '\u02bc'.code, '\uff07'.code)
+    private val SENTENCE_ENDS = setOf(
+        '.'.code, '!'.code, '?'.code, '…'.code,
+        '。'.code, '！'.code, '？'.code, '؟'.code, '।'.code, '॥'.code,
+    )
+    private const val LINE_SEPARATOR = 0x2028
+    private const val PARAGRAPH_SEPARATOR = 0x2029
 }

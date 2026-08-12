@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -54,6 +55,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -87,6 +89,14 @@ class MainActivity : ComponentActivity() {
                 SetupScreen(repository)
             }
         }
+    }
+
+    override fun onStop() {
+        // A rotation gets a replacement activity immediately and keeps the process-owned transfer.
+        // Home, Back, or switching apps means the user has abandoned this foreground install flow;
+        // cancel before a completed download can put Package Installer over the unrelated app.
+        if (!isChangingConfigurations) UpdateManager.cancelInstall()
+        super.onStop()
     }
 }
 
@@ -140,6 +150,10 @@ private fun SetupScreen(repository: SettingsRepository) {
             // The button is disabled while a download runs, so this is a stale tap at worst. The
             // dialog is already saying "Downloading…"; leave it be.
             InstallOutcome.AlreadyRunning -> Unit
+            InstallOutcome.Cancelled -> {
+                availableUpdate = null
+                updateMessage = "Update download canceled."
+            }
             is InstallOutcome.Failed -> {
                 availableUpdate = null
                 updateMessage = "Update download failed: " +
@@ -373,14 +387,14 @@ private fun SetupScreen(repository: SettingsRepository) {
                     SettingSwitch(
                         label = "Incognito mode",
                         checked = settings.incognitoModeEnabled,
-                        description = "Stops Slide from learning new words and phrases. Existing learned data stays until you clear it.",
+                        description = "Stops Slide from learning new words, phrases, and per-key touch calibration. Existing learned data stays until you clear it.",
                     ) { value ->
                         scope.launch {
                             repository.update { it.copy(incognitoModeEnabled = value) }
                         }
                     }
                     Text(
-                        "Slide keeps learned words and phrases only on this device.",
+                        "Slide keeps learned words, phrases, and per-key touch calibration only on this device.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -418,7 +432,7 @@ private fun SetupScreen(repository: SettingsRepository) {
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Updates", style = MaterialTheme.typography.titleMedium)
-                    Text("GitHub is contacted only when you check. Android always confirms installation.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("Slide contacts GitHub when settings opens with update checks enabled, when you enable checks or change prerelease inclusion, and when you tap Check now. Android always confirms installation.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     SettingSwitch("Check GitHub for updates", settings.updateChecksEnabled) { value -> scope.launch { repository.update { it.copy(updateChecksEnabled = value) } } }
                     if (settings.updateChecksEnabled) {
                         SettingSwitch("Include prereleases", settings.includeAlphaUpdates) { value -> scope.launch { repository.update { it.copy(includeAlphaUpdates = value) } } }
@@ -466,7 +480,10 @@ private fun SetupScreen(repository: SettingsRepository) {
     }
     availableUpdate?.let { update ->
         AlertDialog(
-            onDismissRequest = { if (!downloading) availableUpdate = null },
+            onDismissRequest = {
+                if (downloading) UpdateManager.cancelInstall()
+                availableUpdate = null
+            },
             title = { Text("Slide ${update.version} is available") },
             text = {
                 Text(
@@ -487,7 +504,12 @@ private fun SetupScreen(repository: SettingsRepository) {
                 ) { Text(if (downloading) "Downloading…" else "Download and install") }
             },
             dismissButton = {
-                Button(enabled = !downloading, onClick = { availableUpdate = null }) { Text("Not now") }
+                Button(
+                    onClick = {
+                        if (downloading) UpdateManager.cancelInstall()
+                        availableUpdate = null
+                    },
+                ) { Text(if (downloading) "Cancel download" else "Not now") }
             },
         )
     }
@@ -500,8 +522,8 @@ private fun SetupScreen(repository: SettingsRepository) {
             title = { Text("Clear learned data?") },
             text = {
                 Text(
-                    "Slide will forget the personal words and word pairs it learned from your " +
-                        "typing. This cannot be undone.",
+                    "Slide will forget the personal words, word pairs, and per-key touch " +
+                        "calibration it learned from your typing. This cannot be undone.",
                 )
             },
             confirmButton = {
@@ -526,7 +548,8 @@ private fun SetupScreen(repository: SettingsRepository) {
                                     throw IOException("the clear request could not be stored safely")
                                 }
                                 showClearLearnedDataConfirmation = false
-                                privacyMessage = "Learned words and phrases were cleared."
+                                privacyMessage =
+                                    "Learned words, phrases, and per-key touch calibration were cleared."
                             } catch (error: Exception) {
                                 if (error is CancellationException) throw error
                                 showClearLearnedDataConfirmation = false
@@ -624,7 +647,12 @@ private fun SettingSwitch(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(enabled = enabled) { onChange(!checked) }
+            .toggleable(
+                value = checked,
+                enabled = enabled,
+                role = Role.Switch,
+                onValueChange = onChange,
+            )
             .padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -649,7 +677,9 @@ private fun SettingSwitch(
                 )
             }
         }
-        Switch(checked = checked, onCheckedChange = onChange, enabled = enabled)
+        // The row owns the toggle semantics and the full touch target. A null callback keeps this
+        // visual control from becoming a second TalkBack stop.
+        Switch(checked = checked, onCheckedChange = null, enabled = enabled)
     }
 }
 
@@ -723,7 +753,15 @@ private fun ThemeSwatch(color: Color, label: String, selected: Boolean, onClick:
 /** Keeps the offered release across a configuration change instead of re-checking GitHub for it. */
 private val UpdateInfoSaver = listSaver<UpdateInfo?, Any>(
     save = { update ->
-        update?.let { listOf<Any>(it.version, it.notes, it.apkUrl, it.apkSha256, it.apkSize) }
+        update?.let {
+            listOf<Any>(
+                it.version,
+                UpdateManager.boundReleaseNotes(it.notes),
+                it.apkUrl,
+                it.apkSha256,
+                it.apkSize,
+            )
+        }
             ?: emptyList()
     },
     restore = { saved ->

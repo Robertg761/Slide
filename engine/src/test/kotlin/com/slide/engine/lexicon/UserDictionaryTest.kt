@@ -274,6 +274,7 @@ class UserDictionaryTest {
         val unrelated = File(noBackup, "another-component.tmp").apply { writeText("keep") }
 
         assertTrue("clear intent was not made durable", store.requestDeletion())
+        assertTrue(store.hasPendingDeletion())
         assertFalse(words.exists())
         assertFalse(pairsFile.exists())
         residues.forEach { assertFalse("left ${it.name}", it.exists()) }
@@ -297,11 +298,33 @@ class UserDictionaryTest {
         assertFalse(afterRestart.save(pairs))
 
         assertTrue(afterRestart.completePendingDeletion())
+        assertFalse(afterRestart.hasPendingDeletion())
         assertFalse(marker.exists())
         assertFalse(words.exists())
         assertFalse(pairsFile.exists())
         assertTrue("unrelated no-backup data was removed", unrelated.exists())
         assertTrue("save did not resume after completion", afterRestart.save(dictionary))
+    }
+
+    @Test
+    fun `durable deletion request notifies a live consumer even before epoch publication`() {
+        val noBackup = File(folder.root, "no-backup-signal").apply { mkdir() }
+        val store = UserDictionaryStore(
+            File(folder.root, "signal-words.txt"),
+            File(folder.root, "signal-pairs.txt"),
+            noBackup,
+        )
+        val before = UserDictionaryStore.latestDeletionRequestGeneration()
+        val observed = mutableListOf<Long>()
+        val remove = store.addDeletionRequestListener(observed::add)
+        try {
+            assertTrue(store.requestDeletion())
+        } finally {
+            remove()
+        }
+
+        assertEquals(listOf(before + 1L), observed)
+        assertEquals(before + 1L, UserDictionaryStore.latestDeletionRequestGeneration())
     }
 
     @Test
@@ -344,6 +367,72 @@ class UserDictionaryTest {
         assertFalse(store.requestDeletion())
         assertTrue("words were deleted without durable clear intent", words.exists())
         assertTrue("pairs were deleted without durable clear intent", pairs.exists())
+    }
+
+    @Test
+    fun `failed marker directory sync never begins destructive cleanup`() {
+        val words = File(folder.root, "learned.txt").apply { writeText("keep\t3\n") }
+        val pairs = File(folder.root, "pairs.txt").apply { writeText("keep\tpair\t4\n") }
+        val noBackup = File(folder.root, "no-backup").apply { mkdir() }
+        val store = UserDictionaryStore(
+            words,
+            pairs,
+            noBackup,
+            directorySync = { false },
+        )
+
+        assertFalse(store.requestDeletion())
+        assertTrue("words were deleted without a durable marker entry", words.exists())
+        assertTrue("pairs were deleted without a durable marker entry", pairs.exists())
+        // The live marker is retained even when its directory entry could not be proven durable.
+        assertTrue(File(noBackup, "learned_data.clear_pending").exists())
+    }
+
+    @Test
+    fun `failed payload directory sync retains the deletion marker`() {
+        val words = File(folder.root, "learned.txt").apply { writeText("private\t3\n") }
+        val pairs = File(folder.root, "pairs.txt").apply { writeText("private\tpair\t4\n") }
+        val noBackup = File(folder.root, "no-backup").apply { mkdir() }
+        val payloadDirectory = folder.root.absoluteFile
+        val store = UserDictionaryStore(
+            words,
+            pairs,
+            noBackup,
+            directorySync = { directory -> directory?.absoluteFile != payloadDirectory },
+        )
+
+        // The request itself is durable, even though completing the payload transaction is not.
+        assertTrue(store.requestDeletion())
+        assertFalse(store.completePendingDeletion())
+        assertTrue(File(noBackup, "learned_data.clear_pending").exists())
+        assertFalse(store.save(dictionary))
+    }
+
+    @Test
+    fun `failed marker removal sync recreates fail closed state`() {
+        val words = File(folder.root, "learned.txt").apply { writeText("private\t3\n") }
+        val pairs = File(folder.root, "pairs.txt").apply { writeText("private\tpair\t4\n") }
+        val noBackup = File(folder.root, "no-backup").apply { mkdir() }
+        var syncCalls = 0
+        val store = UserDictionaryStore(
+            words,
+            pairs,
+            noBackup,
+            directorySync = {
+                syncCalls++
+                // marker create, two payload directories, two completion directories, then
+                // marker removal. Re-persisting after the sixth failure is allowed to succeed.
+                syncCalls != 6
+            },
+        )
+
+        assertTrue(store.requestDeletion())
+        assertFalse(store.completePendingDeletion())
+        assertTrue(
+            "uncertain completion did not restore the marker",
+            File(noBackup, "learned_data.clear_pending").exists(),
+        )
+        assertFalse(store.save(dictionary))
     }
 
     @Test

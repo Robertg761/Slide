@@ -80,14 +80,38 @@ object KeyGeometry {
 
     /**
      * Finds the key under (x, y), falling back to the nearest key when the touch lands in the
-     * leading/trailing gap of a row or slightly outside the keyboard.
+     * leading/trailing gap of a row.
+     *
+     * The fallback is deliberately row-local and bounded. The view can contain intentional blank
+     * space above or below the placed keys (most notably the user-configurable bottom padding),
+     * and treating that as the nearest key makes a tap on empty chrome type a character. Likewise,
+     * a pointer dragged well past a row must be able to cancel instead of snapping back to an edge
+     * key no matter how far away it is.
      */
     fun hitTest(keys: List<PlacedKey>, x: Float, y: Float): PlacedKey? {
         keys.firstOrNull { it.contains(x, y) }?.let { return it }
-        return keys.minByOrNull { it.squaredDistanceTo(x, y) }
+
+        var nearest: PlacedKey? = null
+        var nearestDistance = Float.POSITIVE_INFINITY
+        for (candidate in keys) {
+            if (y < candidate.top || y >= candidate.bottom) continue
+            val distance = candidate.squaredDistanceTo(x, y)
+            if (distance < nearestDistance) {
+                nearest = candidate
+                nearestDistance = distance
+            }
+        }
+        val resolved = nearest ?: return null
+        // y is already inside this row, so only horizontal distance remains. Half a key accepts
+        // the largest built-in half-unit indent while still bounding the outer edge.
+        val maximumFallback = resolved.width * MAX_FALLBACK_KEY_FRACTION
+        return resolved.takeIf { nearestDistance <= maximumFallback * maximumFallback }
     }
 
     /** Keys whose cell the point falls within, restricted to gesture-eligible letter keys. */
     fun gestureKeyAt(keys: List<PlacedKey>, x: Float, y: Float): Key? =
         keys.firstOrNull { it.contains(x, y) && it.key.gestureEligible }?.key
+
+    /** Half a key covers the deliberate half-unit row indents without accepting distant taps. */
+    private const val MAX_FALLBACK_KEY_FRACTION = 0.5f
 }

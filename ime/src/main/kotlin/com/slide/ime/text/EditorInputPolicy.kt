@@ -15,6 +15,8 @@ internal data class EditorInputPolicy(
     val isPassword: Boolean,
     val allowsVoice: Boolean,
     val keyboardMode: EditorKeyboardMode,
+    /** TYPE_NULL editors ask the IME for hardware-style key events, not composing text. */
+    val usesRawKeyEvents: Boolean,
 ) {
     companion object {
         val NaturalText = EditorInputPolicy(
@@ -23,6 +25,7 @@ internal data class EditorInputPolicy(
             isPassword = false,
             allowsVoice = true,
             keyboardMode = EditorKeyboardMode.TEXT,
+            usesRawKeyEvents = false,
         )
 
         fun from(inputType: Int): EditorInputPolicy {
@@ -49,6 +52,13 @@ internal data class EditorInputPolicy(
                     else -> EditorKeyboardMode.DATETIME
                 }
                 return suppressed(mode)
+            }
+            if (inputClass == InputType.TYPE_NULL) {
+                return suppressed(
+                    EditorKeyboardMode.TEXT,
+                    allowsVoice = false,
+                    usesRawKeyEvents = true,
+                )
             }
             if (inputClass != InputType.TYPE_CLASS_TEXT) {
                 return suppressed(EditorKeyboardMode.TEXT, allowsVoice = false)
@@ -85,6 +95,7 @@ internal data class EditorInputPolicy(
             isPassword = true,
             allowsVoice = false,
             keyboardMode = EditorKeyboardMode.TEXT,
+            usesRawKeyEvents = false,
         )
 
         private val NumberPassword = Password.copy(keyboardMode = EditorKeyboardMode.PIN)
@@ -92,12 +103,14 @@ internal data class EditorInputPolicy(
         private fun suppressed(
             mode: EditorKeyboardMode,
             allowsVoice: Boolean = mode == EditorKeyboardMode.TEXT,
+            usesRawKeyEvents: Boolean = false,
         ) = EditorInputPolicy(
             allowsSuggestions = false,
             allowsPersonalizedLearning = false,
             isPassword = false,
             allowsVoice = allowsVoice,
             keyboardMode = mode,
+            usesRawKeyEvents = usesRawKeyEvents,
         )
     }
 }

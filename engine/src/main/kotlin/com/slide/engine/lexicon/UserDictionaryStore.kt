@@ -16,6 +16,8 @@ import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.nio.file.StandardOpenOption
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArraySet
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Keeps a [UserDictionary] on disk, in the app's private storage and nowhere else.
@@ -39,6 +41,8 @@ class UserDictionaryStore(
             ?: throw IllegalArgumentException("Learned-word file has no parent directory"),
         SPATIAL_FILE_NAME,
     ),
+    /** Injectable only so durability failures can be exercised on the host JVM. */
+    private val directorySync: (File?) -> Boolean = ::syncDirectory,
 ) {
 
     /** Serialises separate Store instances that address the same learned-data files. */
@@ -78,7 +82,7 @@ class UserDictionaryStore(
         }
     }
 
-    /** Persists [from], returning false when the previous on-disk copy had to be left untouched. */
+    /** Persists [from], returning false when replacement or its durability could not be proved. */
     fun save(from: UserDictionary): Boolean =
         synchronized(operationLock) {
             if (deletionPending()) return@synchronized false
@@ -115,7 +119,7 @@ class UserDictionaryStore(
         }
     }
 
-    /** Persists [from], returning false when the previous on-disk copy had to be left untouched. */
+    /** Persists [from], returning false when replacement or its durability could not be proved. */
     fun save(from: UserBigrams): Boolean =
         synchronized(operationLock) {
             if (deletionPending()) return@synchronized false
@@ -179,10 +183,42 @@ class UserDictionaryStore(
      * can then never make a surviving learned file eligible to load again. The IME calls
      * [completePendingDeletion] under its learned-data mutex to finish the transaction.
      */
-    fun requestDeletion(): Boolean = synchronized(operationLock) {
-        if (!persistDeletionMarker()) return@synchronized false
-        if (!deleteLearnedData()) Log.w(TAG, "Learned-data deletion remains pending")
-        true
+    fun requestDeletion(): Boolean {
+        // Publish only after the marker and payload transaction have left fail-closed state, and do
+        // not invoke external listeners while the payload lock is held. Keeping both file phases in
+        // one critical section also prevents a fast IME completion from removing the marker before
+        // this request finishes, then having this request delete newly learned post-clear data.
+        val generation = synchronized(operationLock) {
+            if (!persistDeletionMarker()) return false
+            val requestGeneration = deletionRequestGeneration.incrementAndGet()
+            if (!deleteLearnedData()) Log.w(TAG, "Learned-data deletion remains pending")
+            requestGeneration
+        }
+        for (listener in deletionRequestListeners) {
+            try {
+                listener(generation)
+            } catch (error: RuntimeException) {
+                // One live consumer must not make a successfully persisted user request look like
+                // it failed, nor prevent the remaining consumers from purging their snapshots.
+                Log.w(TAG, "Could not notify a learned-data deletion listener", error)
+            }
+        }
+        return true
+    }
+
+    /** Whether a durable clear request still exists, treating read uncertainty as pending. */
+    fun hasPendingDeletion(): Boolean = synchronized(operationLock) { deletionPending() }
+
+    /**
+     * Observes deletion requests made in this application process.
+     *
+     * MainActivity and the IME run in the default process. Registration is synchronous, so a live
+     * IME cannot miss the signal even when publishing the settings epoch fails afterward. A service
+     * that was not alive needs no signal: its startup load obeys the durable on-disk marker.
+     */
+    fun addDeletionRequestListener(listener: (Long) -> Unit): () -> Unit {
+        deletionRequestListeners += listener
+        return { deletionRequestListeners -= listener }
     }
 
     /**
@@ -197,17 +233,36 @@ class UserDictionaryStore(
             Log.w(TAG, "Could not complete learned-data deletion")
             return@synchronized false
         }
-        val removed = deleteIfPresent(deletionMarker)
-        if (!removed) Log.w(TAG, "Could not clear learned-data deletion marker")
-        removed
+        if (!deleteIfPresent(deletionMarker)) {
+            Log.w(TAG, "Could not clear learned-data deletion marker")
+            return@synchronized false
+        }
+        if (!directorySync(deletionMarker.absoluteFile.parentFile)) {
+            // The payload deletes are durable already, so either on-disk outcome is private: the
+            // marker removal survives, or it rolls back and deletion is retried. Recreate the
+            // marker in the live namespace as well, however, so this process cannot start saving
+            // new learning while the marker's durable state is uncertain.
+            persistDeletionMarker()
+            Log.w(TAG, "Could not make learned-data deletion completion durable")
+            return@synchronized false
+        }
+        true
     }
 
-    /** Deletes the payload and every known save residue, but never the deletion marker. */
+    /** Deletes and syncs the payload and every known save residue, but never the marker. */
     private fun deleteLearnedData(): Boolean {
         var succeeded = true
+        val affectedDirectories = linkedSetOf<File>()
         for (target in listOf(file, pairFile, spatialFile)) {
+            target.absoluteFile.parentFile?.let(affectedDirectories::add)
+            affectedDirectories += temporaryDirectoriesFor(target)
             if (!deleteIfPresent(target)) succeeded = false
             if (!deleteTemporaryFiles(target)) succeeded = false
+        }
+        // Only after every unlink has been attempted do we force the directory entries. The
+        // marker stays in place if any directory cannot prove those removals durable.
+        for (directory in affectedDirectories) {
+            if (!directorySync(directory)) succeeded = false
         }
         return succeeded
     }
@@ -252,7 +307,16 @@ class UserDictionaryStore(
             // The bytes were synced above, but the rename that made them the dictionary lives in
             // the directory, and that is a separate write. Without this a power cut can leave the
             // old file — or no file — behind data we have already told the caller is saved.
-            syncDirectory(target.absoluteFile.parentFile)
+            val renamedDirectories = linkedSetOf<File>()
+            target.absoluteFile.parentFile?.let(renamedDirectories::add)
+            checkNotNull(temporary).absoluteFile.parentFile?.let(renamedDirectories::add)
+            var renameDurable = true
+            for (directory in renamedDirectories) {
+                if (!directorySync(directory)) renameDurable = false
+            }
+            if (!renameDurable) {
+                throw IOException("Could not make the ${target.name} rename durable")
+            }
             return true
         } catch (e: IOException) {
             Log.w(TAG, "Could not save ${target.name}", e)
@@ -279,7 +343,9 @@ class UserDictionaryStore(
         // The marker's own contents are durable now, but the directory entry that makes it exist
         // is not, and everything after this point deletes personal data on the strength of it. A
         // power cut between the two is exactly how a cleared dictionary comes back on reboot.
-        syncDirectory(deletionMarker.absoluteFile.parentFile)
+        if (!directorySync(deletionMarker.absoluteFile.parentFile)) {
+            throw IOException("Could not make the learned-data deletion marker durable")
+        }
         true
     } catch (e: IOException) {
         Log.w(TAG, "Could not persist learned-data deletion marker", e)
@@ -287,27 +353,6 @@ class UserDictionaryStore(
     } catch (e: SecurityException) {
         Log.w(TAG, "Could not persist learned-data deletion marker", e)
         false
-    }
-
-    /**
-     * Flushes a directory's own entries, so a rename or a creation survives losing power.
-     *
-     * Opening a directory read-only and forcing the channel is the portable spelling of `fsync(2)`
-     * on a directory; filesystems that will not have it just say so, and a best-effort sync is
-     * still strictly better than the plain rename this replaces. (Android's own `AtomicFile` skips
-     * this step entirely, which is why it is spelled out here rather than borrowed.)
-     */
-    private fun syncDirectory(directory: File?) {
-        if (directory == null) return
-        try {
-            FileChannel.open(directory.toPath(), StandardOpenOption.READ).use { it.force(true) }
-        } catch (e: IOException) {
-            Log.d(TAG, "Could not sync ${directory.name}; the rename may not be durable yet", e)
-        } catch (e: SecurityException) {
-            Log.d(TAG, "Could not sync ${directory.name}; the rename may not be durable yet", e)
-        } catch (e: UnsupportedOperationException) {
-            Log.d(TAG, "Could not sync ${directory.name}; the rename may not be durable yet", e)
-        }
     }
 
     /** Any uncertainty about the marker is treated as pending, which is the privacy-safe side. */
@@ -319,13 +364,9 @@ class UserDictionaryStore(
 
     private fun deleteTemporaryFiles(target: File): Boolean {
         val prefix = "${target.name}."
-        val directories = linkedSetOf(
-            temporaryDirectory.absoluteFile,
-            target.absoluteFile.parentFile,
-        ).filterNotNull()
         var succeeded = true
 
-        for (directory in directories) {
+        for (directory in temporaryDirectoriesFor(target)) {
             val candidates = try {
                 directory.listFiles { candidate ->
                     candidate.name.startsWith(prefix) && candidate.name.endsWith(TEMP_SUFFIX)
@@ -353,6 +394,12 @@ class UserDictionaryStore(
         return succeeded
     }
 
+    private fun temporaryDirectoriesFor(target: File): Set<File> =
+        linkedSetOf<File>().apply {
+            add(temporaryDirectory.absoluteFile)
+            target.absoluteFile.parentFile?.let(::add)
+        }
+
     /** Treats a concurrent disappearance as success while still reporting a real refusal. */
     private fun deleteIfPresent(target: File): Boolean = try {
         !target.exists() || target.delete() || !target.exists()
@@ -360,16 +407,47 @@ class UserDictionaryStore(
         false
     }
 
-    private companion object {
-        const val TAG = "SlideUserDict"
-        const val FILE_NAME = "learned_words.txt"
-        const val PAIR_FILE_NAME = "learned_pairs.txt"
-        const val SPATIAL_FILE_NAME = "learned_touch_offsets.txt"
-        const val TEMP_SUFFIX = ".tmp"
-        const val CLEAR_PENDING_FILE_NAME = "learned_data.clear_pending"
-        val CLEAR_PENDING_CONTENT = "clear\n".toByteArray(StandardCharsets.US_ASCII)
+    companion object {
+        private const val TAG = "SlideUserDict"
+        private const val FILE_NAME = "learned_words.txt"
+        private const val PAIR_FILE_NAME = "learned_pairs.txt"
+        private const val SPATIAL_FILE_NAME = "learned_touch_offsets.txt"
+        private const val TEMP_SUFFIX = ".tmp"
+        private const val CLEAR_PENDING_FILE_NAME = "learned_data.clear_pending"
+        private val CLEAR_PENDING_CONTENT = "clear\n".toByteArray(StandardCharsets.US_ASCII)
 
         /** App activity and IME service share a process but may construct separate Store objects. */
-        val operationLocks = ConcurrentHashMap<String, Any>()
+        private val operationLocks = ConcurrentHashMap<String, Any>()
+
+        private val deletionRequestGeneration = AtomicLong()
+        private val deletionRequestListeners = CopyOnWriteArraySet<(Long) -> Unit>()
+
+        /** Cheap correlation token for the settings-epoch path; performs no filesystem IO. */
+        fun latestDeletionRequestGeneration(): Long = deletionRequestGeneration.get()
+    }
+}
+
+/**
+ * Forces a directory's own entries, so a rename, unlink, or marker creation survives power loss.
+ *
+ * Opening a directory read-only and forcing its channel is the JVM spelling of `fsync(2)` on a
+ * directory. Failure is deliberately visible to the caller: deletion may only leave fail-closed
+ * state, never silently report durability that the filesystem did not provide.
+ */
+private fun syncDirectory(directory: File?): Boolean {
+    if (directory == null) return false
+    return try {
+        if (!directory.exists()) return true
+        FileChannel.open(directory.toPath(), StandardOpenOption.READ).use { it.force(true) }
+        true
+    } catch (e: IOException) {
+        Log.w("SlideUserDict", "Could not sync ${directory.name}", e)
+        false
+    } catch (e: SecurityException) {
+        Log.w("SlideUserDict", "Could not sync ${directory.name}", e)
+        false
+    } catch (e: UnsupportedOperationException) {
+        Log.w("SlideUserDict", "Could not sync ${directory.name}", e)
+        false
     }
 }

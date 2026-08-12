@@ -114,11 +114,10 @@ class BigramLoaderTest {
     fun `rejects a changed lexicon even when its word count is identical`() {
         val lexiconBytes = File("src/main/assets/${LexiconLoader.ASSET_NAME}").readBytes()
         val changedBytes = lexiconBytes.copyOf()
-        // The first front-coded word starts after the 17-byte header and its two length bytes.
-        // Changing that byte preserves every header count while changing the index-to-word map.
-        changedBytes[FIRST_WORD_OFFSET] =
-            if (changedBytes[FIRST_WORD_OFFSET] == 'a'.code.toByte()) 'b'.code.toByte()
-            else 'a'.code.toByte()
+        // Change "aachen" to "aachem". The replacement remains strictly between "aaa" and
+        // "aachen's", so the lexicon is still semantically valid while its index map differs.
+        assertEquals('n'.code.toByte(), changedBytes[CHANGED_WORD_BYTE_OFFSET])
+        changedBytes[CHANGED_WORD_BYTE_OFFSET] = 'm'.code.toByte()
         val changedLexicon = LexiconLoader.read(ByteArrayInputStream(changedBytes))
         assertEquals(lexicon.size, changedLexicon.size)
 
@@ -168,6 +167,45 @@ class BigramLoaderTest {
         assertTrue(error.message!!, error.message!!.contains("backwards"))
     }
 
+    @Test
+    fun `rejects a context outside the lexicon`() {
+        val error = assertThrows(IOException::class.java) {
+            BigramLoader.read(ByteArrayInputStream(withContext(0, lexicon.size)), lexicon)
+        }
+        assertTrue(error.message!!, error.message!!.contains("outside"))
+    }
+
+    @Test
+    fun `rejects contexts that are not strictly ordered`() {
+        val buffer = ByteBuffer.wrap(raw)
+        val first = buffer.getInt(HEADER_BYTES)
+        val second = buffer.getInt(HEADER_BYTES + Int.SIZE_BYTES)
+
+        val error = assertThrows(IOException::class.java) {
+            BigramLoader.read(ByteArrayInputStream(withContext(0, second, 1, first)), lexicon)
+        }
+        assertTrue(error.message!!, error.message!!.contains("ordered"))
+    }
+
+    @Test
+    fun `rejects a semantically empty zero score`() {
+        val tampered = raw.copyOf()
+        tampered[scoresPosition()] = 0
+
+        val error = assertThrows(IOException::class.java) {
+            BigramLoader.read(ByteArrayInputStream(tampered), lexicon)
+        }
+        assertTrue(error.message!!, error.message!!.contains("zero score"))
+    }
+
+    @Test
+    fun `rejects trailing data`() {
+        val error = assertThrows(IOException::class.java) {
+            BigramLoader.read(ByteArrayInputStream(raw + byteArrayOf(0x42)), lexicon)
+        }
+        assertTrue(error.message!!, error.message!!.contains("trailing"))
+    }
+
     /**
      * A successor index is a varint, and a varint that runs to five bytes reaches the sign bit.
      * The resulting negative index passed the "outside the lexicon" check, was stored, and then
@@ -185,8 +223,7 @@ class BigramLoaderTest {
         val error = assertThrows(IOException::class.java) {
             BigramLoader.read(ByteArrayInputStream(tampered), lexicon)
         }
-        // Naming the index proves this is the sign check failing rather than some later mishap.
-        assertTrue(error.message!!, error.message!!.contains("${Int.MIN_VALUE}"))
+        assertTrue(error.message!!, error.message!!.contains("varint"))
     }
 
     /** Overwrites entries of the offsets table, given as index-to-value pairs. */
@@ -196,6 +233,16 @@ class BigramLoaderTest {
         val position = offsetsPosition()
         for (i in indexThenValue.indices step 2) {
             buffer.putInt(position + indexThenValue[i] * Int.SIZE_BYTES, indexThenValue[i + 1])
+        }
+        return tampered
+    }
+
+    /** Overwrites entries of the ascending context table, given as index-to-value pairs. */
+    private fun withContext(vararg indexThenValue: Int): ByteArray {
+        val tampered = raw.copyOf()
+        val buffer = ByteBuffer.wrap(tampered)
+        for (i in indexThenValue.indices step 2) {
+            buffer.putInt(HEADER_BYTES + indexThenValue[i] * Int.SIZE_BYTES, indexThenValue[i + 1])
         }
         return tampered
     }
@@ -210,6 +257,11 @@ class BigramLoaderTest {
     private fun blockPosition(): Int {
         val contextCount = ByteBuffer.wrap(raw).getInt(CONTEXT_COUNT_OFFSET)
         return offsetsPosition() + (contextCount + 1) * Int.SIZE_BYTES
+    }
+
+    private fun scoresPosition(): Int {
+        val blockLength = ByteBuffer.wrap(raw).getInt(BLOCK_LENGTH_OFFSET)
+        return blockPosition() + blockLength
     }
 
     // endregion
@@ -235,10 +287,11 @@ class BigramLoaderTest {
 
     private companion object {
         const val WORD_COUNT_OFFSET = 5
-        const val FIRST_WORD_OFFSET = 19
+        const val CHANGED_WORD_BYTE_OFFSET = 29
 
         /** Magic, version, word count, lexicon fingerprint, then three counts. */
         const val CONTEXT_COUNT_OFFSET = 4 + 1 + 4 + 32
+        const val BLOCK_LENGTH_OFFSET = CONTEXT_COUNT_OFFSET + 2 * Int.SIZE_BYTES
         const val HEADER_BYTES = CONTEXT_COUNT_OFFSET + 3 * Int.SIZE_BYTES
     }
 }

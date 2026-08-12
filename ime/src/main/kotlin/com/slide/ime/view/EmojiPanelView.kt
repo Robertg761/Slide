@@ -12,6 +12,7 @@ import android.view.MotionEvent
 import android.view.VelocityTracker
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.OverScroller
 import androidx.core.view.ViewCompat
@@ -147,7 +148,7 @@ class EmojiPanelView(context: Context) : View(context) {
     private var popupTone = EmojiData.TONE_DEFAULT
 
     /**
-     * The tone the row was opened on, which is the slot placed under the finger.
+     * The tone the row was opened on, whose slot is aligned horizontally with the pressed cell.
      *
      * Held separately from [popupTone] because that one follows the finger, and a row that moved
      * with it would be impossible to aim at.
@@ -195,7 +196,8 @@ class EmojiPanelView(context: Context) : View(context) {
         if (entry >= 0 && data?.hasVariants(entry) == true) {
             popupIndex = entry
             popupPosition = pressedIndex
-            // Opens on whatever is already the default, so lifting without sliding changes nothing.
+            // Highlight the current default initially; the final x/y hit test still cancels a
+            // release that never enters the popup.
             popupTone = if (skinTone in 0 until EmojiData.TONE_COUNT) skinTone else EmojiData.TONE_DEFAULT
             popupAnchorTone = popupTone
             pressedIndex = -1
@@ -243,6 +245,10 @@ class EmojiPanelView(context: Context) : View(context) {
             virtualViewIds += A11Y_BACKSPACE
         }
 
+        override fun onPopulateNodeForHost(node: AccessibilityNodeInfoCompat) {
+            populateAccessibilityScrollActions(node)
+        }
+
         override fun onPopulateNodeForVirtualView(
             virtualViewId: Int,
             node: AccessibilityNodeInfoCompat,
@@ -281,6 +287,9 @@ class EmojiPanelView(context: Context) : View(context) {
             ) {
                 closeTonePopup()
                 return true
+            }
+            accessibilityScrollDirection(action)?.let { direction ->
+                return scrollForAccessibility(direction)
             }
             if (virtualViewId >= A11Y_EMOJI_BASE && virtualViewId < A11Y_TONE_BASE) {
                 val position = virtualViewId - A11Y_EMOJI_BASE
@@ -335,6 +344,7 @@ class EmojiPanelView(context: Context) : View(context) {
                     (top + cell).coerceAtMost(gridTop() + gridHeight()).toInt(),
                 ),
             )
+            populateAccessibilityScrollActions(node)
         }
 
         private fun populateToneNode(id: Int, node: AccessibilityNodeInfoCompat) {
@@ -432,6 +442,75 @@ class EmojiPanelView(context: Context) : View(context) {
         accessibilityHelper.invalidateRoot()
     }
 
+    private fun canScrollBackward(): Boolean = scrollY > SCROLL_EPSILON_PX
+
+    private fun canScrollForward(): Boolean = scrollY < maxScroll() - SCROLL_EPSILON_PX
+
+    private fun populateAccessibilityScrollActions(node: AccessibilityNodeInfoCompat) {
+        val backward = canScrollBackward()
+        val forward = canScrollForward()
+        node.isScrollable = backward || forward
+        if (backward) {
+            node.addAction(AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_SCROLL_BACKWARD)
+            node.addAction(AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_SCROLL_UP)
+        }
+        if (forward) {
+            node.addAction(AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_SCROLL_FORWARD)
+            node.addAction(AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_SCROLL_DOWN)
+        }
+    }
+
+    /**
+     * Moves by nearly one viewport, retaining one row for orientation, and transfers accessibility
+     * focus to the equivalent cell on the newly visible page when the old cell scrolled away.
+     */
+    private fun scrollForAccessibility(direction: Int): Boolean {
+        if (popupIndex >= 0 || page().isEmpty()) return false
+        if (direction < 0 && !canScrollBackward()) return false
+        if (direction > 0 && !canScrollForward()) return false
+
+        scroller.forceFinished(true)
+        val visibleBefore = visiblePositions()
+        val focusedBefore = accessibilityHelper.getAccessibilityFocusedVirtualViewId()
+            .takeIf { it in A11Y_EMOJI_BASE until A11Y_TONE_BASE }
+            ?.minus(A11Y_EMOJI_BASE)
+
+        val pageDistance = max(cellSize(), gridHeight() - cellSize())
+        scrollY = EmojiAccessibilityPaging.targetOffset(
+            current = scrollY,
+            maximum = maxScroll(),
+            pageDistance = pageDistance,
+            direction = direction,
+        )
+        val visibleAfter = visiblePositions()
+
+        accessibilityHelper.invalidateRoot()
+        invalidate()
+        sendAccessibilityEvent(AccessibilityEvent.TYPE_VIEW_SCROLLED)
+
+        val focusTarget = focusedBefore?.let {
+            EmojiAccessibilityPaging.focusTarget(visibleBefore, visibleAfter, it)
+        }
+        if (focusTarget != null) {
+            accessibilityHelper.getAccessibilityNodeProvider(this)?.performAction(
+                A11Y_EMOJI_BASE + focusTarget,
+                AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS,
+                null,
+            )
+        }
+        return true
+    }
+
+    private fun accessibilityScrollDirection(action: Int): Int? = when (action) {
+        AccessibilityNodeInfo.ACTION_SCROLL_FORWARD,
+        AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_DOWN.id,
+        -> 1
+        AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD,
+        AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_UP.id,
+        -> -1
+        else -> null
+    }
+
     private fun visiblePositions(): IntRange {
         val entries = page()
         if (entries.isEmpty() || gridHeight() <= 0f) return IntRange.EMPTY
@@ -439,7 +518,7 @@ class EmojiPanelView(context: Context) : View(context) {
         val firstRow = max(0, (scrollY / cell).toInt())
         val lastRow = min(
             ceil(entries.size / columns().toFloat()).toInt() - 1,
-            ((scrollY + gridHeight()) / cell).toInt(),
+            ceil((scrollY + gridHeight()) / cell).toInt() - 1,
         )
         val first = firstRow * columns()
         val last = min(entries.lastIndex, (lastRow + 1) * columns() - 1)
@@ -756,8 +835,8 @@ class EmojiPanelView(context: Context) : View(context) {
 
         val popupWidth = min(width.toFloat(), cell * POPUP_SLOTS)
         val cellLeft = column * cell
-        // The slot the row opened on goes under the finger, so releasing without sliding picks what
-        // was already the default rather than whichever tone happens to sit in the middle.
+        // Align the current tone with the originating cell so the shortest upward drag preserves
+        // it rather than landing on whichever tone happens to sit in the middle.
         val anchor = (popupAnchorTone + 1 + 0.5f) * (popupWidth / POPUP_SLOTS)
         val left = (cellLeft + cell / 2f - anchor).coerceIn(0f, width - popupWidth)
 
@@ -783,7 +862,7 @@ class EmojiPanelView(context: Context) : View(context) {
             // A second finger is not a second press: the panel keeps following the first one.
             MotionEvent.ACTION_POINTER_DOWN -> Unit
             MotionEvent.ACTION_POINTER_UP -> onPointerLift(event)
-            MotionEvent.ACTION_UP -> onUp()
+            MotionEvent.ACTION_UP -> onUp(event)
             MotionEvent.ACTION_CANCEL -> cancelTouch()
         }
         return true
@@ -797,7 +876,7 @@ class EmojiPanelView(context: Context) : View(context) {
         velocityTracker = VelocityTracker.obtain().apply { addMovement(event) }
 
         when {
-            popupIndex >= 0 -> popupTone = toneAt(event.x)
+            popupIndex >= 0 -> popupTone = toneAt(event.x, event.y)
             event.y < tabHeight() -> pressedTab = tabAt(event.x)
             event.y >= height - footerHeight() -> {
                 pressedBack = event.x < backButtonWidth()
@@ -829,7 +908,7 @@ class EmojiPanelView(context: Context) : View(context) {
         val y = event.getY(index)
 
         if (popupIndex >= 0) {
-            val tone = toneAt(x)
+            val tone = toneAt(x, y)
             if (tone != popupTone) {
                 popupTone = tone
                 invalidate()
@@ -888,9 +967,13 @@ class EmojiPanelView(context: Context) : View(context) {
         val tracked = activePointerId ?: return
         if (event.getPointerId(event.actionIndex) != tracked) return
 
+        if (popupIndex >= 0) {
+            popupTone = toneAt(event.getX(event.actionIndex), event.getY(event.actionIndex))
+        }
+
         val successor = EmojiGridPointer.successorIndex(event.pointerCount, event.actionIndex)
         if (successor == null) {
-            onUp()
+            onUp(event)
             return
         }
 
@@ -899,7 +982,14 @@ class EmojiPanelView(context: Context) : View(context) {
         downY = event.getY(successor)
     }
 
-    private fun onUp() {
+    private fun onUp(event: MotionEvent) {
+        if (popupIndex >= 0) {
+            val index = activePointerId
+                ?.let(event::findPointerIndex)
+                ?.takeIf { it >= 0 }
+                ?: event.actionIndex
+            popupTone = toneAt(event.getX(index), event.getY(index))
+        }
         resolveTouch()
         releaseTracker()
         activePointerId = null
@@ -1030,13 +1120,16 @@ class EmojiPanelView(context: Context) : View(context) {
         return if (tab in 0 until count) tab else -1
     }
 
-    /** Tone under a touch in the popup row, [EmojiData.TONE_DEFAULT] over its leading untoned slot. */
-    private fun toneAt(x: Float): Int {
-        if (!popupRect.contains(x, popupRect.centerY())) return popupTone
-        val slot = popupRect.width() / POPUP_SLOTS
-        val position = ((x - popupRect.left) / slot).toInt().coerceIn(0, POPUP_SLOTS - 1)
-        return position - 1
-    }
+    /** Tone under a touch in the popup row, or [NO_POPUP_TONE] after sliding outside it. */
+    private fun toneAt(x: Float, y: Float): Int = EmojiTonePopupHitTest.toneAt(
+        x = x,
+        y = y,
+        left = popupRect.left,
+        top = popupRect.top,
+        right = popupRect.right,
+        bottom = popupRect.bottom,
+        slots = POPUP_SLOTS,
+    ) ?: NO_POPUP_TONE
 
     /** Grid position under a touch, or -1 when it lands outside the grid or past the last cell. */
     private fun positionAt(x: Float, y: Float): Int {
@@ -1090,9 +1183,37 @@ class EmojiPanelView(context: Context) : View(context) {
 
     override fun onInitializeAccessibilityNodeInfo(info: AccessibilityNodeInfo) {
         super.onInitializeAccessibilityNodeInfo(info)
-        info.className = "android.view.View"
+        info.className = "android.widget.GridView"
         info.isFocusable = true
         info.contentDescription = accessibilityDescription()
+        info.isScrollable = canScrollBackward() || canScrollForward()
+        if (canScrollBackward()) {
+            info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_BACKWARD)
+            info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_UP)
+        }
+        if (canScrollForward()) {
+            info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_FORWARD)
+            info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_DOWN)
+        }
+    }
+
+    override fun onInitializeAccessibilityEvent(event: AccessibilityEvent) {
+        super.onInitializeAccessibilityEvent(event)
+        if (event.eventType != AccessibilityEvent.TYPE_VIEW_SCROLLED) return
+        val visible = visiblePositions()
+        event.isScrollable = canScrollBackward() || canScrollForward()
+        event.scrollY = scrollY.roundToInt()
+        event.maxScrollY = maxScroll().roundToInt()
+        event.itemCount = page().size
+        if (!visible.isEmpty()) {
+            event.fromIndex = visible.first
+            event.toIndex = visible.last
+        }
+    }
+
+    override fun performAccessibilityAction(action: Int, arguments: Bundle?): Boolean {
+        accessibilityScrollDirection(action)?.let { return scrollForAccessibility(it) }
+        return super.performAccessibilityAction(action, arguments)
     }
 
     private fun refreshAccessibilityDescription() {
@@ -1140,6 +1261,7 @@ class EmojiPanelView(context: Context) : View(context) {
 
         /** Below this a fling is indistinguishable from letting go mid-drag. */
         const val MIN_FLING_DP_PER_S = 80f
+        const val SCROLL_EPSILON_PX = 0.5f
 
         const val RECENTS_TAB = 0
         const val FIRST_CATEGORY_TAB = 1
@@ -1149,6 +1271,7 @@ class EmojiPanelView(context: Context) : View(context) {
         const val A11Y_TONE_BASE = 100_000
         const val A11Y_BACK = 200_000
         const val A11Y_BACKSPACE = 200_001
+        const val NO_POPUP_TONE = -2
 
         const val BACK_LABEL = "ABC"
         const val EMPTY_RECENTS = "Emoji you pick will show up here"
@@ -1190,5 +1313,55 @@ internal object EmojiGridPointer {
             if (index != liftedIndex) return index
         }
         return null
+    }
+}
+
+/** Pure paging rules kept outside the View so boundary and focus behavior stay unit-testable. */
+internal object EmojiAccessibilityPaging {
+
+    fun targetOffset(
+        current: Float,
+        maximum: Float,
+        pageDistance: Float,
+        direction: Int,
+    ): Float {
+        if (maximum <= 0f || pageDistance <= 0f || direction == 0) {
+            return current.coerceIn(0f, maximum.coerceAtLeast(0f))
+        }
+        return (current + pageDistance * direction.sign()).coerceIn(0f, maximum)
+    }
+
+    /**
+     * Keeps the same relative cell focused after paging. If it remains visible, no transfer is
+     * needed; otherwise its old viewport offset is applied to the new viewport and clamped.
+     */
+    fun focusTarget(before: IntRange, after: IntRange, focused: Int): Int? {
+        if (before.isEmpty() || after.isEmpty() || focused !in before || focused in after) return null
+        return (after.first + (focused - before.first)).coerceIn(after.first, after.last)
+    }
+
+    private fun Int.sign(): Int = when {
+        this > 0 -> 1
+        this < 0 -> -1
+        else -> 0
+    }
+}
+
+/** Coordinate-only popup hit testing; an outside release is a cancellation, never a stale tone. */
+internal object EmojiTonePopupHitTest {
+
+    fun toneAt(
+        x: Float,
+        y: Float,
+        left: Float,
+        top: Float,
+        right: Float,
+        bottom: Float,
+        slots: Int,
+    ): Int? {
+        if (slots <= 0 || right <= left || bottom <= top) return null
+        if (x < left || x >= right || y < top || y >= bottom) return null
+        val slot = (right - left) / slots
+        return ((x - left) / slot).toInt().coerceIn(0, slots - 1) - 1
     }
 }

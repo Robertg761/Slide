@@ -58,6 +58,8 @@ class PrecedingWordTest {
     fun `keeps an apostrophe inside the word`() {
         assertEquals("don't", PrecedingWord.of("don't hae"))
         assertEquals("it's", PrecedingWord.of("it's rainin"))
+        assertEquals("don’t", PrecedingWord.of("don’t hae"))
+        assertEquals("lʼheure", PrecedingWord.beforeNewWord("lʼheure "))
     }
 
     /**
@@ -99,6 +101,13 @@ class PrecedingWordTest {
             PrecedingWord.Context(null, null),
             PrecedingWord.contextOf("we arrived. nex"),
         )
+        for (boundary in listOf("…", "。", "！", "？", "؟", "\u2028", "\u2029")) {
+            assertEquals(
+                "$boundary must end context",
+                PrecedingWord.Context(null, null),
+                PrecedingWord.contextBeforeNewWord("done$boundary "),
+            )
+        }
     }
 
     /** The two differ exactly where they should: one skips a word in progress, the other does not. */
@@ -142,5 +151,11 @@ class PrecedingWordTest {
         // window is very often a fragment. Returning the fragment is right: it is either a real
         // word or one the lexicon will not know, and an unknown context is already handled.
         assertEquals("cellent", PrecedingWord.of("cellent wor"))
+    }
+
+    @Test
+    fun `keeps decomposed and supplementary letters intact`() {
+        assertEquals("cafe\u0301", PrecedingWord.beforeNewWord("try cafe\u0301 "))
+        assertEquals("𝐀", PrecedingWord.beforeNewWord("math 𝐀 "))
     }
 }

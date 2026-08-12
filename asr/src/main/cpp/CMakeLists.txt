@@ -1,7 +1,31 @@
 cmake_minimum_required(VERSION 3.22.1)
 project(slide_asr CXX)
 
-set(WHISPER_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../../../third_party/whisper.cpp)
+file(REAL_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." SLIDE_REPOSITORY_ROOT)
+set(WHISPER_ROOT ${SLIDE_REPOSITORY_ROOT}/third_party/whisper.cpp)
+
+# The vendored library is a source snapshot, not a nested Git checkout. Its own fallback to
+# `git rev-parse` would therefore identify the enclosing Slide checkout (or "unknown" in a source
+# archive), making otherwise identical builds carry different and incorrect provenance.
+file(READ "${WHISPER_ROOT}/VENDORED_COMMIT" WHISPER_VENDORED_COMMIT)
+string(STRIP "${WHISPER_VENDORED_COMMIT}" WHISPER_VENDORED_COMMIT)
+string(LENGTH "${WHISPER_VENDORED_COMMIT}" WHISPER_VENDORED_COMMIT_LENGTH)
+if(NOT WHISPER_VENDORED_COMMIT_LENGTH EQUAL 40 OR
+   NOT WHISPER_VENDORED_COMMIT MATCHES "^[0-9a-f]+$")
+    message(FATAL_ERROR "Invalid whisper.cpp VENDORED_COMMIT: ${WHISPER_VENDORED_COMMIT}")
+endif()
+set(GGML_BUILD_COMMIT_OVERRIDE "${WHISPER_VENDORED_COMMIT}")
+
+# Native debug/symbol metadata otherwise records the absolute checkout directory, making the four
+# packaged libslide_asr.so files differ between a Git checkout and the release's source-export
+# rebuild. Map both Slide's source and CMake build roots to stable virtual locations before any
+# vendored target is created so the setting applies to whisper/ggml as well as the JNI bridge.
+add_compile_options(
+    "-ffile-prefix-map=${SLIDE_REPOSITORY_ROOT}=/src/slide"
+    "-fdebug-prefix-map=${SLIDE_REPOSITORY_ROOT}=/src/slide"
+    "-ffile-prefix-map=${CMAKE_BINARY_DIR}=/build/slide"
+    "-fdebug-prefix-map=${CMAKE_BINARY_DIR}=/build/slide"
+)
 
 # Everything whisper.cpp builds by default that Slide does not need. Left on, the examples pull in
 # SDL2 and a CLI, none of which can link on Android.
