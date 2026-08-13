@@ -11,16 +11,20 @@
 #include <android/asset_manager_jni.h>
 #include <android/log.h>
 
+#include <dlfcn.h>
+
 #include <algorithm>
 #include <atomic>
 #include <exception>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <string>
 #include <vector>
 
 #include "whisper.h"
+#include "ggml-backend.h"
 
 #define LOG_TAG "SlideAsr"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -150,6 +154,51 @@ bool should_abort(void *data) {
     return token != nullptr && token->cancelled.load(std::memory_order_relaxed);
 }
 
+/** Loads the best packaged ARM64 CPU backend directly through Android's native-library namespace. */
+bool load_dynamic_cpu_backend() {
+#if defined(GGML_BACKEND_DL)
+    static std::once_flag once;
+    static bool loaded = false;
+    std::call_once(once, [] {
+        // extractNativeLibs=false means these files can live inside base.apk. dlopen still resolves
+        // their SONAMEs from the app namespace, while std::filesystem cannot enumerate that ZIP.
+        constexpr const char *variants[] = {
+            "libggml-cpu-android_armv8.0_1.so",
+            "libggml-cpu-android_armv8.2_1.so",
+            "libggml-cpu-android_armv8.2_2.so",
+            "libggml-cpu-android_armv8.6_1.so",
+            "libggml-cpu-android_armv9.0_1.so",
+            "libggml-cpu-android_armv9.2_1.so",
+            "libggml-cpu-android_armv9.2_2.so",
+        };
+        const char *best_variant = nullptr;
+        int best_score = 0;
+        for (const char *variant : variants) {
+            void *handle = dlopen(variant, RTLD_NOW | RTLD_LOCAL);
+            if (handle == nullptr) continue;
+            const auto score = reinterpret_cast<int (*)()>(dlsym(handle, "ggml_backend_score"));
+            const int value = score == nullptr ? 0 : score();
+            dlclose(handle);
+            if (value > best_score) {
+                best_score = value;
+                best_variant = variant;
+            }
+        }
+        if (best_variant != nullptr && ggml_backend_load(best_variant) != nullptr) {
+            loaded = ggml_backend_dev_count() > 0;
+        }
+        if (loaded) {
+            LOGI("Loaded speech CPU backend %s (feature score %d)", best_variant, best_score);
+        } else {
+            LOGE("No compatible packaged speech CPU backend was found");
+        }
+    });
+    return loaded;
+#else
+    return true;
+#endif
+}
+
 /** Trims the leading space whisper puts on every segment, and any stray newlines. */
 std::string tidy(const std::string &text) {
     const auto first = text.find_first_not_of(" \t\n");
@@ -166,6 +215,7 @@ JNI_EXPORT jlong JNICALL
 Java_com_slide_asr_WhisperNative_openModel(
         JNIEnv *env, jclass, jobject asset_manager, jstring asset_name, jint threads) {
     try {
+        if (!load_dynamic_cpu_backend()) return 0;
         AAssetManager *manager = AAssetManager_fromJava(env, asset_manager);
         if (manager == nullptr) {
             LOGE("No asset manager");
@@ -194,7 +244,9 @@ Java_com_slide_asr_WhisperNative_openModel(
 
         whisper_context_params params = whisper_context_default_params();
         params.use_gpu = false;
-        params.flash_attn = false;
+        // Flash attention is a CPU graph optimization too. It produces the same model operation
+        // while avoiding the full attention matrix, which cuts memory traffic on phone CPUs.
+        params.flash_attn = true;
 
         std::unique_ptr<Session> session(new (std::nothrow) Session());
         if (!session) {
@@ -279,6 +331,12 @@ Java_com_slide_asr_WhisperNative_transcribe(
             params.no_timestamps = true;
             params.suppress_blank = true;
             params.suppress_nst = true;
+            // The upstream fallback can expand one uncertain decode into 26 decoder paths:
+            // temperature zero, then five temperatures with five candidates each. Keep two
+            // stochastic candidates at two fallback temperatures. Clean audio still uses the
+            // identical deterministic pass, while noisy audio retains a bounded second chance.
+            params.greedy.best_of = 2;
+            params.temperature_inc = 0.4F;
 
             status = whisper_full(session->ctx, params, audio.data(), audio.count());
         } // Always wipe and discard any JNI float copy before allocating the transcript string.

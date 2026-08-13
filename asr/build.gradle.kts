@@ -1,5 +1,48 @@
+import org.gradle.api.DefaultTask
+import org.gradle.api.file.DirectoryProperty
+import org.gradle.api.tasks.InputDirectory
+import org.gradle.api.tasks.OutputDirectory
+import org.gradle.api.tasks.PathSensitive
+import org.gradle.api.tasks.PathSensitivity
+import org.gradle.api.tasks.TaskAction
+
 plugins {
     alias(libs.plugins.android.library)
+}
+
+abstract class PackageArm64SpeechBackends : DefaultTask() {
+    @get:InputDirectory
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val inputDirectory: DirectoryProperty
+
+    @get:OutputDirectory
+    abstract val outputDirectory: DirectoryProperty
+
+    @TaskAction
+    fun packageBackends() {
+        val expected = listOf(
+            "libggml-cpu-android_armv8.0_1.so",
+            "libggml-cpu-android_armv8.2_1.so",
+            "libggml-cpu-android_armv8.2_2.so",
+            "libggml-cpu-android_armv8.6_1.so",
+            "libggml-cpu-android_armv9.0_1.so",
+            "libggml-cpu-android_armv9.2_1.so",
+            "libggml-cpu-android_armv9.2_2.so",
+        )
+        val source = inputDirectory.get().asFile
+        val actual = source.listFiles()?.filter(File::isFile)?.map(File::getName)?.sorted().orEmpty()
+        require(actual == expected.sorted()) {
+            "ARM64 speech backend stage is incomplete: expected ${expected.sorted()}, got $actual"
+        }
+
+        val destination = outputDirectory.get().asFile
+        if (destination.exists()) {
+            require(destination.deleteRecursively()) { "Could not clean $destination" }
+        }
+        val abiDirectory = destination.resolve("arm64-v8a")
+        require(abiDirectory.mkdirs()) { "Could not create $abiDirectory" }
+        expected.forEach { name -> source.resolve(name).copyTo(abiDirectory.resolve(name)) }
+    }
 }
 
 android {
@@ -20,7 +63,17 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments += listOf("-DANDROID_STL=c++_static")
+                // ARM64 runtime-selected ggml kernels cross shared-library ownership boundaries.
+                // One shared C++ runtime keeps allocation, exceptions, and standard-library state
+                // coherent across libslide_asr, whisper, ggml, and the selected CPU backend.
+                arguments += listOf(
+                    "-DANDROID_STL=c++_shared",
+                    "-DSLIDE_CPU_BACKEND_STAGE_DIR=${layout.buildDirectory.get().asFile}/generated/cmakeCpuBackends",
+                )
+                // Build the JNI entry point and its dependencies only. whisper.cpp also declares
+                // an unrelated Parakeet target; asking CMake for its default `all` target would
+                // package that unused recognizer whenever ARM64 runtime dispatch uses shared libs.
+                targets += "slide_asr"
 
                 // Both, not just cppFlags. Every hot kernel in ggml -- the quantised dot products,
                 // the matmuls, the mel spectrogram -- is C, and the NDK's debug configuration
@@ -55,6 +108,27 @@ android {
         // Recorder JVM tests inject a fake backend; harmless android.util.Log calls should retain
         // their normal no-op host behavior rather than throwing from the mockable android.jar.
         unitTests.isReturnDefaultValues = true
+    }
+}
+
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        val capitalized = variant.name.replaceFirstChar(Char::uppercaseChar)
+        val cmakeConfiguration = if (variant.buildType == "release") "RelWithDebInfo" else "Debug"
+        val packageBackends = tasks.register<PackageArm64SpeechBackends>(
+            "package${capitalized}Arm64SpeechBackends",
+        ) {
+            dependsOn("externalNativeBuild$capitalized")
+            inputDirectory.set(
+                layout.buildDirectory.dir(
+                    "generated/cmakeCpuBackends/$cmakeConfiguration/arm64-v8a",
+                ),
+            )
+            outputDirectory.set(layout.buildDirectory.dir("generated/packagedJni/${variant.name}"))
+        }
+        requireNotNull(variant.sources.jniLibs).addGeneratedSourceDirectory(packageBackends) {
+            it.outputDirectory
+        }
     }
 }
 

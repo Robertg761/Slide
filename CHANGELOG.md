@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+## [0.3.4] - 2026-08-13
+
+### Changed
+
+- Offline voice transcription now selects the fastest compatible ARM64 Whisper kernel at runtime
+  instead of forcing every phone through the portable Armv8 baseline. Newer devices can use
+  dot-product, FP16, i8mm, SVE, or SME kernels while older supported phones retain a safe baseline.
+- Conservative content-local trimming removes only confident leading and trailing silence before
+  inference. Clean greedy decoding is unchanged, while low-confidence retries are bounded to avoid
+  a combinatorial latency tail without removing Whisper's accuracy fallback.
+- The voice panel now uses responsive level bars with fast attack and smooth release, a pulsing mic
+  halo while listening, and a rotating progress arc while the model loads or transcribes. Its copy
+  explicitly identifies listening and transcription as offline/on-device.
+
+### Privacy
+
+- Dictation remains fully offline: the speech module has no network permission, URL client, Android
+  platform recognizer, runtime model downloader, telemetry, or cloud fallback. Raw audio remains in
+  the isolated speech process and is wiped after each decode.
+
+### Verification
+
+- JVM tests cover silence trimming, level dynamics, bounded decode configuration, runtime ARM64
+  backend selection, and the offline-only speech boundary. The full release gate, packaged native
+  fixture, clean-export reproduction, and hosted APK checks were run for the tagged update.
+- No physical Android device was connected. The ARM64 dispatch and real microphone/animation feel
+  are structurally verified but not newly measured on phone hardware.
+
 ## [0.3.3] - 2026-08-13
 
 ### Added

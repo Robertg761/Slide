@@ -97,8 +97,13 @@ class WhisperTranscriber(
                 // consonant is not erased by a long quiet lead-in or tail.
                 if (isDigitallySilent(samples)) return@withLock Result.NoSpeech
 
+                val inferenceSamples = SpeechAudioTrimmer.trim(samples)
+
                 val token = WhisperNative.createCancellationToken()
-                if (token == 0L) return@withLock Result.Failed("Speech recognition failed")
+                if (token == 0L) {
+                    if (inferenceSamples !== samples) PcmBuffers.wipe(inferenceSamples)
+                    return@withLock Result.Failed("Speech recognition failed")
+                }
 
                 synchronized(cancellationLock) { activeCancellationToken = token }
                 try {
@@ -110,7 +115,7 @@ class WhisperTranscriber(
                         val decoded = decodeTranscript(
                             WhisperNative.transcribe(
                                 handle,
-                                samples,
+                                inferenceSamples,
                                 threadCount(),
                                 token,
                             ),
@@ -119,8 +124,16 @@ class WhisperTranscriber(
                     }
                     val elapsedMs = (System.nanoTime() - started) / 1_000_000
 
-                    val seconds = samples.size.toFloat() / SAMPLE_RATE
-                    Log.i(TAG, "Transcribed %.1fs of audio in %dms".format(seconds, elapsedMs))
+                    val recordedSeconds = samples.size.toFloat() / SAMPLE_RATE
+                    val decodedSeconds = inferenceSamples.size.toFloat() / SAMPLE_RATE
+                    Log.i(
+                        TAG,
+                        "Transcribed %.1fs of %.1fs recorded audio in %dms".format(
+                            decodedSeconds,
+                            recordedSeconds,
+                            elapsedMs,
+                        ),
+                    )
 
                     when {
                         text == null -> Result.Failed("Speech recognition failed")
@@ -129,6 +142,7 @@ class WhisperTranscriber(
                     }
                 } finally {
                     closeToken(token)
+                    if (inferenceSamples !== samples) PcmBuffers.wipe(inferenceSamples)
                 }
             }
         }

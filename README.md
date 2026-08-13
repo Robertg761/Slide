@@ -24,8 +24,9 @@ always enforces the installed app's signing identity.
 
 Typing, themes, and gesture decoding were verified on a Galaxy S24 Ultra (Android 16). The native
 Base Whisper model also loaded and transcribed an 11-second fixture on that phone in a prior
-benchmark (about 100 ms load and 1.7 seconds decode). The current 0.3.2 packaging and fixes, neural
-swipe model, and complete microphone-to-editor flow have not yet been rerun on physical hardware.
+benchmark (about 100 ms load and 1.7 seconds decode). Version 0.3.4 restores runtime-selected
+optimized ARM64 kernels, bounds slow low-confidence retries, and skips confidently detected edge
+silence. Its complete microphone-to-editor flow has not yet been rerun on physical hardware.
 
 **Working**
 - QWERTY typing with multi-touch rollover and slide-off correction
@@ -48,8 +49,11 @@ swipe model, and complete microphone-to-editor flow have not yet been rerun on p
 
 **Built, with hardware verification still incomplete**
 - **Voice typing.** Whisper runs in a separate `:asr` process; audio never crosses the process
-  boundary. The overlay, permission flow, recorder, transcriber, and native fixture benchmark are
-  in place. A release-device run of the real microphone-to-editor flow is still outstanding.
+  boundary. The bundled Base English model selects a CPU backend compatible with each ARM64 phone,
+  trims only confident leading/trailing silence, and retains bounded accuracy fallbacks. The live
+  panel uses responsive speech-level bars and an explicit on-device progress animation. There is no
+  network, platform-recognizer, or cloud fallback path. A release-device run of the real
+  microphone-to-editor flow is still outstanding.
 - **Autocorrect and typed-word suggestions.** The word being typed is held as composing text, so
   a correction replaces a region the editor owns rather than a character count the keyboard
   guessed at. A fast single-edit path handles ordinary slips; a trie-pruned weighted sequence

@@ -66,17 +66,17 @@ A 1:1 inventory of Gboard's feature surface, used as the master checklist for Sl
 | # | Feature | Tier | Effort | Notes |
 |---|---|---|---|---|
 | C1 | Mic key → voice input panel | V1 | S | **Built.** Permission, listening, transcribing, failure, and cancellation states are wired. |
-| C2 | **On-device Whisper transcription** | V1 | XL | **Built.** One bundled Base English q5_1 model; native fixture transcription was benchmarked on a Galaxy S24 Ultra, while the final 0.2.1 microphone-to-editor flow still needs a device run. |
+| C2 | **On-device Whisper transcription** | V1 | XL | **Built.** One bundled Base English q5_1 model, conservative edge-silence trimming, bounded accuracy retries, and runtime-selected ARM64 CPU kernels. The native fixture was benchmarked on a Galaxy S24 Ultra previously; the current microphone-to-editor flow still needs a device run. |
 | C3 | Model manager — browse/download/delete models | V2 | M | Deliberately not shipped in 0.2.1: one immutable, checksummed Base model is bundled and there is no runtime model download. |
 | C4 | Streaming partial results while speaking | V2 | L | Not built. Current transcription runs after Stop. |
 | C5 | Automatic punctuation & casing | V1 | S | Supplied by the local Whisper decode. |
 | C6 | Silence detection → auto-stop | V2 | M | Not built; current endpointing is manual with a safety recording limit. |
-| C7 | Live waveform / level meter | V1 | S | **Built.** Device-level UX verification is still outstanding. |
+| C7 | Live waveform / level meter | V1 | S | **Built.** Responsive symmetric level bars, listening halo, and model/decode progress arc; device-level UX verification is still outstanding. |
 | C8 | Voice commands ("delete", "send", "new line", "comma") | V2 | M | Post-processing on the transcript. |
 | C9 | Continuous dictation (keeps listening) | V2 | M | Not built; each session records and decodes once. |
 | C10 | Multilingual voice + language picker | V2 | M | Multilingual Whisper weights. |
 | C11 | Auto language detection | V3 | S | Whisper does this natively. |
-| C12 | Fallback to system `SpeechRecognizer` when no model | V2 | S | |
+| C12 | Fallback to system `SpeechRecognizer` when no model | Skip | S | Deliberately omitted: a platform recognizer can use a network service and would violate Slide's offline speech contract. |
 | C13 | Dictate into the middle of existing text | V2 | M | Cursor-aware insertion. |
 | C14 | Offline typing/voice guarantee + visible status | V1 | S | Audio and transcripts stay on device. The app's separate, opt-in updater contacts GitHub. |
 

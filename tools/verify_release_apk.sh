@@ -67,7 +67,17 @@ EXPECTED_NATIVE_PATHS=(
     lib/arm64-v8a/libdatastore_shared_counter.so
     lib/arm64-v8a/libexecutorch.so
     lib/arm64-v8a/libfbjni.so
+    lib/arm64-v8a/libggml-base.so
+    lib/arm64-v8a/libggml-cpu-android_armv8.0_1.so
+    lib/arm64-v8a/libggml-cpu-android_armv8.2_1.so
+    lib/arm64-v8a/libggml-cpu-android_armv8.2_2.so
+    lib/arm64-v8a/libggml-cpu-android_armv8.6_1.so
+    lib/arm64-v8a/libggml-cpu-android_armv9.0_1.so
+    lib/arm64-v8a/libggml-cpu-android_armv9.2_1.so
+    lib/arm64-v8a/libggml-cpu-android_armv9.2_2.so
+    lib/arm64-v8a/libggml.so
     lib/arm64-v8a/libslide_asr.so
+    lib/arm64-v8a/libwhisper.so
     lib/armeabi-v7a/libandroidx.graphics.path.so
     lib/armeabi-v7a/libc++_shared.so
     lib/armeabi-v7a/libdatastore_shared_counter.so
@@ -93,6 +103,15 @@ EXPECTED_RUNTIME_DATA_PATHS=(
     assets/swipe/decoder.pte
     assets/swipe/encoder.pte
     assets/trigrams_en.bin
+)
+ARM64_CPU_VARIANTS=(
+    libggml-cpu-android_armv8.0_1.so
+    libggml-cpu-android_armv8.2_1.so
+    libggml-cpu-android_armv8.2_2.so
+    libggml-cpu-android_armv8.6_1.so
+    libggml-cpu-android_armv9.0_1.so
+    libggml-cpu-android_armv9.2_1.so
+    libggml-cpu-android_armv9.2_2.so
 )
 
 verify_exact_manifest() {
@@ -408,6 +427,10 @@ fi
 # tracked whisper.cpp snapshot identity rather than ambient Slide Git state or "unknown".
 mapfile -t native_paths < <(unzip -Z1 "$APK" | sed -n '/^lib\/[^/][^/]*\/[^/][^/]*\.so$/p' | sort)
 verify_exact_manifest "native library" EXPECTED_NATIVE_PATHS native_paths
+SYMBOL_READELF="${READELF:-}"
+if [[ -z "$SYMBOL_READELF" ]]; then
+    SYMBOL_READELF="$(command -v llvm-readelf || command -v readelf || true)"
+fi
 for index in "${!native_paths[@]}"; do
     path="${native_paths[$index]}"
     abi="${path#lib/}"
@@ -418,13 +441,36 @@ for index in "${!native_paths[@]}"; do
         echo "$path does not contain code for its declared ABI." >&2
         exit 1
     }
-    if [[ "$path" == */libslide_asr.so ]]; then
+    # Static ABIs carry whisper.cpp inside libslide_asr. ARM64 runtime dispatch makes ggml-base a
+    # shared dependency, so the linked build identity moves there without changing provenance.
+    if [[ "$path" == */libggml-base.so ||
+          ( "$path" == */libslide_asr.so && "$abi" != "arm64-v8a" ) ]]; then
         strings_file="$TEMP_DIR/native-$index.strings"
         strings "$extracted" > "$strings_file"
         if ! grep -Fq "$WHISPER_COMMIT" "$strings_file"; then
             echo "$path does not identify the tracked whisper.cpp commit." >&2
             exit 1
         fi
+    fi
+    if [[ "$path" == lib/arm64-v8a/libggml-cpu-*.so ]]; then
+        symbol_table="$TEMP_DIR/native-$index.symbols"
+        "$SYMBOL_READELF" --wide --symbols "$extracted" > "$symbol_table"
+        for symbol in ggml_backend_init ggml_backend_score; do
+            if ! grep -Eq "GLOBAL[[:space:]]+DEFAULT.*[[:space:]]${symbol}$" "$symbol_table"; then
+                echo "$path does not export $symbol for runtime selection." >&2
+                exit 1
+            fi
+        done
+    fi
+    if [[ "$path" == lib/arm64-v8a/libslide_asr.so ]]; then
+        strings_file="$TEMP_DIR/native-$index.variant-strings"
+        strings "$extracted" > "$strings_file"
+        for variant in "${ARM64_CPU_VARIANTS[@]}"; do
+            if ! grep -Fqx "$variant" "$strings_file"; then
+                echo "$path cannot select packaged backend $variant." >&2
+                exit 1
+            fi
+        done
     fi
 done
 

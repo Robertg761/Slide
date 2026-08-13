@@ -70,8 +70,7 @@ class WhisperTranscriberTest {
      */
     @Test
     fun measuresEveryModel() = runBlocking {
-        val audio = readTestAudio()
-        val seconds = audio.size.toFloat() / WhisperTranscriber.SAMPLE_RATE
+        val seconds = readTestAudio().size.toFloat() / WhisperTranscriber.SAMPLE_RATE
 
         for (model in WhisperModel.entries) {
             val subject = WhisperTranscriber(context)
@@ -80,10 +79,12 @@ class WhisperTranscriberTest {
             val loadMs = (System.nanoTime() - loadStart) / 1_000_000
 
             // Once to warm the caches, then a timed run.
-            subject.transcribe(audio)
+            subject.transcribe(readTestAudio())
             val decodeStart = System.nanoTime()
-            val result = subject.transcribe(audio)
+            val result = subject.transcribe(readTestAudio())
             val decodeMs = (System.nanoTime() - decodeStart) / 1_000_000
+
+            assertTrue("Benchmark decode did not recognize speech: $result", result is WhisperTranscriber.Result.Text)
 
             println(
                 "%s: load %dms, decode %dms for %.1fs of audio (%.2fx realtime) -> %s"
