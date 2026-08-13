@@ -108,6 +108,29 @@ touch logs from a device, which Slide does not collect.
 
 **Do not** copy anything from Gboard itself — no dictionaries, no assets, no code.
 
+### Personal swipe adaptation and measurement
+
+Swipe alternatives are now adaptive only after unambiguous feedback. A verified suggestion-strip
+replacement teaches a bounded preference between the rejected and chosen candidates; an immediate
+whole-word Backspace is weaker rejection evidence and must repeat before it can demote a result.
+The adjustment operates in rank space after either neural or deterministic decoding, because their
+raw scores are not calibrated to the same scale. Evidence saturates, decays by logical feedback
+epochs rather than wall-clock time, and is capacity-bounded so old habits can disappear and state
+cannot grow forever.
+
+The persisted snapshot contains a per-install salt, salted word fingerprints, bounded strengths,
+and logical ages. It contains no raw trace, coordinates, surrounding context, app/editor identity,
+or timestamps; it is excluded from backup and participates in the same fail-closed save/delete
+transaction as other learned data. Incognito fields and fields requesting no personalized learning
+never train it.
+
+Quality measurement has two separate privacy boundaries. The IME keeps only fixed-size process-local
+aggregate buckets for latency, candidate count, confidence, decoder provenance, outcomes, feedback,
+and model readiness. The opt-in benchmark JSONL contains content-free outcomes and rejects unknown
+fields, while `tools/typing_quality_report.py` calculates accuracy, wrong commits, abstentions,
+fallback, latency percentiles, calibration, before/after deltas, and explicit regression budgets.
+Synthetic and donated-corpus reports remain benchmarks, not evidence of physical-device UX.
+
 ---
 
 ## 3. On-device Whisper

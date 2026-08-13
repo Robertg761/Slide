@@ -40,6 +40,10 @@ import com.slide.core.settings.SettingsRepository
 import com.slide.core.theme.KeyboardTheme
 import com.slide.core.theme.Themes
 import com.slide.engine.gesture.GestureDecoder
+import com.slide.engine.gesture.GestureAdaptation
+import com.slide.engine.gesture.GestureCandidate
+import com.slide.engine.gesture.GestureDecoderProvenance
+import com.slide.engine.gesture.GestureDecoderSource
 import com.slide.engine.gesture.GestureDecodingEngine
 import com.slide.engine.gesture.GestureKeyMap
 import com.slide.engine.gesture.GesturePoint
@@ -77,6 +81,13 @@ import com.slide.ime.text.cursorAfterReplacement
 import com.slide.ime.text.isCaseableCharacter
 import com.slide.ime.text.matchTypedCase
 import com.slide.ime.text.resolveCharacterCase
+import com.slide.ime.quality.ConfidenceBucket
+import com.slide.ime.quality.DecisionOutcome
+import com.slide.ime.quality.DecoderSource
+import com.slide.ime.quality.ModelReadiness
+import com.slide.ime.quality.QualityInputMode
+import com.slide.ime.quality.QualityModel
+import com.slide.ime.quality.TypingQualityCollector
 import com.slide.ime.view.EmojiGlyphs
 import com.slide.ime.view.EmojiPanelView
 import com.slide.ime.view.EnterAction
@@ -100,6 +111,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.FileDescriptor
+import java.io.PrintWriter
+import kotlin.math.exp
 
 class SlideInputMethodService :
     InputMethodService(),
@@ -203,6 +217,12 @@ class SlideInputMethodService :
     /** Per-key touch offsets learned only from words this person confirmed. */
     private val spatialTouchModel = SpatialTouchModel()
 
+    /** Bounded swipe preferences learned only from explicit alternative picks and immediate undo. */
+    private val gestureAdaptation = GestureAdaptation()
+
+    /** Fixed-size, text-free process-local quality aggregates. */
+    private val typingQuality = TypingQualityCollector()
+
     private val userDictionaryStore by lazy { UserDictionaryStore(applicationContext) }
 
     private val learnedDataReady = CompletableDeferred<Unit>()
@@ -251,6 +271,15 @@ class SlideInputMethodService :
 
     /** What a separator would turn [composing] into, or null to leave it as typed. */
     private var pendingAutocorrection: String? = null
+
+    /** Last text-free suggestion decision for the active composing word. */
+    private var pendingTypedQuality: PendingTypedQuality? = null
+
+    private data class PendingTypedQuality(
+        val latencyMillis: Double,
+        val candidateCount: Int,
+        val confidence: ConfidenceBucket,
+    )
 
     /**
      * True when [composing] is a finished word the user tapped back into rather than one being
@@ -347,6 +376,8 @@ class SlideInputMethodService :
 
     override fun onCreate() {
         super.onCreate()
+        typingQuality.recordModelReadiness(QualityModel.TYPING_SUGGESTER, ModelReadiness.NOT_READY)
+        typingQuality.recordModelReadiness(QualityModel.SWIPE_DECODER, ModelReadiness.NOT_READY)
         removeLearnedDeletionListener = userDictionaryStore.addDeletionRequestListener { generation ->
             scope.launch {
                 if (learnedDataClearEpoch.observeDeletionRequest(generation)) {
@@ -485,6 +516,14 @@ class SlideInputMethodService :
                     spatialModel = spatialTouchModel,
                     trie = requireNotNull(trie),
                 )
+                typingQuality.recordModelReadiness(
+                    QualityModel.TYPING_SUGGESTER,
+                    ModelReadiness.PRIMARY_READY,
+                )
+                typingQuality.recordModelReadiness(
+                    QualityModel.SWIPE_DECODER,
+                    ModelReadiness.FALLBACK_READY,
+                )
                 Log.i(
                     TAG,
                     "Deterministic decoder and suggester ready with ${lexicon.size} words" +
@@ -512,12 +551,25 @@ class SlideInputMethodService :
                     val ready = neural ?: return@launch
                     gestureDecoder = ready
                     neural = null // Ownership transfers to the service and is released in onDestroy.
+                    typingQuality.recordModelReadiness(
+                        QualityModel.SWIPE_DECODER,
+                        ModelReadiness.PRIMARY_READY,
+                    )
                     Log.i(TAG, "Neural swipe passed its known-trace health check and is ready")
                 } finally {
                     // Cancellation can arrive while native loading is not interruptible. Keeping
                     // the candidate in this outer variable ensures that late result is still closed.
                     neural?.close()
                 }
+            } else {
+                typingQuality.recordModelReadiness(
+                    QualityModel.TYPING_SUGGESTER,
+                    ModelReadiness.UNAVAILABLE,
+                )
+                typingQuality.recordModelReadiness(
+                    QualityModel.SWIPE_DECODER,
+                    ModelReadiness.UNAVAILABLE,
+                )
             }
         }
 
@@ -871,6 +923,13 @@ class SlideInputMethodService :
         super.onDestroy()
     }
 
+    /** On-demand support output: bounded aggregate enums/counters only, never typed content. */
+    override fun dump(fd: FileDescriptor, writer: PrintWriter, args: Array<out String>) {
+        super.dump(fd, writer, args)
+        writer.println("Slide typing quality (process-local, text-free aggregate)")
+        writer.println(typingQuality.snapshot())
+    }
+
     // region KeyboardView.Listener
 
     override fun onKeyDown(key: Key) {
@@ -1029,10 +1088,12 @@ class SlideInputMethodService :
         val editorSnapshot = gestureEditorSnapshot(connection)
         val context = precedingContextForSwipe()
         val blockOffensive = settings.blockOffensiveWords
-        val candidates = try {
+        val decodeStarted = SystemClock.elapsedRealtimeNanos()
+        val decodeResult = try {
             withContext(Dispatchers.Default) {
                 gestureDecodeMutex.withLock {
-                    decoder.decode(
+                    decodeGesture(
+                        decoder = decoder,
                         points = points,
                         keys = keys,
                         blockOffensive = blockOffensive,
@@ -1042,25 +1103,50 @@ class SlideInputMethodService :
                 }
             }
         } catch (cancelled: CancellationException) {
+            typingQuality.recordSwipeDecision(
+                elapsedMillis(decodeStarted),
+                DecoderSource.UNKNOWN,
+                0,
+                ConfidenceBucket.UNKNOWN,
+                DecisionOutcome.CANCELLED,
+            )
             throw cancelled
         } catch (failure: Throwable) {
             Log.w(TAG, "Final swipe decode failed", failure)
+            typingQuality.recordSwipeDecision(
+                elapsedMillis(decodeStarted),
+                DecoderSource.UNKNOWN,
+                0,
+                ConfidenceBucket.UNKNOWN,
+                DecisionOutcome.FAILED,
+            )
             if (gestureInputIsCurrent(request)) clearGesturePreview()
             return
         }
+        // Include dispatcher and mutex contention: this is the delay the ordered final input paid,
+        // not only the time spent inside the decoder after it eventually got the gate.
+        val decoded = decodeResult.copy(latencyMillis = elapsedMillis(decodeStarted))
+        val candidates = decoded.candidates
 
         if (
             !gestureInputIsCurrent(request) ||
             currentInputConnection !== connection ||
             !gestureModeAvailable()
-        ) return
+        ) {
+            recordSwipeDecision(decoded, DecisionOutcome.STALE)
+            return
+        }
         val liveSnapshot = gestureEditorSnapshot(connection)
         if (!editorSnapshot.matches(liveSnapshot)) {
+            recordSwipeDecision(decoded, DecisionOutcome.STALE)
             clearGesturePreview()
             return
         }
 
-        val best = candidates.firstOrNull() ?: return clearGesturePreview()
+        val best = candidates.firstOrNull() ?: run {
+            recordSwipeDecision(decoded, DecisionOutcome.NO_CANDIDATE)
+            return clearGesturePreview()
+        }
 
         // Only settle a typed prefix once decoding has definitely produced replacement input. A
         // length-changing autocorrection moves the cursor before the swipe is inserted, so record
@@ -1076,6 +1162,7 @@ class SlideInputMethodService :
             // A swipe is a dependent edit: inserting it while the editor still owns the typed
             // prefix can replace that prefix or put the decoded word inside its active region.
             updateTypingSuggestions()
+            recordSwipeDecision(decoded, DecisionOutcome.EDITOR_REJECTED)
             return
         }
         val corrected = finish.corrected
@@ -1108,9 +1195,11 @@ class SlideInputMethodService :
         }
 
         if (!commitGestureWord(connection, best.word, selectionBeforeCommit)) {
+            recordSwipeDecision(decoded, DecisionOutcome.EDITOR_REJECTED)
             clearGesturePreview()
             return
         }
+        recordSwipeDecision(decoded, DecisionOutcome.TOP_CANDIDATE_COMMITTED)
         literalWordInProgress = false
         if (settings.suggestionsEnabled) {
             stripMode = StripMode.Gesture
@@ -1119,6 +1208,78 @@ class SlideInputMethodService :
             clearSuggestions()
         }
     }
+
+    private data class DecodedGesture(
+        val candidates: List<GestureCandidate>,
+        val source: DecoderSource,
+        val latencyMillis: Double,
+        val confidence: ConfidenceBucket,
+    )
+
+    /** Called under [gestureDecodeMutex], keeping failover provenance tied to this exact result. */
+    private fun decodeGesture(
+        decoder: GestureDecodingEngine,
+        points: List<GesturePoint>,
+        keys: GestureKeyMap,
+        blockOffensive: Boolean,
+        previousWord: String?,
+        previousPreviousWord: String?,
+    ): DecodedGesture {
+        val started = SystemClock.elapsedRealtimeNanos()
+        val raw = decoder.decode(
+            points,
+            keys,
+            blockOffensive,
+            previousWord,
+            previousPreviousWord,
+        )
+        val source = when ((decoder as? GestureDecoderProvenance)?.lastDecoderSource) {
+            GestureDecoderSource.NEURAL -> DecoderSource.NEURAL
+            GestureDecoderSource.FALLBACK -> DecoderSource.FALLBACK
+            GestureDecoderSource.NONE -> DecoderSource.UNKNOWN
+            null -> if (decoder is GestureDecoder) DecoderSource.FALLBACK else DecoderSource.UNKNOWN
+        }
+        val adapted = gestureAdaptation.rerank(raw)
+        return DecodedGesture(
+            candidates = adapted,
+            source = source,
+            latencyMillis = elapsedMillis(started),
+            confidence = gestureConfidence(adapted),
+        )
+    }
+
+    private fun recordSwipeDecision(decoded: DecodedGesture, outcome: DecisionOutcome) {
+        typingQuality.recordSwipeDecision(
+            latencyMillis = decoded.latencyMillis,
+            decoderSource = decoded.source,
+            candidateCount = decoded.candidates.size,
+            confidence = decoded.confidence,
+            outcome = outcome,
+        )
+    }
+
+    private fun gestureConfidence(candidates: List<GestureCandidate>): ConfidenceBucket {
+        return scoreConfidence(candidates.map { it.score })
+    }
+
+    private fun scoreConfidence(scores: List<Float>): ConfidenceBucket {
+        val top = scores.firstOrNull()?.takeIf(Float::isFinite)
+            ?: return ConfidenceBucket.UNKNOWN
+        var denominator = 0.0
+        for (score in scores) {
+            if (!score.isFinite()) return ConfidenceBucket.UNKNOWN
+            denominator += exp((score - top).toDouble().coerceIn(-50.0, 0.0))
+        }
+        val share = 1.0 / denominator
+        return when {
+            share < 0.55 -> ConfidenceBucket.LOW
+            share < 0.80 -> ConfidenceBucket.MEDIUM
+            else -> ConfidenceBucket.HIGH
+        }
+    }
+
+    private fun elapsedMillis(startedNanos: Long): Double =
+        (SystemClock.elapsedRealtimeNanos() - startedNanos).coerceAtLeast(0L) / 1_000_000.0
 
     private fun gestureModeAvailable(): Boolean =
         settings.gestureTypingEnabled &&
@@ -1299,13 +1460,14 @@ class SlideInputMethodService :
                 val candidates = try {
                     withContext(Dispatchers.Default) {
                         gestureDecodeMutex.withLock {
-                            decoder.decode(
-                                trace,
-                                keys,
-                                blockOffensive,
-                                context.previous,
-                                context.older,
-                            )
+                            decodeGesture(
+                                decoder = decoder,
+                                points = trace,
+                                keys = keys,
+                                blockOffensive = blockOffensive,
+                                previousWord = context.previous,
+                                previousPreviousWord = context.older,
+                            ).candidates
                         }
                     }
                 } catch (_: CancellationException) {
@@ -1557,6 +1719,7 @@ class SlideInputMethodService :
                 editorGeneration,
                 collapsedCursorPosition(),
                 learnablePair,
+                word,
             )
         } else {
             lastGestureLearnedPair = null
@@ -1780,6 +1943,7 @@ class SlideInputMethodService :
                     originalUndo.editorGeneration,
                     originalUndo.cursorPosition,
                     originalUndo.learnedPair,
+                    originalUndo.adaptiveWord,
                 )
                 else -> {
                     rollbackGestureLearning(originalUndo.learnedPair)
@@ -1818,19 +1982,35 @@ class SlideInputMethodService :
             fallbackStillArmed = selfEdit && !exactSelectionTracked,
         )
 
-        // The first-ranked word was only a machine guess. Selecting another candidate is direct
-        // evidence: remove the wrong observation and teach the chosen pair instead.
+        // The first-ranked word was only a machine guess. A verified replacement is the explicit
+        // outcome the bounded swipe model is allowed to learn from; no trace or editor context is
+        // retained by that model.
+        var learnedGestureChanged = false
+        val rejectedAdaptiveWord = originalUndo.adaptiveWord
+        if (
+            !incognito &&
+            rejectedAdaptiveWord != null &&
+            gestureAdaptation.observeAlternative(rejectedAdaptiveWord, word)
+        ) {
+            learnedPersistence.markDirty()
+            learnedGestureChanged = true
+        }
+
+        // Repair the language observation as well, using context only in the existing bigram
+        // model. Gesture adaptation itself remains context-free and fingerprinted.
         lastGestureLearnedPair?.let { (context, guessed) ->
             if (!incognito) {
                 userBigrams.unlearn(context, guessed)
                 userBigrams.learn(context, word)
                 learnedPersistence.markDirty()
-                saveLearnedWords()
+                learnedGestureChanged = true
                 lastGestureLearnedPair = context to word
             } else {
                 lastGestureLearnedPair = null
             }
         }
+        if (learnedGestureChanged) saveLearnedWords()
+        typingQuality.recordExplicitAlternateSelection(QualityInputMode.SWIPE)
 
         // The strip stays up, and keeps its order, so a second wrong guess is also one tap away
         // and the candidates do not move under the user's thumb.
@@ -1840,6 +2020,7 @@ class SlideInputMethodService :
             editorGeneration,
             collapsedCursorPosition(),
             lastGestureLearnedPair,
+            word,
         )
         updateShiftFromCursor()
     }
@@ -2653,6 +2834,16 @@ class SlideInputMethodService :
             collapsedCursorPosition(),
         ) ?: return false
 
+        typingQuality.recordImmediateUndo(QualityInputMode.SWIPE)
+        if (
+            !incognito &&
+            undo.adaptiveWord != null &&
+            gestureAdaptation.observeImmediateUndo(undo.adaptiveWord)
+        ) {
+            learnedPersistence.markDirty()
+            saveLearnedWords()
+        }
+
         val selectionBefore = readEditorSelection(connection) ?: cachedEditorSelection()
         connection.beginBatchEdit()
         val deletion = try {
@@ -2894,6 +3085,7 @@ class SlideInputMethodService :
         val suggester = typingSuggester.takeIf { fieldSuggestionsEnabled() }
         val keys = suggester?.let { currentGestureKeyMap() }
         if (suggester == null || keys == null || composing.isEmpty()) {
+            pendingTypedQuality = null
             clearSuggestions()
             return
         }
@@ -2903,6 +3095,7 @@ class SlideInputMethodService :
 
     private fun updateTypingSuggestions(suggester: TypingSuggester, keys: GestureKeyMap) {
         val context = precedingContext()
+        val started = SystemClock.elapsedRealtimeNanos()
         val result = suggester.suggest(
             typed = composing.toString(),
             keys = keys,
@@ -2911,11 +3104,34 @@ class SlideInputMethodService :
             previousPreviousWord = context.older,
             touchPoints = composingTouches,
         )
-        pendingAutocorrection = result.autocorrection
+        val appliedAutocorrection = result.autocorrection
             .takeIf { settings.autocorrectEnabled && !recomposed }
+        pendingTypedQuality = PendingTypedQuality(
+            latencyMillis = elapsedMillis(started),
+            candidateCount = result.words.size,
+            // A literal decision is produced by several safety gates, not a calibrated score.
+            // Unknown is more honest than treating its presentation-first position as confidence.
+            confidence = if (appliedAutocorrection != null) {
+                scoreConfidence(result.words.map { it.score })
+            } else {
+                ConfidenceBucket.UNKNOWN
+            },
+        )
+        pendingAutocorrection = appliedAutocorrection
 
         stripMode = StripMode.Typing
         suggestionStrip?.setSuggestions(result.words.map { it.word })
+    }
+
+    private fun recordTypedDecision(outcome: DecisionOutcome) {
+        val decision = pendingTypedQuality ?: return
+        pendingTypedQuality = null
+        typingQuality.recordTypedDecision(
+            latencyMillis = decision.latencyMillis,
+            candidateCount = decision.candidateCount,
+            confidence = decision.confidence,
+            outcome = outcome,
+        )
     }
 
     /**
@@ -2980,16 +3196,19 @@ class SlideInputMethodService :
                         val words = UserDictionary()
                         val pairs = UserBigrams()
                         val touches = SpatialTouchModel()
+                        val gestures = GestureAdaptation()
                         val deletionCompleted = userDictionaryStore.completePendingDeletion()
                         if (deletionCompleted) {
                             userDictionaryStore.load(words)
                             userDictionaryStore.load(pairs)
                             userDictionaryStore.load(touches)
+                            userDictionaryStore.load(gestures)
                         }
                         LearnedDataSnapshot(
                             words = words,
                             pairs = pairs,
                             touches = touches,
+                            gestures = gestures,
                             deletionPending = !deletionCompleted,
                         )
                     }
@@ -3005,6 +3224,7 @@ class SlideInputMethodService :
                     // Loading is complete before any typing engine is published, so unlike words
                     // and pairs there cannot yet be a concurrent touch observation to merge.
                     spatialTouchModel.restore(loaded.touches.entries())
+                    gestureAdaptation.restore(loaded.gestures.snapshot())
                 }
             } finally {
                 val accepted = learnedPersistence.finishLoad(
@@ -3029,6 +3249,7 @@ class SlideInputMethodService :
         userDictionary.clear()
         userBigrams.clear()
         spatialTouchModel.clear()
+        gestureAdaptation.clear()
 
         if (composing.isNotEmpty()) updateTypingSuggestions()
         if (stripMode == StripMode.Prediction) updatePredictions()
@@ -3086,6 +3307,7 @@ class SlideInputMethodService :
         val words = UserDictionary().also { it.restore(userDictionary.entries()) }
         val pairs = UserBigrams().also { it.restore(userBigrams.entries()) }
         val touches = SpatialTouchModel().also { it.restore(spatialTouchModel.entries()) }
+        val gestures = GestureAdaptation().also { it.restore(gestureAdaptation.snapshot()) }
         scope.launch {
             val result = withContext(Dispatchers.IO) {
                 LEARNED_DATA_IO.withLock {
@@ -3099,8 +3321,9 @@ class SlideInputMethodService :
                         val wordsSaved = userDictionaryStore.save(words)
                         val pairsSaved = userDictionaryStore.save(pairs)
                         val touchesSaved = userDictionaryStore.save(touches)
+                        val gesturesSaved = userDictionaryStore.save(gestures)
                         LearnedDataWriteResult(
-                            saved = wordsSaved && pairsSaved && touchesSaved,
+                            saved = wordsSaved && pairsSaved && touchesSaved && gesturesSaved,
                             pendingDeleteResolved = true,
                         )
                     }
@@ -3127,6 +3350,7 @@ class SlideInputMethodService :
         val words: UserDictionary,
         val pairs: UserBigrams,
         val touches: SpatialTouchModel,
+        val gestures: GestureAdaptation,
         val deletionPending: Boolean,
     )
 
@@ -3142,10 +3366,12 @@ class SlideInputMethodService :
         val words = UserDictionary().also { it.restore(userDictionary.entries()) }
         val pairs = UserBigrams().also { it.restore(userBigrams.entries()) }
         val touches = SpatialTouchModel().also { it.restore(spatialTouchModel.entries()) }
+        val gestures = GestureAdaptation().also { it.restore(gestureAdaptation.snapshot()) }
         return FinalLearnedData(
             words = words,
             pairs = pairs,
             touches = touches,
+            gestures = gestures,
             completePendingDeletionFirst = learnedPersistence.clearOutstanding,
         )
     }
@@ -3168,7 +3394,8 @@ class SlideInputMethodService :
                     val wordsSaved = userDictionaryStore.save(data.words)
                     val pairsSaved = userDictionaryStore.save(data.pairs)
                     val touchesSaved = userDictionaryStore.save(data.touches)
-                    wordsSaved && pairsSaved && touchesSaved
+                    val gesturesSaved = userDictionaryStore.save(data.gestures)
+                    wordsSaved && pairsSaved && touchesSaved && gesturesSaved
                 }
             }
 
@@ -3184,6 +3411,7 @@ class SlideInputMethodService :
         val words: UserDictionary,
         val pairs: UserBigrams,
         val touches: SpatialTouchModel,
+        val gestures: GestureAdaptation,
         val completePendingDeletionFirst: Boolean,
     )
 
@@ -3253,6 +3481,13 @@ class SlideInputMethodService :
             )
         }
         lastAutocorrect = autocorrect
+        recordTypedDecision(
+            if (settlement.corrected) {
+                DecisionOutcome.TOP_CANDIDATE_COMMITTED
+            } else {
+                DecisionOutcome.LITERAL_COMMITTED
+            },
+        )
         if (settlement.learnTypedWord && !recomposed) {
             // Settled exactly as typed, with the keyboard offering no objection. That is the
             // ordinary way a word the dictionary has never heard of gets into the language.
@@ -3289,6 +3524,7 @@ class SlideInputMethodService :
     ): EditorComposingSettlement.AbandonResult {
         if (composing.isEmpty()) {
             lastAutocorrect = null
+            pendingTypedQuality = null
             clearSuggestions()
             return EditorComposingSettlement.AbandonResult(
                 settled = true,
@@ -3306,6 +3542,8 @@ class SlideInputMethodService :
         )
         if (!settlement.settled) return settlement
 
+        recordTypedDecision(DecisionOutcome.STALE)
+
         composing.setLength(0)
         clearTouches()
         pendingAutocorrection = null
@@ -3319,6 +3557,7 @@ class SlideInputMethodService :
 
     /** Drops state that can no longer refer to the framework's current InputConnection. */
     private fun discardComposingForEditorTransition() {
+        recordTypedDecision(DecisionOutcome.STALE)
         composing.setLength(0)
         clearTouches()
         pendingAutocorrection = null
@@ -3387,6 +3626,8 @@ class SlideInputMethodService :
             )
         }
 
+        typingQuality.recordImmediateCorrection(QualityInputMode.TYPED)
+
         // The clearest signal a keyboard ever gets. The user was shown what it thought they meant
         // and said no, in the one gesture that means exactly that and nothing else. A word rescued
         // this way is trusted from now on rather than waiting to be typed again.
@@ -3454,6 +3695,7 @@ class SlideInputMethodService :
             fallbackStillArmed = selfEdit,
         )
         if (!suggestion.settled) {
+            recordTypedDecision(DecisionOutcome.EDITOR_REJECTED)
             if (suggestion.replacementApplied) {
                 // The replacement landed as composing text but both settlement operations were
                 // rejected. Keep tracking the editor's new live value so a retry or following key
@@ -3478,6 +3720,8 @@ class SlideInputMethodService :
         if (word.equals(typed, ignoreCase = true)) {
             learnWord(word, weight = TRUSTED_AT_ONCE)
         }
+        recordTypedDecision(DecisionOutcome.LITERAL_COMMITTED)
+        typingQuality.recordExplicitAlternateSelection(QualityInputMode.TYPED)
 
         composing.setLength(0)
         clearTouches()

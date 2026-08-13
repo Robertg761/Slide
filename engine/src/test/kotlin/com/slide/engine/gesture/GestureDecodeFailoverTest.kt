@@ -16,6 +16,7 @@ class GestureDecodeFailoverTest {
 
         assertEquals("hello", result.single().word)
         assertEquals(1, fallback.calls)
+        assertEquals(GestureDecoderSource.FALLBACK, failover.lastSource)
     }
 
     @Test
@@ -34,6 +35,7 @@ class GestureDecodeFailoverTest {
 
         assertEquals(1, primaryCalls)
         assertEquals(2, fallback.calls)
+        assertEquals(GestureDecoderSource.FALLBACK, failover.lastSource)
     }
 
     @Test
@@ -47,6 +49,7 @@ class GestureDecodeFailoverTest {
 
         assertEquals("neural", result.single().word)
         assertEquals(0, fallback.calls)
+        assertEquals(GestureDecoderSource.NEURAL, failover.lastSource)
     }
 
     @Test
@@ -60,6 +63,15 @@ class GestureDecodeFailoverTest {
 
         assertEquals("hello", result.single().word)
         assertEquals(1, fallback.calls)
+        assertEquals(GestureDecoderSource.FALLBACK, failover.lastSource)
+    }
+
+    @Test
+    fun `empty primary and fallback report no source`() {
+        val failover = GestureDecodeFailover(FakeDecoder(emptyList()))
+
+        assertEquals(emptyList<GestureCandidate>(), failover.decode(points, keys, true, null, null) { emptyList() })
+        assertEquals(GestureDecoderSource.NONE, failover.lastSource)
     }
 
     private class FakeDecoder(
