@@ -3,8 +3,8 @@ package com.slide.ime.view
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
-import android.graphics.Path
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.os.Bundle
 import android.util.TypedValue
@@ -19,6 +19,7 @@ import com.slide.asr.VoiceInput
 import com.slide.core.theme.KeyboardTheme
 import com.slide.core.theme.Themes
 import kotlin.math.PI
+import kotlin.math.cos
 import kotlin.math.min
 import kotlin.math.sin
 
@@ -30,9 +31,9 @@ import kotlin.math.sin
  * typing on is exactly the sort of thing that makes people uninstall a keyboard. When this is
  * visible, Slide is listening; when it is not, it is not.
  *
- * The microphone button and the waveform are the same thing in two states: a still circle before
- * and after, a moving wave while the microphone is open. Nothing else on screen moves, so movement
- * on its own is enough to say which of the two is happening.
+ * The microphone stays visually anchored through every state. Speech drives the surrounding bars
+ * while listening; model loading and inference use a rotating arc, so the panel never appears
+ * frozen while it is doing work.
  */
 class VoiceOverlayView(context: Context) : View(context) {
 
@@ -52,7 +53,7 @@ class VoiceOverlayView(context: Context) : View(context) {
     var state: VoiceInput.State = VoiceInput.State.Idle
         set(value) {
             field = value
-            if (value != VoiceInput.State.Listening) level = 0f
+            if (value != VoiceInput.State.Listening) levelDynamics.reset()
             syncAnimation()
             refreshAccessibilityDescription()
             invalidate()
@@ -66,18 +67,10 @@ class VoiceOverlayView(context: Context) : View(context) {
             invalidate()
         }
 
-    /**
-     * Smoothed microphone level driving the height of the wave.
-     *
-     * Raw levels from a 100ms window jitter enough to look like a fault rather than a voice, so
-     * each update pulls the drawn value part of the way towards the new one.
-     */
-    private var level = 0f
+    private val levelDynamics = VoiceLevelDynamics()
 
     fun setLevel(value: Float) {
-        level += (value.coerceIn(0f, 1f) - level) * LEVEL_SMOOTHING
-        // No invalidate: the animation is already redrawing every frame while listening, and
-        // outside that state there is no wave for a level to change.
+        levelDynamics.accept(value)
     }
 
     private val density = resources.displayMetrics.density
@@ -88,12 +81,12 @@ class VoiceOverlayView(context: Context) : View(context) {
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
 
-    private val wavePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val indicatorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
     }
-    private val wavePath = Path()
+    private val arcBounds = RectF()
 
     private var cancelBounds = floatArrayOf(0f, 0f, 0f, 0f)
     private var pressedCancel = false
@@ -184,11 +177,17 @@ class VoiceOverlayView(context: Context) : View(context) {
      * at the same speed whether the view is being drawn at 60Hz or 120Hz, and does not lurch when
      * a frame is dropped.
      */
-    private var waveStartMs = 0L
+    private var animationStartMs = 0L
+    private var previousFrameMs = 0L
 
     private val frame = object : Runnable {
         override fun run() {
-            if (state != VoiceInput.State.Listening) return
+            if (!state.animates) return
+            val now = AnimationUtils.currentAnimationTimeMillis()
+            if (state == VoiceInput.State.Listening) {
+                levelDynamics.advance((now - previousFrameMs).coerceIn(0L, MAX_FRAME_GAP_MS))
+            }
+            previousFrameMs = now
             invalidate()
             postOnAnimation(this)
         }
@@ -196,8 +195,9 @@ class VoiceOverlayView(context: Context) : View(context) {
 
     private fun syncAnimation() {
         removeCallbacks(frame)
-        if (state != VoiceInput.State.Listening || !isAttachedToWindow) return
-        waveStartMs = AnimationUtils.currentAnimationTimeMillis()
+        if (!state.animates || !isAttachedToWindow) return
+        animationStartMs = AnimationUtils.currentAnimationTimeMillis()
+        previousFrameMs = animationStartMs
         postOnAnimation(frame)
     }
 
@@ -211,56 +211,53 @@ class VoiceOverlayView(context: Context) : View(context) {
         removeCallbacks(frame)
     }
 
-    /**
-     * Draws the microphone level as a band of travelling waves.
-     *
-     * Three of them, at frequencies and speeds that share no common multiple, so the crossings
-     * never settle into a repeating pattern the eye can latch onto — the difference between
-     * something that looks alive and something that looks like a screensaver. One of the three runs
-     * backwards, which is what makes them appear to fold through each other rather than slide.
-     *
-     * The waves keep a little height at silence. A dead flat line reads as a broken microphone,
-     * whereas a shallow ripple reads as an open one waiting for a voice.
-     */
-    private fun drawWave(canvas: Canvas, centerX: Float, centerY: Float, radius: Float) {
-        val elapsed = (AnimationUtils.currentAnimationTimeMillis() - waveStartMs) / 1000f
-        val amplitude = radius * (WAVE_IDLE_HEIGHT + level * (1f - WAVE_IDLE_HEIGHT))
-        val halfSpan = min(centerX, radius * WAVE_SPAN)
+    private fun drawListeningIndicator(canvas: Canvas, centerX: Float, centerY: Float, radius: Float) {
+        val elapsed = (AnimationUtils.currentAnimationTimeMillis() - animationStartMs) / 1000f
+        val level = levelDynamics.level
 
-        wavePaint.strokeWidth = dp(3f)
-        wavePaint.color = keyboardTheme.accentBackground
+        // A translucent halo makes volume readable even in peripheral vision. It grows from a
+        // steady open-microphone pulse, then the bars provide the detailed speech response.
+        fillPaint.color = keyboardTheme.accentBackground
+        fillPaint.alpha = (42 + level * 64).toInt()
+        val pulse = (sin(elapsed * PI.toFloat() * 1.8f) + 1f) * 0.5f
+        canvas.drawCircle(centerX, centerY, radius * (1.05f + level * 0.28f + pulse * 0.04f), fillPaint)
 
-        for (wave in WAVES) {
-            wavePath.reset()
-            var x = centerX - halfSpan
-            while (x <= centerX + halfSpan) {
-                // Position along the band, -1 at the left end and 1 at the right.
-                val position = (x - centerX) / halfSpan
-                // Tapers both ends to nothing so the band fades into the panel instead of being
-                // cut off at an arbitrary edge.
-                val envelope = sin(((position + 1f) / 2f) * PI).toFloat()
-                val angle = position * wave.frequency * PI.toFloat() - elapsed * wave.speed
-                val y = centerY + sin(angle.toDouble()).toFloat() *
-                    amplitude * wave.height * envelope * envelope
-
-                if (x == centerX - halfSpan) wavePath.moveTo(x, y) else wavePath.lineTo(x, y)
-                x += WAVE_STEP_PX
-            }
-
-            wavePaint.alpha = wave.alpha
-            canvas.drawPath(wavePath, wavePaint)
+        indicatorPaint.color = keyboardTheme.accentBackground
+        indicatorPaint.alpha = 235
+        indicatorPaint.strokeWidth = dp(4f)
+        val halfSpan = min(centerX - dp(16f), radius * BAR_SPAN)
+        val spacing = halfSpan * 2f / (BAR_COUNT - 1)
+        for (index in 0 until BAR_COUNT) {
+            val position = index.toFloat() / (BAR_COUNT - 1) * 2f - 1f
+            val envelope = 0.4f + 0.6f * cos(position * PI.toFloat() / 2f)
+            val motion = 0.78f + 0.22f * sin(elapsed * 5.2f + index * 1.37f)
+            val halfHeight = radius * (BAR_IDLE_HEIGHT + level * envelope * motion)
+            val x = centerX - halfSpan + spacing * index
+            canvas.drawLine(x, centerY - halfHeight, x, centerY + halfHeight, indicatorPaint)
         }
+
+        drawMicrophoneButton(canvas, centerX, centerY, radius * 0.7f)
     }
 
-    private data class Wave(
-        /** Half-cycles across the band. */
-        val frequency: Float,
-        /** Radians per second; negative travels the other way. */
-        val speed: Float,
-        /** Share of the full amplitude. */
-        val height: Float,
-        val alpha: Int,
-    )
+    private fun drawProcessingIndicator(canvas: Canvas, centerX: Float, centerY: Float, radius: Float) {
+        drawMicrophoneButton(canvas, centerX, centerY, radius * 0.78f)
+        val elapsed = (AnimationUtils.currentAnimationTimeMillis() - animationStartMs) / 1000f
+        indicatorPaint.style = Paint.Style.STROKE
+        indicatorPaint.strokeWidth = dp(4f)
+        indicatorPaint.color = keyboardTheme.accentBackground
+        indicatorPaint.alpha = 230
+        val arcRadius = radius * 1.12f
+        arcBounds.set(centerX - arcRadius, centerY - arcRadius, centerX + arcRadius, centerY + arcRadius)
+        canvas.drawArc(arcBounds, elapsed * 210f, 104f, false, indicatorPaint)
+    }
+
+    private fun drawMicrophoneButton(canvas: Canvas, centerX: Float, centerY: Float, radius: Float) {
+        fillPaint.color = keyboardTheme.accentBackground
+        fillPaint.alpha = 255
+        canvas.drawCircle(centerX, centerY, radius, fillPaint)
+        fillPaint.color = keyboardTheme.accentText
+        MicGlyph.draw(canvas, fillPaint, centerX, centerY, radius)
+    }
 
     // endregion
 
@@ -271,15 +268,12 @@ class VoiceOverlayView(context: Context) : View(context) {
         val centerY = height * MIC_CENTRE_FRACTION
         val baseRadius = min(width, height) * MIC_RADIUS_FRACTION
 
-        if (state == VoiceInput.State.Listening) {
-            drawWave(canvas, centerX, centerY, baseRadius)
-        } else {
-            fillPaint.color = keyboardTheme.accentBackground
-            fillPaint.alpha = 255
-            canvas.drawCircle(centerX, centerY, baseRadius, fillPaint)
-
-            fillPaint.color = keyboardTheme.accentText
-            MicGlyph.draw(canvas, fillPaint, centerX, centerY, baseRadius)
+        when (state) {
+            VoiceInput.State.Listening -> drawListeningIndicator(canvas, centerX, centerY, baseRadius)
+            VoiceInput.State.Preparing,
+            VoiceInput.State.Transcribing,
+            -> drawProcessingIndicator(canvas, centerX, centerY, baseRadius)
+            VoiceInput.State.Idle -> drawMicrophoneButton(canvas, centerX, centerY, baseRadius)
         }
 
         textPaint.color = keyboardTheme.keyText
@@ -331,9 +325,9 @@ class VoiceOverlayView(context: Context) : View(context) {
     }
 
     private fun statusText(): String = errorText ?: when (state) {
-        VoiceInput.State.Preparing -> "Getting ready…"
-        VoiceInput.State.Listening -> "Listening — tap when you're done"
-        VoiceInput.State.Transcribing -> "Transcribing…"
+        VoiceInput.State.Preparing -> "Loading offline speech…"
+        VoiceInput.State.Listening -> "Listening offline · tap when you're done"
+        VoiceInput.State.Transcribing -> "Transcribing on device…"
         VoiceInput.State.Idle -> "Tap to close"
     }
 
@@ -447,21 +441,14 @@ class VoiceOverlayView(context: Context) : View(context) {
         const val A11Y_MAIN = 0
         const val A11Y_CANCEL = 1
 
-        const val LEVEL_SMOOTHING = 0.35f
-
-        /** How far either side of centre the band reaches, as a multiple of the mic radius. */
-        const val WAVE_SPAN = 3.2f
-
-        /** Amplitude at silence, as a share of the full height, so the line still breathes. */
-        const val WAVE_IDLE_HEIGHT = 0.12f
-
-        /** Sampling interval along the band. Three pixels is below the eye's notice at this size. */
-        const val WAVE_STEP_PX = 3f
-
-        val WAVES = listOf(
-            Wave(frequency = 2.0f, speed = 3.1f, height = 1.0f, alpha = 255),
-            Wave(frequency = 3.0f, speed = -2.3f, height = 0.7f, alpha = 150),
-            Wave(frequency = 4.5f, speed = 4.3f, height = 0.45f, alpha = 90),
-        )
+        const val BAR_COUNT = 11
+        const val BAR_SPAN = 3.15f
+        const val BAR_IDLE_HEIGHT = 0.08f
+        const val MAX_FRAME_GAP_MS = 64L
     }
 }
+
+private val VoiceInput.State.animates: Boolean
+    get() = this == VoiceInput.State.Preparing ||
+        this == VoiceInput.State.Listening ||
+        this == VoiceInput.State.Transcribing

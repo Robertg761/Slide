@@ -137,7 +137,7 @@ Synthetic and donated-corpus reports remain benchmarks, not evidence of physical
 
 ### Model choice
 
-Slide 0.2.1 packages one model: `ggml-base.en-q5_1.bin` (59,721,011 bytes). A prior Galaxy S24
+Slide packages one model: `ggml-base.en-q5_1.bin` (59,721,011 bytes). A prior Galaxy S24
 Ultra benchmark loaded Base in about 100 ms and decoded an 11-second fixture in about 1.7 seconds.
 The former Small model decoded the same fixture in about 7.4 seconds and added roughly 181 MB to
 every APK and update, so it was removed. This is one device measurement, not a latency promise for
@@ -150,7 +150,11 @@ and stored uncompressed for direct asset access; the installed app has no model 
 model-choice UI.
 
 Current transcription is batch-oriented: the user starts and stops recording, then Whisper decodes
-the captured 16 kHz mono audio. Streaming partials, VAD endpointing, and hardware acceleration are
+the captured 16 kHz mono audio. A conservative local pre-pass trims only confidently silent leading
+and trailing frames. Low-confidence temperature retries remain available but are explicitly bounded.
+ARM64 packages separately compiled ggml CPU backends and asks each for a compatibility score before
+loading the best match, preserving the Armv8 baseline while allowing dot-product, FP16, i8mm, SVE,
+and SME kernels on newer phones. Streaming partials, VAD endpointing, and GPU/NPU acceleration are
 future work and must not be described as shipped features.
 
 ### Process architecture
@@ -168,6 +172,7 @@ taking the keyboard with it.
   `MicPermissionActivity` for the system prompt, then the IME rechecks the result.
 - Use `MediaRecorder.AudioSource.VOICE_RECOGNITION`, 16 kHz mono PCM — that's what Whisper expects.
 - The model is bundled in the APK and verified during the build; there is no runtime model fetch.
+- The speech module has no Internet permission, URL client, platform recognizer, or cloud fallback.
 - Licensing is clean: Whisper weights are MIT, `whisper.cpp` is MIT.
 
 ---

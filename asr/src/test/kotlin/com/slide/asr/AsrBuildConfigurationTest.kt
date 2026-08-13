@@ -22,6 +22,7 @@ class AsrBuildConfigurationTest {
 
     @Test
     fun armBuildHasNoOptionalInstructionFloor() {
+        val build = File(root, "asr/build.gradle.kts").readText()
         val cmake = File(root, "asr/src/main/cpp/CMakeLists.txt").readText()
         val configuredArch = Regex("""set\(GGML_CPU_ARM_ARCH\s+\"([^\"]*)\"""")
             .find(cmake)
@@ -29,6 +30,47 @@ class AsrBuildConfigurationTest {
             ?.get(1)
 
         assertEquals("", configuredArch)
+        assertTrue(cmake.contains("ANDROID_ABI STREQUAL \"arm64-v8a\""))
+        assertTrue(cmake.contains("set(GGML_CPU_ALL_VARIANTS  ON"))
+        assertTrue(cmake.contains("set(GGML_BACKEND_DL        ON"))
+        assertTrue(build.contains("addGeneratedSourceDirectory(packageBackends)"))
+        assertTrue(build.contains("dependsOn(\"externalNativeBuild\$capitalized\")"))
+        assertTrue(cmake.contains("ggml-cpu-android_armv8.0_1"))
+        assertTrue(cmake.contains("ggml-cpu-android_armv9.2_2"))
+    }
+
+    @Test
+    fun arm64RuntimeSelectsACompatibleCpuBackend() {
+        val bridge = File(root, "asr/src/main/cpp/whisper_jni.cpp").readText()
+
+        assertTrue(bridge.contains("dlopen(variant, RTLD_NOW | RTLD_LOCAL)"))
+        assertTrue(bridge.contains("dlsym(handle, \"ggml_backend_score\")"))
+        assertTrue(bridge.contains("ggml_backend_load(best_variant)"))
+        assertTrue(bridge.contains("ggml_backend_dev_count() > 0"))
+        assertTrue(bridge.contains("if (!load_dynamic_cpu_backend()) return 0"))
+    }
+
+    @Test
+    fun uncertainDecodeRetainsBoundedAccuracyFallbacks() {
+        val bridge = File(root, "asr/src/main/cpp/whisper_jni.cpp").readText()
+
+        assertTrue(bridge.contains("params.greedy.best_of = 2"))
+        assertTrue(bridge.contains("params.temperature_inc = 0.4F"))
+        assertTrue(bridge.contains("params.flash_attn = true"))
+    }
+
+    @Test
+    fun speechRecognitionHasNoNetworkOrPlatformRecognizerPath() {
+        val cmake = File(root, "asr/src/main/cpp/CMakeLists.txt").readText()
+        val manifest = File(root, "asr/src/main/AndroidManifest.xml").readText()
+        val kotlinSources = File(root, "asr/src/main/kotlin").walkTopDown()
+            .filter { it.isFile && it.extension == "kt" }
+            .joinToString("\n") { it.readText() }
+
+        assertTrue(cmake.contains("set(WHISPER_CURL           OFF"))
+        assertTrue(!manifest.contains("android.permission.INTERNET"))
+        assertTrue(!kotlinSources.contains("android.speech.SpeechRecognizer"))
+        assertTrue(!kotlinSources.contains("java.net."))
     }
 
     @Test

@@ -15,8 +15,8 @@ android {
         applicationId = "com.slide"
         minSdk = 26
         targetSdk = 37
-        versionCode = 12
-        versionName = "0.3.3"
+        versionCode = 13
+        versionName = "0.3.4"
     }
 
     buildTypes {
@@ -42,6 +42,15 @@ android {
         // Whisper maps its model directly, while swipe inference copies already-packed models to
         // mmap-friendly storage; the application therefore owns both packaging rules.
         noCompress += listOf("bin", "pte")
+    }
+
+    packaging {
+        jniLibs {
+            // ARM64 Whisper's runtime-selected backends and fbjni both bring the NDK's ABI-stable
+            // shared C++ runtime. Package one process-wide copy so Gradle does not reject the
+            // otherwise valid duplicate transitive input.
+            pickFirsts += "**/libc++_shared.so"
+        }
     }
 
     compileOptions {
