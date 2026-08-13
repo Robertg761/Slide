@@ -3,6 +3,7 @@ package com.slide.engine.gesture
 import com.slide.engine.TestBigrams
 import com.slide.engine.TestLexicon
 import java.io.File
+import kotlin.math.exp
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -16,6 +17,8 @@ import org.junit.Test
  *     ./gradlew :engine:testDebugUnitTest \
  *       --tests '*RealSwipeBenchmarkTest*' \
  *       -Dslide.realSwipeDataset=/path/to/test.jsonl
+ *
+ * Add `-Dslide.typingQualityOutput=/path/to/results.jsonl` for a privacy-safe machine report input.
  *
  * Without that property this test is skipped, keeping an ordinary offline build deterministic.
  * The default limit matches the public 20,000 non-single-letter subset used in FUTO Keyboard's
@@ -41,46 +44,70 @@ class RealSwipeBenchmarkTest {
         var inLexiconTopFive = 0
         var totalScored = 0L
         var totalNanos = 0L
+        val qualityWriter = System.getProperty(QUALITY_OUTPUT_PROPERTY)
+            ?.takeIf(String::isNotBlank)
+            ?.let { outputPath ->
+                val output = File(outputPath)
+                output.absoluteFile.parentFile?.mkdirs()
+                TypingQualityJsonlWriter(output.bufferedWriter())
+            }
         val marginThresholds = floatArrayOf(0.25f, 0.5f, 1f, 1.5f, 2f, 3f, 4f)
         val marginTotals = IntArray(marginThresholds.size)
         val marginCorrect = IntArray(marginThresholds.size)
 
-        file.useLines { lines ->
-            for (line in lines) {
-                if (accepted >= limit) break
-                val record = parse(line) ?: continue
-                if (record.word.length <= 1 || !record.word.all { it in 'a'..'z' || it == '\'' }) continue
+        try {
+            file.useLines { lines ->
+                for (line in lines) {
+                    if (accepted >= limit) break
+                    val record = parse(line) ?: continue
+                    if (record.word.length <= 1 || !record.word.all { it in 'a'..'z' || it == '\'' }) continue
 
-                val start = System.nanoTime()
-                val decoded = decoder.decode(
-                    points = record.points,
-                    keys = QWERTY,
-                    previousWord = record.previousWord,
-                )
-                val candidates = decoded.map { it.word.lowercase() }
-                totalNanos += System.nanoTime() - start
-                totalScored += decoder.lastScoredCount
+                    val start = System.nanoTime()
+                    val decoded = decoder.decode(
+                        points = record.points,
+                        keys = QWERTY,
+                        previousWord = record.previousWord,
+                    )
+                    val elapsedNanos = (System.nanoTime() - start).coerceAtLeast(0L)
+                    val candidates = decoded.map { it.word.lowercase() }
+                    totalNanos += elapsedNanos
+                    totalScored += decoder.lastScoredCount
 
-                val margin = if (decoded.size >= 2) decoded[0].score - decoded[1].score else null
-                if (margin != null) {
-                    marginThresholds.forEachIndexed { index, threshold ->
-                        if (margin >= threshold) {
-                            marginTotals[index]++
-                            if (candidates.firstOrNull() == record.word) marginCorrect[index]++
+                    val expectedIndex = candidates.indexOf(record.word)
+                    qualityWriter?.append(
+                        TypingQualityCase(
+                            inputKind = TypingQualityInputKind.SWIPE,
+                            expectedRank = expectedIndex.takeIf { it >= 0 }?.plus(1),
+                            committed = decoded.isNotEmpty(),
+                            usedFallback = false,
+                            latencyMillis = elapsedNanos / 1_000_000.0,
+                            confidence = confidence(decoded),
+                        ),
+                    )
+
+                    val margin = if (decoded.size >= 2) decoded[0].score - decoded[1].score else null
+                    if (margin != null) {
+                        marginThresholds.forEachIndexed { index, threshold ->
+                            if (margin >= threshold) {
+                                marginTotals[index]++
+                                if (candidates.firstOrNull() == record.word) marginCorrect[index]++
+                            }
                         }
                     }
-                }
 
-                accepted++
-                val known = TestLexicon.instance.contains(record.word)
-                if (candidates.firstOrNull() == record.word) topOne++
-                if (record.word in candidates) topFive++
-                if (known) {
-                    inLexicon++
-                    if (candidates.firstOrNull() == record.word) inLexiconTopOne++
-                    if (record.word in candidates) inLexiconTopFive++
+                    accepted++
+                    val known = TestLexicon.instance.contains(record.word)
+                    if (candidates.firstOrNull() == record.word) topOne++
+                    if (record.word in candidates) topFive++
+                    if (known) {
+                        inLexicon++
+                        if (candidates.firstOrNull() == record.word) inLexiconTopOne++
+                        if (record.word in candidates) inLexiconTopFive++
+                    }
                 }
             }
+        } finally {
+            qualityWriter?.close()
         }
 
         assertTrue("benchmark found only $accepted usable records", accepted >= minOf(limit, 1_000))
@@ -160,6 +187,15 @@ class RealSwipeBenchmarkTest {
     private fun percent(numerator: Int, denominator: Int): String =
         if (denominator == 0) "n/a" else "%.2f%%".format(numerator * 100.0 / denominator)
 
+    /** Softmax share of the top result; bounded, deterministic, and content-free. */
+    private fun confidence(candidates: List<GestureCandidate>): Double {
+        val top = candidates.firstOrNull()?.score?.takeIf(Float::isFinite) ?: return 0.0
+        val denominator = candidates.sumOf { candidate ->
+            exp((candidate.score - top).toDouble().coerceIn(-50.0, 0.0))
+        }
+        return (1.0 / denominator).coerceIn(0.0, 1.0)
+    }
+
     private data class Record(
         val word: String,
         val previousWord: String?,
@@ -169,6 +205,7 @@ class RealSwipeBenchmarkTest {
     private companion object {
         const val DATASET_PROPERTY = "slide.realSwipeDataset"
         const val LIMIT_PROPERTY = "slide.realSwipeLimit"
+        const val QUALITY_OUTPUT_PROPERTY = "slide.typingQualityOutput"
         const val DEFAULT_LIMIT = 20_000
         const val DATA_PREFIX = "\"data\":["
         const val DATA_SUFFIX = "],\"sentence\""

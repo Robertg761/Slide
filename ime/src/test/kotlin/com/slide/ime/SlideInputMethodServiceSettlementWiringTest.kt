@@ -111,6 +111,32 @@ class SlideInputMethodServiceSettlementWiringTest {
         )
     }
 
+    @Test
+    fun `gesture adaptation sees only verified replacements and consumed immediate undo`() {
+        val alternative = method("pickGestureAlternative", "applyShift")
+        assertOrdered(
+            alternative,
+            "if (!transaction.replaced)",
+            "gestureAdaptation.observeAlternative(rejectedAdaptiveWord, word)",
+        )
+        assertTrue(alternative.contains("!incognito"))
+
+        val undo = method("deleteLastGestureCommit", "rollbackGestureLearning")
+        assertOrdered(
+            undo,
+            ") ?: return false",
+            "gestureAdaptation.observeImmediateUndo(undo.adaptiveWord)",
+        )
+        assertTrue(undo.contains("!incognito"))
+    }
+
+    @Test
+    fun `both gesture decoders pass through one adaptive and measured seam`() {
+        val decode = method("decodeGesture", "recordSwipeDecision")
+        assertOrdered(decode, "decoder.decode(", "gestureAdaptation.rerank(raw)")
+        assertOrdered(decode, "lastDecoderSource", "gestureAdaptation.rerank(raw)")
+    }
+
     private fun method(name: String, nextName: String): String {
         val start = source.indexOf("fun $name(")
         val end = source.indexOf("fun $nextName(", start + 1)

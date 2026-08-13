@@ -10,3 +10,15 @@ interface GestureDecodingEngine {
         previousPreviousWord: String? = null,
     ): List<GestureCandidate>
 }
+
+/** Which decoder produced the candidates returned by the most recent call on this engine. */
+enum class GestureDecoderSource {
+    NEURAL,
+    FALLBACK,
+    NONE,
+}
+
+/** Optional per-call provenance for engines that may transparently fail over. */
+interface GestureDecoderProvenance {
+    val lastDecoderSource: GestureDecoderSource
+}

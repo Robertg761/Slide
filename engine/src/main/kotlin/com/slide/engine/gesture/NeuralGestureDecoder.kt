@@ -20,10 +20,13 @@ class NeuralGestureDecoder private constructor(
     trie: SwipeLexiconTrie,
     trigrams: Trigrams?,
     private val fallback: GestureDecodingEngine?,
-) : GestureDecodingEngine, AutoCloseable {
+) : GestureDecodingEngine, GestureDecoderProvenance, AutoCloseable {
     private val beamSearch = CtcSwipeBeamSearch(lexicon, bigrams, userBigrams, trie, trigrams)
     private val failover = GestureDecodeFailover(fallback)
     private var closed = false
+
+    override val lastDecoderSource: GestureDecoderSource
+        @Synchronized get() = failover.lastSource
 
     @Synchronized
     override fun decode(
@@ -202,6 +205,8 @@ internal class GestureDecodeFailover(
     private val fallback: GestureDecodingEngine?,
 ) {
     private var primaryAvailable = true
+    var lastSource: GestureDecoderSource = GestureDecoderSource.NONE
+        private set
 
     fun decode(
         points: List<GesturePoint>,
@@ -213,20 +218,30 @@ internal class GestureDecodeFailover(
     ): List<GestureCandidate> {
         if (primaryAvailable) {
             try {
-                usable(primary()).takeIf(List<GestureCandidate>::isNotEmpty)?.let { return it }
+                usable(primary()).takeIf(List<GestureCandidate>::isNotEmpty)?.let {
+                    lastSource = GestureDecoderSource.NEURAL
+                    return it
+                }
             } catch (_: RuntimeException) {
                 primaryAvailable = false
             }
         }
-        return usable(
+        val recovered = usable(
             fallback
                 ?.decode(points, keys, blockOffensive, previousWord, previousPreviousWord)
                 .orEmpty(),
         )
+        lastSource = if (recovered.isEmpty()) {
+            GestureDecoderSource.NONE
+        } else {
+            GestureDecoderSource.FALLBACK
+        }
+        return recovered
     }
 
     fun disablePrimary() {
         primaryAvailable = false
+        lastSource = GestureDecoderSource.NONE
     }
 
     private fun usable(candidates: List<GestureCandidate>): List<GestureCandidate> =

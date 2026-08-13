@@ -6,6 +6,8 @@ internal data class GestureUndo(
     val editorGeneration: Long,
     val cursorPosition: Int?,
     val learnedPair: Pair<String, String>?,
+    /** Lower-level decoded word, retained only until this one-shot editor transaction expires. */
+    val adaptiveWord: String? = null,
 )
 
 /**
@@ -28,9 +30,10 @@ internal class GestureUndoState {
         editorGeneration: Long,
         cursorPosition: Int?,
         learnedPair: Pair<String, String>?,
+        adaptiveWord: String? = null,
     ) {
         pending = committedText.takeIf(String::isNotEmpty)?.let {
-            GestureUndo(it, editorGeneration, cursorPosition, learnedPair)
+            GestureUndo(it, editorGeneration, cursorPosition, learnedPair, adaptiveWord)
         }
     }
 

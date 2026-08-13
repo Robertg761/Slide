@@ -30,7 +30,11 @@ android {
         unitTests.all {
             it.inputs.dir(layout.projectDirectory.dir("src/main/assets"))
             it.inputs.dir(layout.projectDirectory.dir("src/test/resources"))
-            listOf("slide.realSwipeDataset", "slide.realSwipeLimit").forEach { property ->
+            listOf(
+                "slide.realSwipeDataset",
+                "slide.realSwipeLimit",
+                "slide.typingQualityOutput",
+            ).forEach { property ->
                 System.getProperty(property)?.let { value -> it.systemProperty(property, value) }
             }
         }

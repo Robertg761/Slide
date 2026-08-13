@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+## [0.3.3] - 2026-08-13
+
+### Added
+
+- Swipe typing now learns from verified suggestion-strip replacements and repeated immediate
+  whole-word undo. The bounded preference model reranks both neural and deterministic decoder
+  results, decays old evidence, and leaves unrelated candidate lists unchanged.
+- A process-local typing quality snapshot reports coarse latency, confidence, candidate-count,
+  outcome, decoder-source, correction, and model-readiness totals through Android's permission-
+  gated service dump. It stores no typed text, gesture coordinates, editor identity, or event rows.
+- The opt-in typing quality reporter compares content-free JSONL benchmark outcomes, including
+  top-1 and top-k accuracy, wrong commits, abstentions, fallback use, latency percentiles,
+  confidence calibration, before-and-after deltas, and explicit regression budgets.
+
+### Changed
+
+- Neural swipe failover now reports which decoder produced each result instead of requiring the IME
+  to infer provenance from model availability.
+- Personal swipe preferences persist as salted word fingerprints with bounded strengths and logical
+  ages. Incognito fields do not train the model, and clear-personalized-data removes the snapshot in
+  the same fail-closed transaction as learned words, phrases, and touch calibration.
+- Gesture preference files and temporary residues are excluded from legacy backup, cloud backup,
+  and device transfer.
+
+### Verification
+
+- JVM tests for adaptation, persistence, neural failover, IME wiring, concurrent aggregate
+  collection, backup rules, and the JSONL writer pass. The Python report suite passes with Ruff,
+  release lint, debug and minified release assembly, Android-test compilation, strict APK checks,
+  release-script contracts, and exact locked-language regeneration.
+- No Android device was connected for this release pass, and the optional donated real-swipe corpus
+  was not downloaded. Physical typing feel and corpus-level improvement remain unmeasured.
+
 ## [0.3.2] - 2026-08-12
 
 ### Fixed

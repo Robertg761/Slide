@@ -2,6 +2,10 @@ package com.slide.engine.lexicon
 
 import android.content.Context
 import android.util.Log
+import com.slide.engine.gesture.GestureAdaptation
+import com.slide.engine.gesture.GestureAdaptationSnapshot
+import com.slide.engine.gesture.GestureAlternativePreference
+import com.slide.engine.gesture.GestureRejectionPreference
 import com.slide.engine.suggest.SpatialTouchModel
 import java.io.BufferedWriter
 import java.io.File
@@ -20,12 +24,12 @@ import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Keeps a [UserDictionary] on disk, in the app's private storage and nowhere else.
+ * Keeps personalized language, touch, and gesture models in private app storage and nowhere else.
  *
  * This is the most personal thing Slide holds — it is, fairly literally, a list of the words
  * someone uses that most people do not. It never leaves the device, is never bundled into a
- * backup that could carry it off one (see `allowBackup` handling), and is written as plain text so
- * that anyone who wants to read or delete it can.
+ * backup that could carry it off one (see `allowBackup` handling). Words and pairs remain readable
+ * plain text; gesture preferences use salted fingerprints so that file is not itself word history.
  *
  * Writes go to a temporary file and are renamed into place, so a process killed mid-save loses the
  * newest word rather than the whole dictionary.
@@ -41,6 +45,11 @@ class UserDictionaryStore(
             ?: throw IllegalArgumentException("Learned-word file has no parent directory"),
         SPATIAL_FILE_NAME,
     ),
+    private val gestureAdaptationFile: File = File(
+        file.absoluteFile.parentFile
+            ?: throw IllegalArgumentException("Learned-word file has no parent directory"),
+        GESTURE_ADAPTATION_FILE_NAME,
+    ),
     /** Injectable only so durability failures can be exercised on the host JVM. */
     private val directorySync: (File?) -> Boolean = ::syncDirectory,
 ) {
@@ -48,7 +57,8 @@ class UserDictionaryStore(
     /** Serialises separate Store instances that address the same learned-data files. */
     private val operationLock = operationLocks.computeIfAbsent(
         "${file.absoluteFile.toPath().normalize()}\u0000${pairFile.absoluteFile.toPath().normalize()}" +
-            "\u0000${spatialFile.absoluteFile.toPath().normalize()}",
+            "\u0000${spatialFile.absoluteFile.toPath().normalize()}" +
+            "\u0000${gestureAdaptationFile.absoluteFile.toPath().normalize()}",
     ) { Any() }
     private val deletionMarker = File(temporaryDirectory, CLEAR_PENDING_FILE_NAME)
 
@@ -175,6 +185,79 @@ class UserDictionaryStore(
             }
         }
 
+    fun load(into: GestureAdaptation) {
+        synchronized(operationLock) {
+            if (deletionPending()) {
+                into.clear()
+                Log.i(TAG, "Gesture adaptation withheld while deletion is pending")
+                return
+            }
+            if (!gestureAdaptationFile.exists()) return
+            try {
+                val lines = gestureAdaptationFile.useLines { source ->
+                    source.take(MAX_GESTURE_ADAPTATION_LINES).toList()
+                }
+                val version = lines.firstValue("version")?.toIntOrNull() ?: return
+                val salt = lines.firstValue("salt") ?: return
+                val epoch = lines.firstValue("epoch")?.toLongOrNull() ?: return
+                val alternatives = lines.mapNotNull { line ->
+                    val parts = line.split('\t')
+                    if (parts.size != 5 || parts[0] != "alternative") return@mapNotNull null
+                    val rejected = parts[1].toUnsignedLongOrNull() ?: return@mapNotNull null
+                    val chosen = parts[2].toUnsignedLongOrNull() ?: return@mapNotNull null
+                    val strength = parts[3].toIntOrNull() ?: return@mapNotNull null
+                    val lastEpoch = parts[4].toLongOrNull() ?: return@mapNotNull null
+                    GestureAlternativePreference(rejected, chosen, strength, lastEpoch)
+                }
+                val rejections = lines.mapNotNull { line ->
+                    val parts = line.split('\t')
+                    if (parts.size != 4 || parts[0] != "rejection") return@mapNotNull null
+                    val fingerprint = parts[1].toUnsignedLongOrNull() ?: return@mapNotNull null
+                    val strength = parts[2].toIntOrNull() ?: return@mapNotNull null
+                    val lastEpoch = parts[3].toLongOrNull() ?: return@mapNotNull null
+                    GestureRejectionPreference(fingerprint, strength, lastEpoch)
+                }
+                val restored = into.restore(
+                    GestureAdaptationSnapshot(version, salt, epoch, alternatives, rejections),
+                )
+                if (restored) {
+                    Log.i(TAG, "Restored ${alternatives.size + rejections.size} gesture preferences")
+                } else {
+                    Log.w(TAG, "Could not validate gesture adaptation; starting empty")
+                }
+            } catch (e: IOException) {
+                Log.w(TAG, "Could not read gesture adaptation; starting empty", e)
+            } catch (e: SecurityException) {
+                Log.w(TAG, "Could not read gesture adaptation; starting empty", e)
+            }
+        }
+    }
+
+    fun save(from: GestureAdaptation): Boolean =
+        synchronized(operationLock) {
+            if (deletionPending()) return@synchronized false
+            val snapshot = from.snapshot()
+            writeAtomically(gestureAdaptationFile) { writer ->
+                writer.write("version\t${snapshot.version}")
+                writer.newLine()
+                writer.write("salt\t${snapshot.saltHex}")
+                writer.newLine()
+                writer.write("epoch\t${snapshot.epoch}")
+                writer.newLine()
+                for (entry in snapshot.alternatives) {
+                    writer.write("alternative\t${entry.rejectedFingerprint.toUnsignedHex()}")
+                    writer.write("\t${entry.chosenFingerprint.toUnsignedHex()}")
+                    writer.write("\t${entry.strength}\t${entry.lastEpoch}")
+                    writer.newLine()
+                }
+                for (entry in snapshot.rejections) {
+                    writer.write("rejection\t${entry.fingerprint.toUnsignedHex()}")
+                    writer.write("\t${entry.strength}\t${entry.lastEpoch}")
+                    writer.newLine()
+                }
+            }
+        }
+
     /**
      * Durably records a clear request before attempting to remove any personal data.
      *
@@ -253,7 +336,7 @@ class UserDictionaryStore(
     private fun deleteLearnedData(): Boolean {
         var succeeded = true
         val affectedDirectories = linkedSetOf<File>()
-        for (target in listOf(file, pairFile, spatialFile)) {
+        for (target in listOf(file, pairFile, spatialFile, gestureAdaptationFile)) {
             target.absoluteFile.parentFile?.let(affectedDirectories::add)
             affectedDirectories += temporaryDirectoriesFor(target)
             if (!deleteIfPresent(target)) succeeded = false
@@ -412,6 +495,8 @@ class UserDictionaryStore(
         private const val FILE_NAME = "learned_words.txt"
         private const val PAIR_FILE_NAME = "learned_pairs.txt"
         private const val SPATIAL_FILE_NAME = "learned_touch_offsets.txt"
+        private const val GESTURE_ADAPTATION_FILE_NAME = "learned_gesture_adaptation.txt"
+        private const val MAX_GESTURE_ADAPTATION_LINES = 1_024
         private const val TEMP_SUFFIX = ".tmp"
         private const val CLEAR_PENDING_FILE_NAME = "learned_data.clear_pending"
         private val CLEAR_PENDING_CONTENT = "clear\n".toByteArray(StandardCharsets.US_ASCII)
@@ -426,6 +511,20 @@ class UserDictionaryStore(
         fun latestDeletionRequestGeneration(): Long = deletionRequestGeneration.get()
     }
 }
+
+private fun List<String>.firstValue(key: String): String? = firstNotNullOfOrNull { line ->
+    val parts = line.split('\t')
+    parts.getOrNull(1)?.takeIf { parts.size == 2 && parts[0] == key }
+}
+
+private fun String.toUnsignedLongOrNull(): Long? = try {
+    if (length !in 1..16 || any { it !in "0123456789abcdefABCDEF" }) null
+    else java.lang.Long.parseUnsignedLong(this, 16)
+} catch (_: NumberFormatException) {
+    null
+}
+
+private fun Long.toUnsignedHex(): String = java.lang.Long.toUnsignedString(this, 16).padStart(16, '0')
 
 /**
  * Forces a directory's own entries, so a rename, unlink, or marker creation survives power loss.
