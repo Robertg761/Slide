@@ -15,6 +15,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -326,6 +327,71 @@ class KeyboardSettingsTest {
         assertEquals(500L, preferenceRetryDelayMillis(1))
         assertEquals(32_000L, preferenceRetryDelayMillis(7))
         assertEquals(32_000L, preferenceRetryDelayMillis(1_000))
+    }
+
+    // endregion
+
+    // region Persistence round trip
+
+    @Test
+    fun `every settings field survives a write and read round trip`() {
+        val defaults = KeyboardSettings()
+        val modified = KeyboardSettings(
+            themeId = "midnight",
+            followSystemDarkMode = false,
+            showKeyBorders = true,
+            showKeyPreview = false,
+            showNumberRow = true,
+            keyHeightScale = 1.3f,
+            bottomPaddingDp = 24f,
+            hapticEnabled = false,
+            hapticStrength = 0.9f,
+            soundEnabled = true,
+            soundVolume = 0.8f,
+            gestureTypingEnabled = false,
+            suggestionsEnabled = false,
+            autocorrectEnabled = false,
+            incognitoModeEnabled = true,
+            learnedDataClearEpoch = 7L,
+            blockOffensiveWords = false,
+            voiceModelId = "BaseEn",
+            autoCapitalize = false,
+            doubleSpacePeriod = false,
+            emojiSkinTone = 3,
+            updateChecksEnabled = true,
+            includeAlphaUpdates = true,
+        )
+
+        // Every constructor field must differ from its default here, or the round trip below
+        // could pass without exercising the field at all. Reflection walks the backing fields,
+        // so adding a new setting fails this test until the field is varied above — and then
+        // the round trip fails until the write, read, and backup lists all know about it.
+        KeyboardSettings::class.java.declaredFields
+            .filterNot { java.lang.reflect.Modifier.isStatic(it.modifiers) }
+            .forEach { field ->
+                field.isAccessible = true
+                assertNotEquals(
+                    "Field '${field.name}' must be given a non-default value in this test",
+                    field.get(defaults),
+                    field.get(modified),
+                )
+            }
+
+        val written = mutablePreferencesOf()
+        written.writeKeyboardSettings(modified)
+        assertEquals(modified, written.toPreferences().toKeyboardSettings())
+    }
+
+    @Test
+    fun `every stored settings key is registered as backup eligible`() {
+        val written = mutablePreferencesOf()
+        written.writeKeyboardSettings(KeyboardSettings())
+        written.asMap().forEach { (key, value) ->
+            assertTrue(
+                "Key '${key.name}' is missing from isBackupEligibleSetting",
+                isBackupEligibleSetting(key.name, value),
+            )
+        }
     }
 
     // endregion
