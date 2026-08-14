@@ -342,10 +342,8 @@ class GestureDecoder(
 
     /** Resolves the preceding word to a lexicon index; -1 when there is nothing to look up. */
     private fun contextIndexFor(previousWord: String?): Int {
-        if ((bigrams == null && trigrams == null) || previousWord.isNullOrEmpty()) return -1
-        val cleaned = previousWord.lowercase().trim('\'')
-        if (cleaned.isEmpty() || !cleaned.all { it in 'a'..'z' || it == '\'' }) return -1
-        return lexicon.indexOf(cleaned)
+        if (bigrams == null && trigrams == null) return -1
+        return lexicon.contextIndexOf(previousWord)
     }
 
     /**

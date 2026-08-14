@@ -66,6 +66,8 @@ jobs:
         run: bash tools/test_release_scripts.sh
 
       - name: Run JVM tests, lint, and build the unsigned release
+        # Library-module lint matters most for :ime, whose draw paths Android's own checks
+        # (DrawAllocation and friends) cover but :app:lintRelease never analyzes.
         run: >-
           ./gradlew --no-daemon
           :core:testDebugUnitTest
@@ -73,6 +75,10 @@ jobs:
           :asr:testDebugUnitTest
           :ime:testDebugUnitTest
           :app:testDebugUnitTest
+          :core:lintDebug
+          :engine:lintDebug
+          :asr:lintDebug
+          :ime:lintDebug
           :app:lintRelease
           :app:assembleRelease
 

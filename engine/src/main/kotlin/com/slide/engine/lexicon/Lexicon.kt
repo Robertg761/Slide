@@ -83,6 +83,21 @@ class Lexicon(
     fun contains(word: String): Boolean = indexOf(word) >= 0
 
     /**
+     * Resolves a preceding word to its index for context scoring, or -1 when it cannot be used.
+     *
+     * This is the one shared definition of "usable context": lowercased, stripped of wrapping
+     * apostrophes, and containing only letters and inner apostrophes. The typing corrector and
+     * both gesture decoders all resolve context through it, so the sentence model can never
+     * weigh in for one of them and silently stay out of the same sentence for another.
+     */
+    fun contextIndexOf(previousWord: String?): Int {
+        if (previousWord.isNullOrEmpty()) return -1
+        val cleaned = previousWord.lowercase().trim('\'')
+        if (cleaned.isEmpty() || !cleaned.all { it in 'a'..'z' || it == '\'' }) return -1
+        return indexOf(cleaned)
+    }
+
+    /**
      * Exact lookup against a buffer rather than a [String].
      *
      * Autocorrect generates a few hundred candidate spellings per keystroke and looks each one up.
