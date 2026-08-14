@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+### Added
+
+- A clipboard panel and a text-editing panel, reached from shortcuts that share the suggestion
+  strip while it has no candidates, as Gboard's toolbar does. The clipboard remembers what was
+  copied while Slide was running: unpinned items stay in memory only and expire after an hour,
+  pinned items persist outside cloud backup and device transfer, and clips the source app marks
+  sensitive are never recorded. The editing panel offers hold-to-repeat cursor arrows, a Select
+  mode in which the arrows extend the selection through Shift-held key events, Select all, Copy,
+  Cut, Paste, and Delete.
+- The in-keyboard settings panel gained the keyboard height, bottom padding, haptic strength,
+  and keypress volume sliders that previously existed only in the settings app, and its
+  autocorrection row now explains when autocorrection is paused, matching the app's copy.
+- A reflection-guarded round-trip test now covers every settings field: a new field that misses
+  the write, read, or backup-eligibility list fails a JVM test instead of silently never
+  persisting.
+
+### Changed
+
+- Short dictations no longer pay Whisper's full 30-second encoder window: the encoder context is
+  bounded to the clip length plus a safety margin, with a floor that protects accuracy on very
+  short clips. Model load and decode also moved to a dedicated thread, and the speech process now
+  survives the keyboard hiding for a 30-second grace period, so switching fields mid-thought no
+  longer pays process start plus model reload.
+- A microphone permission denied with "don't ask again" now routes to the app's system settings
+  page with an explanatory toast instead of the mic key silently doing nothing forever. Voice
+  errors cross the process boundary as codes and are worded on the keyboard side from string
+  resources.
+- The keyboard's hot paths stopped allocating: the classic swipe decoder reuses scratch traces
+  instead of allocating four arrays per scored word, draw paths reuse font metrics and memoize
+  shifted labels and ellipsized candidates, gesture path length is a running sum, the live swipe
+  preview resolves the words before the swipe once per stroke instead of once per 100 ms tick,
+  and verified swipe-model files are no longer re-hashed on every process start.
+- The updater reports a failed automatic check inline and shows real byte progress while
+  downloading. The voice settings card renders the model resolved from the stored setting.
+- One shared rule now resolves the previous word for context scoring across the typing corrector
+  and both gesture decoders, and Android lint runs on every module in CI rather than only the
+  app.
+
+### Verification
+
+- JVM tests, per-module Android lint, and the native arm64 build pass. No physical Android
+  device was connected: the new panels, toolbar shortcuts, and voice-latency changes are
+  structurally verified but not yet measured on hardware.
+
 ## [0.3.4] - 2026-08-13
 
 ### Changed

@@ -78,8 +78,15 @@ silence. Its complete microphone-to-editor flow has not yet been rerun on physic
   Emoji and footer controls use larger touch targets; the remaining work is device-level TalkBack,
   font-scale, landscape, and latency verification.
 
+- **Clipboard and text-editing panels.** While the strip has no candidates it offers clipboard
+  and edit shortcuts beside the settings gear, as Gboard's toolbar does. The clipboard panel
+  shows what was copied while Slide was running — unpinned items expire after an hour and never
+  leave memory, pinned items persist outside cloud backup, and clips a source marks sensitive
+  are never recorded. The editing panel has hold-to-repeat arrows, a Select mode that makes the
+  arrows extend the selection, Select all, Copy, Cut, Paste, and Delete, all driven through the
+  editor's own key handling. Neither has had a physical-device pass yet.
+
 **Not yet built**
-- Clipboard and text-editing panels
 - Remaining appearance settings, setup-wizard polish, and full accessibility/adaptive-layout QA
 
 ## Documentation

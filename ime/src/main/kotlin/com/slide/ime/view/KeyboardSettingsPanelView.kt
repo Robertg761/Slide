@@ -551,8 +551,8 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
     )
 }
 
-/** Geometry-drawn back arrow avoids depending on an OEM font glyph. */
-private class BackIconView(context: Context) : View(context) {
+/** Geometry-drawn back arrow avoids depending on an OEM font glyph. Shared by the key panels. */
+internal class BackIconView(context: Context) : View(context) {
     private val density = resources.displayMetrics.density
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE

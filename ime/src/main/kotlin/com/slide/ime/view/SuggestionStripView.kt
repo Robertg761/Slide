@@ -36,6 +36,12 @@ class SuggestionStripView(context: Context) : View(context) {
         /** Opens Slide's keyboard settings. */
         fun onSettingsRequested()
 
+        /** Opens the clipboard panel. Offered only while the strip has no candidates. */
+        fun onClipboardRequested() = Unit
+
+        /** Opens the text-editing panel. Offered only while the strip has no candidates. */
+        fun onTextEditRequested() = Unit
+
         /** [index] is the position in the list passed to [setSuggestions], 0 being the best. */
         fun onSuggestionPicked(index: Int, word: String)
 
@@ -59,6 +65,8 @@ class SuggestionStripView(context: Context) : View(context) {
             pressedIndex = -1
             micPressed = false
             settingsPressed = false
+            clipboardPressed = false
+            editPressed = false
             refreshAccessibilityDescription()
             invalidate()
         }
@@ -87,6 +95,8 @@ class SuggestionStripView(context: Context) : View(context) {
     private var pressedIndex = -1
     private var micPressed = false
     private var settingsPressed = false
+    private var clipboardPressed = false
+    private var editPressed = false
     private var emptyMessage = "Type or swipe for suggestions"
 
     private val handler = Handler(Looper.getMainLooper())
@@ -111,6 +121,8 @@ class SuggestionStripView(context: Context) : View(context) {
         override fun getVirtualViewAt(x: Float, y: Float): Int {
             if (y !in 0f..height.toFloat()) return INVALID_ID
             if (isOverSettings(x)) return A11Y_SETTINGS
+            if (isOverClipboard(x)) return A11Y_CLIPBOARD
+            if (isOverEdit(x)) return A11Y_EDIT
             if (voiceEnabled && isOverMic(x)) return A11Y_MIC
             val index = indexAt(x)
             return if (index >= 0) A11Y_WORD_BASE + index else INVALID_ID
@@ -118,6 +130,10 @@ class SuggestionStripView(context: Context) : View(context) {
 
         override fun getVisibleVirtualViews(virtualViewIds: MutableList<Int>) {
             virtualViewIds += A11Y_SETTINGS
+            if (toolbarShown) {
+                virtualViewIds += A11Y_CLIPBOARD
+                virtualViewIds += A11Y_EDIT
+            }
             words.indices.forEach { virtualViewIds += A11Y_WORD_BASE + it }
             if (voiceEnabled) virtualViewIds += A11Y_MIC
         }
@@ -132,6 +148,20 @@ class SuggestionStripView(context: Context) : View(context) {
             if (virtualViewId == A11Y_SETTINGS) {
                 node.contentDescription = "Keyboard settings"
                 node.setBoundsInParent(Rect(0, 0, settingsWidth().toInt(), height))
+                return
+            }
+            if (virtualViewId == A11Y_CLIPBOARD) {
+                node.contentDescription = "Clipboard"
+                node.setBoundsInParent(
+                    Rect(settingsWidth().toInt(), 0, (settingsWidth() * 2).toInt(), height),
+                )
+                return
+            }
+            if (virtualViewId == A11Y_EDIT) {
+                node.contentDescription = "Edit text"
+                node.setBoundsInParent(
+                    Rect((settingsWidth() * 2).toInt(), 0, (settingsWidth() * 3).toInt(), height),
+                )
                 return
             }
             if (virtualViewId == A11Y_MIC) {
@@ -165,6 +195,16 @@ class SuggestionStripView(context: Context) : View(context) {
             if (virtualViewId == A11Y_SETTINGS) {
                 if (action != AccessibilityNodeInfo.ACTION_CLICK) return false
                 listener?.onSettingsRequested()
+                return true
+            }
+            if (virtualViewId == A11Y_CLIPBOARD) {
+                if (action != AccessibilityNodeInfo.ACTION_CLICK || !toolbarShown) return false
+                listener?.onClipboardRequested()
+                return true
+            }
+            if (virtualViewId == A11Y_EDIT) {
+                if (action != AccessibilityNodeInfo.ACTION_CLICK || !toolbarShown) return false
+                listener?.onTextEditRequested()
                 return true
             }
             if (virtualViewId == A11Y_MIC) {
@@ -214,6 +254,8 @@ class SuggestionStripView(context: Context) : View(context) {
         requested.forEach(words::add)
         pressedIndex = -1
         settingsPressed = false
+        clipboardPressed = false
+        editPressed = false
         micPressed = false
         refreshAccessibilityDescription()
         accessibilityHelper.invalidateRoot()
@@ -245,17 +287,30 @@ class SuggestionStripView(context: Context) : View(context) {
         drawSettingsButton(canvas)
         drawMicButton(canvas)
         if (words.isEmpty()) {
+            drawToolbarButton(canvas, slot = 1, pressed = clipboardPressed) { x, y ->
+                drawClipboardGlyph(canvas, x, y)
+            }
+            drawToolbarButton(canvas, slot = 2, pressed = editPressed) { x, y ->
+                drawEditGlyph(canvas, x, y)
+            }
             if (emptyMessage.isNotEmpty()) {
-                textPaint.color = keyboardTheme.hintText
-                textPaint.typeface = Typeface.DEFAULT
-                textPaint.textSize = minOf(sp(12f), suggestionWidth() * 0.04f)
-                textPaint.getFontMetrics(reusableMetrics)
-                canvas.drawText(
-                    emptyMessage,
-                    suggestionLeft() + suggestionWidth() / 2f,
-                    height / 2f - (reusableMetrics.ascent + reusableMetrics.descent) / 2f,
-                    textPaint,
-                )
+                // The hint shares the row with the toolbar icons, so it centres over what is
+                // left of the strip and disappears rather than colliding on a narrow screen.
+                val messageLeft = settingsWidth() * 3
+                val messageRight = if (voiceEnabled) width - micWidth() else width.toFloat()
+                val messageWidth = messageRight - messageLeft
+                if (messageWidth >= dp(72f)) {
+                    textPaint.color = keyboardTheme.hintText
+                    textPaint.typeface = Typeface.DEFAULT
+                    textPaint.textSize = minOf(sp(12f), messageWidth * 0.055f)
+                    textPaint.getFontMetrics(reusableMetrics)
+                    canvas.drawText(
+                        emptyMessage,
+                        messageLeft + messageWidth / 2f,
+                        height / 2f - (reusableMetrics.ascent + reusableMetrics.descent) / 2f,
+                        textPaint,
+                    )
+                }
             }
             return
         }
@@ -344,6 +399,64 @@ class SuggestionStripView(context: Context) : View(context) {
         }
     }
 
+    /** Shared chrome for the empty-strip toolbar buttons: circle, pressed overlay, then glyph. */
+    private inline fun drawToolbarButton(
+        canvas: Canvas,
+        slot: Int,
+        pressed: Boolean,
+        glyph: (centerX: Float, centerY: Float) -> Unit,
+    ) {
+        val centerX = settingsWidth() * slot + settingsWidth() / 2f
+        val centerY = height / 2f
+        pressedPaint.color = keyboardTheme.specialKeyBackground
+        canvas.drawCircle(centerX, centerY, height * 0.36f, pressedPaint)
+        if (pressed) {
+            pressedPaint.color = keyboardTheme.keyPressedOverlay
+            canvas.drawCircle(centerX, centerY, height * 0.4f, pressedPaint)
+        }
+        iconPaint.color = keyboardTheme.suggestionText
+        iconPaint.style = Paint.Style.STROKE
+        iconPaint.strokeWidth = dp(2f)
+        glyph(centerX, centerY)
+    }
+
+    /** A clipboard: rounded body with the clip tab on top. */
+    private fun drawClipboardGlyph(canvas: Canvas, centerX: Float, centerY: Float) {
+        val halfWidth = dp(6f)
+        val halfHeight = dp(7.5f)
+        canvas.drawRoundRect(
+            centerX - halfWidth,
+            centerY - halfHeight + dp(1.5f),
+            centerX + halfWidth,
+            centerY + halfHeight,
+            dp(2f),
+            dp(2f),
+            iconPaint,
+        )
+        canvas.drawRoundRect(
+            centerX - dp(3f),
+            centerY - halfHeight - dp(1f),
+            centerX + dp(3f),
+            centerY - halfHeight + dp(3f),
+            dp(1.5f),
+            dp(1.5f),
+            iconPaint,
+        )
+    }
+
+    /** A text cursor I-beam, the least ambiguous "edit text" mark at strip size. */
+    private fun drawEditGlyph(canvas: Canvas, centerX: Float, centerY: Float) {
+        val halfHeight = dp(8f)
+        val serif = dp(3.5f)
+        canvas.drawLine(centerX, centerY - halfHeight, centerX, centerY + halfHeight, iconPaint)
+        canvas.drawLine(
+            centerX - serif, centerY - halfHeight, centerX + serif, centerY - halfHeight, iconPaint,
+        )
+        canvas.drawLine(
+            centerX - serif, centerY + halfHeight, centerX + serif, centerY + halfHeight, iconPaint,
+        )
+    }
+
     /**
      * The microphone lives here rather than in the bottom key row, as in Gboard.
      *
@@ -383,26 +496,36 @@ class SuggestionStripView(context: Context) : View(context) {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 settingsPressed = isOverSettings(event.x)
-                micPressed = !settingsPressed && isOverMic(event.x)
-                pressedIndex = if (settingsPressed || micPressed) -1 else indexAt(event.x)
+                clipboardPressed = !settingsPressed && isOverClipboard(event.x)
+                editPressed = !settingsPressed && !clipboardPressed && isOverEdit(event.x)
+                micPressed =
+                    !settingsPressed && !clipboardPressed && !editPressed && isOverMic(event.x)
+                val overButton = settingsPressed || clipboardPressed || editPressed || micPressed
+                pressedIndex = if (overButton) -1 else indexAt(event.x)
                 longPressFired = false
                 if (pressedIndex >= 0) scheduleLongPress(pressedIndex)
                 invalidate()
-                return settingsPressed || micPressed || pressedIndex >= 0
+                return overButton || pressedIndex >= 0
             }
 
             MotionEvent.ACTION_MOVE -> {
                 // Sliding off cancels the press, matching how the keys behave.
                 val inBounds = event.y in 0f..height.toFloat()
                 val stillOnSettings = settingsPressed && isOverSettings(event.x) && inBounds
+                val stillOnClipboard = clipboardPressed && isOverClipboard(event.x) && inBounds
+                val stillOnEdit = editPressed && isOverEdit(event.x) && inBounds
                 val stillOnMic = micPressed && isOverMic(event.x) && inBounds
                 val stillOnWord = pressedIndex >= 0 && indexAt(event.x) == pressedIndex && inBounds
                 if (
                     settingsPressed != stillOnSettings ||
+                    clipboardPressed != stillOnClipboard ||
+                    editPressed != stillOnEdit ||
                     micPressed != stillOnMic ||
                     (pressedIndex >= 0 && !stillOnWord)
                 ) {
                     settingsPressed = stillOnSettings
+                    clipboardPressed = stillOnClipboard
+                    editPressed = stillOnEdit
                     micPressed = stillOnMic
                     if (!stillOnWord) {
                         pressedIndex = -1
@@ -415,10 +538,14 @@ class SuggestionStripView(context: Context) : View(context) {
             MotionEvent.ACTION_UP -> {
                 val index = pressedIndex
                 val settings = settingsPressed
+                val clipboard = clipboardPressed
+                val edit = editPressed
                 val mic = micPressed
                 val held = longPressFired
                 pressedIndex = -1
                 settingsPressed = false
+                clipboardPressed = false
+                editPressed = false
                 micPressed = false
                 cancelPendingLongPress()
                 invalidate()
@@ -426,6 +553,12 @@ class SuggestionStripView(context: Context) : View(context) {
                 if (settings) {
                     announceForAccessibility("Keyboard settings")
                     listener?.onSettingsRequested()
+                } else if (clipboard) {
+                    announceForAccessibility("Clipboard")
+                    listener?.onClipboardRequested()
+                } else if (edit) {
+                    announceForAccessibility("Edit text")
+                    listener?.onTextEditRequested()
                 } else if (mic) {
                     announceForAccessibility("Voice typing")
                     listener?.onVoiceRequested()
@@ -439,6 +572,8 @@ class SuggestionStripView(context: Context) : View(context) {
             MotionEvent.ACTION_CANCEL -> {
                 pressedIndex = -1
                 settingsPressed = false
+                clipboardPressed = false
+                editPressed = false
                 micPressed = false
                 cancelPendingLongPress()
                 invalidate()
@@ -473,6 +608,20 @@ class SuggestionStripView(context: Context) : View(context) {
     private fun isOverMic(x: Float): Boolean = voiceEnabled && x >= width - micWidth()
 
     private fun isOverSettings(x: Float): Boolean = x >= 0f && x < settingsWidth()
+
+    /**
+     * Whether the clipboard and text-editing shortcuts are on the strip.
+     *
+     * They borrow the space candidates use, exactly as Gboard's toolbar does: present while
+     * there is nothing to suggest, gone the moment candidates need the room.
+     */
+    private val toolbarShown: Boolean get() = words.isEmpty()
+
+    private fun isOverClipboard(x: Float): Boolean =
+        toolbarShown && x >= settingsWidth() && x < settingsWidth() * 2
+
+    private fun isOverEdit(x: Float): Boolean =
+        toolbarShown && x >= settingsWidth() * 2 && x < settingsWidth() * 3
 
     private fun indexAt(x: Float): Int {
         if (words.isEmpty()) return -1
@@ -539,6 +688,7 @@ class SuggestionStripView(context: Context) : View(context) {
         if (words.isNotEmpty()) add("Suggestions: ${words.joinToString(", ")}")
         else if (emptyMessage.isNotEmpty()) add(emptyMessage)
         add("Keyboard settings button at the left")
+        if (words.isEmpty()) add("Clipboard and edit text buttons beside it")
         if (voiceEnabled) add("Voice typing button at the right")
     }.joinToString(". ")
 
@@ -548,6 +698,8 @@ class SuggestionStripView(context: Context) : View(context) {
         const val A11Y_WORD_BASE = 0
         const val A11Y_MIC = 100
         const val A11Y_SETTINGS = 101
+        const val A11Y_CLIPBOARD = 102
+        const val A11Y_EDIT = 103
     }
 }
 

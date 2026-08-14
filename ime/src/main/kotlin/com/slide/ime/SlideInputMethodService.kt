@@ -88,6 +88,7 @@ import com.slide.ime.quality.ModelReadiness
 import com.slide.ime.quality.QualityInputMode
 import com.slide.ime.quality.QualityModel
 import com.slide.ime.quality.TypingQualityCollector
+import com.slide.ime.view.ClipboardPanelView
 import com.slide.ime.view.EmojiGlyphs
 import com.slide.ime.view.EmojiPanelView
 import com.slide.ime.view.EnterAction
@@ -96,6 +97,7 @@ import com.slide.ime.view.KeyboardSettingsPanelView
 import com.slide.ime.view.KeyboardView
 import com.slide.ime.view.ShiftState
 import com.slide.ime.view.SuggestionStripView
+import com.slide.ime.view.TextEditPanelView
 import com.slide.ime.view.VoiceOverlayView
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
@@ -122,7 +124,9 @@ class SlideInputMethodService :
     KeyboardSettingsPanelView.Listener,
     EmojiPanelView.Listener,
     VoiceOverlayView.Listener,
-    VoiceInputClient.Listener {
+    VoiceInputClient.Listener,
+    TextEditPanelView.Listener,
+    ClipboardPanelView.Listener {
 
     private lateinit var settingsRepository: SettingsRepository
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -132,6 +136,16 @@ class SlideInputMethodService :
     private var voiceOverlay: VoiceOverlayView? = null
     private var emojiPanel: EmojiPanelView? = null
     private var keyboardSettingsPanel: KeyboardSettingsPanelView? = null
+    private var textEditPanel: TextEditPanelView? = null
+    private var clipboardPanel: ClipboardPanelView? = null
+
+    /**
+     * Created with the service and listening for as long as it lives: history only exists if
+     * copies were observed when they happened. Android already scopes clipboard access to the
+     * active default IME, and [ClipboardHistory] refuses sensitive clips and keeps recents
+     * in memory only.
+     */
+    private val clipboardHistory by lazy { ClipboardHistory(this) }
     private var keyboardFrame: KeyboardFrame? = null
     private var inputRoot: View? = null
     private var settings = KeyboardSettings()
@@ -393,6 +407,7 @@ class SlideInputMethodService :
 
     override fun onCreate() {
         super.onCreate()
+        clipboardHistory.startListening()
         typingQuality.recordModelReadiness(QualityModel.TYPING_SUGGESTER, ModelReadiness.NOT_READY)
         typingQuality.recordModelReadiness(QualityModel.SWIPE_DECODER, ModelReadiness.NOT_READY)
         removeLearnedDeletionListener = userDictionaryStore.addDeletionRequestListener { generation ->
@@ -660,6 +675,16 @@ class SlideInputMethodService :
             settings = this@SlideInputMethodService.settings
             visibility = View.GONE
         }
+        val textEdit = TextEditPanelView(this).apply {
+            listener = this@SlideInputMethodService
+            keyboardTheme = theme
+            visibility = View.GONE
+        }
+        val clipboard = ClipboardPanelView(this).apply {
+            listener = this@SlideInputMethodService
+            keyboardTheme = theme
+            visibility = View.GONE
+        }
 
         suggestionStrip = strip
         keyboardView = view
@@ -667,6 +692,8 @@ class SlideInputMethodService :
         voiceOverlay = overlay
         emojiPanel = emoji
         keyboardSettingsPanel = keyboardSettings
+        textEditPanel = textEdit
+        clipboardPanel = clipboard
         updateGestureAvailability()
 
         // Emoji, voice, and settings sit on top of the keys rather than replacing them, so the
@@ -678,6 +705,8 @@ class SlideInputMethodService :
             addView(emoji, MATCH_PARENT, MATCH_PARENT)
             addView(overlay, MATCH_PARENT, MATCH_PARENT)
             addView(keyboardSettings, MATCH_PARENT, MATCH_PARENT)
+            addView(textEdit, MATCH_PARENT, MATCH_PARENT)
+            addView(clipboard, MATCH_PARENT, MATCH_PARENT)
         }
         keyboardFrame = keys
 
@@ -701,6 +730,8 @@ class SlideInputMethodService :
         selfEdit = false
         cancelVoiceForEditorTransition()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
+        hideTextEditPanel(restoreEditorUi = false)
+        hideClipboardPanel(restoreEditorUi = false)
     }
 
     override fun onFinishInput() {
@@ -711,6 +742,8 @@ class SlideInputMethodService :
         selfEdit = false
         cancelVoiceForEditorTransition()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
+        hideTextEditPanel(restoreEditorUi = false)
+        hideClipboardPanel(restoreEditorUi = false)
         super.onFinishInput()
     }
 
@@ -723,6 +756,8 @@ class SlideInputMethodService :
         selfEdit = false
         cancelVoiceForEditorTransition()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
+        hideTextEditPanel(restoreEditorUi = false)
+        hideClipboardPanel(restoreEditorUi = false)
         exitEmojiSearch(showPicker = false)
         layer = Layer.ALPHA
         hideEmojiPanel()
@@ -780,6 +815,8 @@ class SlideInputMethodService :
         voiceOverlay?.keyboardTheme = theme
         emojiPanel?.keyboardTheme = theme
         keyboardSettingsPanel?.keyboardTheme = theme
+        textEditPanel?.keyboardTheme = theme
+        clipboardPanel?.keyboardTheme = theme
         // The frame's navigation-bar strip and any rounding the window puts around the input view
         // are the two places the keyboard's own colour does not otherwise reach, and both sit right
         // along the bottom edge where a mismatch reads as the keyboard not fitting the screen.
@@ -814,6 +851,8 @@ class SlideInputMethodService :
         exitEmojiSearch(showPicker = false)
         hideEmojiPanel()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
+        hideTextEditPanel(restoreEditorUi = false)
+        hideClipboardPanel(restoreEditorUi = false)
         if (voiceClientDelegate.isInitialized()) {
             voiceUnbindJob?.cancel()
             voiceUnbindJob = scope.launch {
@@ -841,6 +880,8 @@ class SlideInputMethodService :
         gestureUndoState.invalidate()
         cancelVoiceForEditorTransition()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
+        hideTextEditPanel(restoreEditorUi = false)
+        hideClipboardPanel(restoreEditorUi = false)
         literalWordInProgress = false
         abandonComposing()
         selfEdit = false
@@ -864,7 +905,7 @@ class SlideInputMethodService :
     }
 
     /** The overlays that can cover or replace the keys, topmost first. */
-    private enum class Panel { VOICE, SETTINGS, SEARCH, EMOJI }
+    private enum class Panel { VOICE, SETTINGS, TEXT_EDIT, CLIPBOARD, SEARCH, EMOJI }
 
     /**
      * The topmost panel over the keys, or null when the plain keyboard is showing.
@@ -878,6 +919,8 @@ class SlideInputMethodService :
         get() = when {
             voiceOverlayShown -> Panel.VOICE
             keyboardSettingsPanelShown -> Panel.SETTINGS
+            textEditPanelShown -> Panel.TEXT_EDIT
+            clipboardPanelShown -> Panel.CLIPBOARD
             searchModeShown -> Panel.SEARCH
             emojiPanelShown -> Panel.EMOJI
             else -> null
@@ -899,6 +942,16 @@ class SlideInputMethodService :
 
         Panel.SETTINGS -> {
             hideKeyboardSettingsPanel(restoreEditorUi = true)
+            true
+        }
+
+        Panel.TEXT_EDIT -> {
+            hideTextEditPanel(restoreEditorUi = true)
+            true
+        }
+
+        Panel.CLIPBOARD -> {
+            hideClipboardPanel(restoreEditorUi = true)
             true
         }
 
@@ -964,11 +1017,14 @@ class SlideInputMethodService :
         // from entering after that destruction.
         (gestureDecoder as? AutoCloseable)?.close()
         finalLearnedData?.let(::flushFinalLearnedData)
+        clipboardHistory.stopListening()
         keyboardView = null
         suggestionStrip = null
         voiceOverlay = null
         emojiPanel = null
         keyboardSettingsPanel = null
+        textEditPanel = null
+        clipboardPanel = null
         super.onDestroy()
     }
 
@@ -1847,6 +1903,8 @@ class SlideInputMethodService :
         if (voiceOverlayShown) onVoiceDismissed(committed = false)
         exitEmojiSearch(showPicker = false)
         hideEmojiPanel()
+        hideTextEditPanel(restoreEditorUi = false)
+        hideClipboardPanel(restoreEditorUi = false)
         clearSuggestions()
 
         panel.settings = settings
@@ -1877,6 +1935,241 @@ class SlideInputMethodService :
 
     private val keyboardSettingsPanelShown: Boolean
         get() = keyboardSettingsPanel?.visibility == View.VISIBLE
+
+    // region Text editing and clipboard panels
+
+    private val textEditPanelShown: Boolean
+        get() = textEditPanel?.visibility == View.VISIBLE
+
+    private val clipboardPanelShown: Boolean
+        get() = clipboardPanel?.visibility == View.VISIBLE
+
+    override fun onTextEditRequested() {
+        showTextEditPanel()
+    }
+
+    override fun onClipboardRequested() {
+        showClipboardPanel()
+    }
+
+    private fun showTextEditPanel() {
+        val panel = textEditPanel ?: return
+        if (panel.visibility == View.VISIBLE) return
+
+        // Like settings, an interaction mode over the keys: the word in progress settles first so
+        // cursor movement operates on finished text, and rival panels close underneath it.
+        if (composing.isNotEmpty()) {
+            val connection = currentInputConnection ?: return
+            if (!finishComposing(connection).settled) return
+        }
+        if (voiceOverlayShown) onVoiceDismissed(committed = false)
+        exitEmojiSearch(showPicker = false)
+        hideEmojiPanel()
+        hideClipboardPanel(restoreEditorUi = false)
+        hideKeyboardSettingsPanel(restoreEditorUi = false)
+        clearSuggestions()
+
+        panel.reset()
+        panel.visibility = View.VISIBLE
+        suggestionStrip?.voiceEnabled = false
+        suggestionStrip?.setEmptyMessage("Edit text")
+        updateGestureAvailability()
+        refreshBackCallback()
+        panel.announceForAccessibility("Text editing opened")
+    }
+
+    private fun hideTextEditPanel(restoreEditorUi: Boolean) {
+        val panel = textEditPanel ?: return
+        if (panel.visibility != View.VISIBLE) return
+        panel.reset()
+        panel.visibility = View.GONE
+
+        suggestionStrip?.voiceEnabled = voiceAvailableForEditor()
+        clearSuggestions()
+        refreshSuggestionEmptyMessage()
+        updateGestureAvailability()
+        refreshBackCallback()
+        if (restoreEditorUi) {
+            updateShiftFromCursor()
+            updatePredictions()
+            keyboardView?.announceForAccessibility("Text editing closed")
+        }
+    }
+
+    override fun onTextEditDismissed() {
+        hideTextEditPanel(restoreEditorUi = true)
+    }
+
+    override fun onTextEditSelectingChanged(selecting: Boolean) {
+        performHaptic()
+        announce(if (selecting) "Arrows now extend the selection" else "Selection mode off")
+    }
+
+    override fun onTextEditAction(action: TextEditPanelView.Action) {
+        val connection = currentInputConnection ?: return
+        performHaptic()
+        when (action) {
+            TextEditPanelView.Action.Left -> sendCursorKey(connection, KeyEvent.KEYCODE_DPAD_LEFT)
+            TextEditPanelView.Action.Right -> sendCursorKey(connection, KeyEvent.KEYCODE_DPAD_RIGHT)
+            TextEditPanelView.Action.Up -> sendCursorKey(connection, KeyEvent.KEYCODE_DPAD_UP)
+            TextEditPanelView.Action.Down -> sendCursorKey(connection, KeyEvent.KEYCODE_DPAD_DOWN)
+            TextEditPanelView.Action.SelectAll -> {
+                connection.performContextMenuAction(android.R.id.selectAll)
+                announce("Selected all")
+            }
+            TextEditPanelView.Action.Copy -> {
+                connection.performContextMenuAction(android.R.id.copy)
+                announce("Copied")
+            }
+            TextEditPanelView.Action.Cut -> {
+                connection.performContextMenuAction(android.R.id.cut)
+                announce("Cut")
+            }
+            TextEditPanelView.Action.Paste -> {
+                connection.performContextMenuAction(android.R.id.paste)
+                announce("Pasted")
+            }
+            TextEditPanelView.Action.Delete -> {
+                sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+            }
+        }
+    }
+
+    /**
+     * Arrow presses travel as real key events so each editor's own cursor logic applies —
+     * multi-line movement, RTL runs, list widgets. While Select mode is on, Shift is held around
+     * the arrow, which is exactly how a hardware keyboard extends a selection.
+     */
+    private fun sendCursorKey(connection: InputConnection, keyCode: Int) {
+        val selecting = textEditPanel?.selecting == true
+        val now = SystemClock.uptimeMillis()
+        val meta = if (selecting) KeyEvent.META_SHIFT_ON or KeyEvent.META_SHIFT_LEFT_ON else 0
+        if (selecting) {
+            connection.sendKeyEvent(
+                KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_SHIFT_LEFT, 0, meta),
+            )
+        }
+        connection.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0, meta))
+        connection.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0, meta))
+        if (selecting) {
+            connection.sendKeyEvent(
+                KeyEvent(now, now, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_SHIFT_LEFT, 0, 0),
+            )
+        }
+    }
+
+    private fun showClipboardPanel() {
+        val panel = clipboardPanel ?: return
+        if (panel.visibility == View.VISIBLE) return
+
+        if (composing.isNotEmpty()) {
+            val connection = currentInputConnection ?: return
+            if (!finishComposing(connection).settled) return
+        }
+        if (voiceOverlayShown) onVoiceDismissed(committed = false)
+        exitEmojiSearch(showPicker = false)
+        hideEmojiPanel()
+        hideTextEditPanel(restoreEditorUi = false)
+        hideKeyboardSettingsPanel(restoreEditorUi = false)
+        clearSuggestions()
+
+        refreshClipboardPanelItems()
+        panel.visibility = View.VISIBLE
+        suggestionStrip?.voiceEnabled = false
+        suggestionStrip?.setEmptyMessage("Clipboard")
+        updateGestureAvailability()
+        refreshBackCallback()
+        panel.announceForAccessibility("Clipboard opened")
+    }
+
+    private fun hideClipboardPanel(restoreEditorUi: Boolean) {
+        val panel = clipboardPanel ?: return
+        if (panel.visibility != View.VISIBLE) return
+        panel.visibility = View.GONE
+
+        suggestionStrip?.voiceEnabled = voiceAvailableForEditor()
+        clearSuggestions()
+        refreshSuggestionEmptyMessage()
+        updateGestureAvailability()
+        refreshBackCallback()
+        if (restoreEditorUi) {
+            updateShiftFromCursor()
+            updatePredictions()
+            keyboardView?.announceForAccessibility("Clipboard closed")
+        }
+    }
+
+    private fun refreshClipboardPanelItems() {
+        clipboardPanel?.setItems(
+            clipboardHistory.entries().map { ClipboardPanelView.Item(it.text, it.pinned) },
+        )
+    }
+
+    override fun onClipboardDismissed() {
+        hideClipboardPanel(restoreEditorUi = true)
+    }
+
+    override fun onClipboardItemPicked(text: String) {
+        if (queueBehindGestureInput { processClipboardPaste(text) }) return
+        processClipboardPaste(text)
+    }
+
+    /** Mirrors the emoji commit path, which is the other panel that inserts literal text. */
+    private fun processClipboardPaste(text: String) {
+        gestureUndoState.invalidate()
+        performHaptic()
+        val connection = currentInputConnection ?: return
+        val selfEditWasPending = selfEdit
+        selfEdit = true
+        val finish = finishComposing(connection)
+        if (!finish.settled) {
+            selfEdit = SelfEditFallback.afterAttempt(
+                selfEditWasPending,
+                finish.callbackPossible,
+                selfEdit,
+            )
+            return
+        }
+        val committed = if (editorInputPolicy.usesRawKeyEvents) {
+            handleRawText(connection, text)
+        } else {
+            connection.commitText(text, 1)
+        }
+        if (!committed) {
+            selfEdit = SelfEditFallback.afterAttempt(
+                selfEditWasPending,
+                callbackPossible = finish.callbackPossible,
+                fallbackStillArmed = selfEdit,
+            )
+            return
+        }
+        selfEdit = SelfEditFallback.afterAttempt(
+            selfEditWasPending,
+            callbackPossible = true,
+            fallbackStillArmed = selfEdit,
+        )
+        lastAutocorrect = null
+        literalWordInProgress = false
+        hideClipboardPanel(restoreEditorUi = false)
+        updateShiftFromCursor()
+        announce("Pasted")
+    }
+
+    override fun onClipboardItemPinToggled(text: String, pinned: Boolean) {
+        performHaptic()
+        if (pinned) clipboardHistory.pin(text) else clipboardHistory.unpin(text)
+        refreshClipboardPanelItems()
+        announce(if (pinned) "Pinned" else "Unpinned")
+    }
+
+    override fun onClipboardItemDeleted(text: String) {
+        performHaptic()
+        clipboardHistory.remove(text)
+        refreshClipboardPanelItems()
+        announce("Deleted from clipboard history")
+    }
+
+    // endregion
 
     /**
      * Holding a candidate teaches the keyboard a word, or takes one back.
