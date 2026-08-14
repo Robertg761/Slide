@@ -138,15 +138,23 @@ class SlideInputMethodService :
     private var settingsLoaded = false
 
     /**
-     * Connected to the speech process only while the keyboard is on screen.
+     * Connected to the speech process only while the keyboard is on screen, plus a short grace
+     * period after it hides.
      *
-     * Staying bound would keep a process alive — and eventually a few hundred megabytes of model
-     * with it — for as long as Slide is the selected keyboard, which is essentially always.
+     * Staying bound indefinitely would keep a process alive — and eventually a few hundred
+     * megabytes of model with it — for as long as Slide is the selected keyboard, which is
+     * essentially always. But tearing down at the instant the keyboard hides makes the common
+     * switch-field-and-dictate-again flow pay process start plus model load every time. The
+     * [VOICE_UNBIND_GRACE_MS] window keeps the model warm across brief hides and still lets the
+     * memory go when dictation is actually done.
      */
     private val voiceClientDelegate = lazy {
         VoiceInputClient(this).also { it.listener = this }
     }
     private val voiceClient by voiceClientDelegate
+
+    /** Pending delayed release of the speech process; cancelled when the keyboard returns. */
+    private var voiceUnbindJob: Job? = null
 
     /** Which of the three key layers is on screen. */
     private enum class Layer { ALPHA, SYMBOLS, SYMBOLS_ALT }
@@ -770,13 +778,21 @@ class SlideInputMethodService :
         inputRoot?.setBackgroundColor(theme.background)
     }
 
+    override fun onWindowShown() {
+        super.onWindowShown()
+        // The keyboard is back before the grace period ran out; keep the speech process and its
+        // loaded model for the next dictation instead of paying the reload.
+        voiceUnbindJob?.cancel()
+        voiceUnbindJob = null
+    }
+
     /**
-     * Releases the speech process whenever the keyboard leaves the screen.
+     * Schedules release of the speech process when the keyboard leaves the screen.
      *
-     * The alternative — staying bound so the next dictation starts instantly — keeps a process
-     * holding the whole model alive for as long as Slide is the selected keyboard, which is
-     * essentially always. Paying a few hundred milliseconds of reload at the start of a dictation,
-     * where the overlay already says "Getting ready", is the better trade.
+     * Unbinding immediately would make every hide-and-return dictation pay process start plus
+     * model load again; never unbinding would keep hundreds of megabytes resident for as long as
+     * Slide is the selected keyboard, which is essentially always. The delay keeps quick returns
+     * instant and still lets the memory go once the user has moved on.
      */
     override fun onWindowHidden() {
         super.onWindowHidden()
@@ -789,7 +805,14 @@ class SlideInputMethodService :
         exitEmojiSearch(showPicker = false)
         hideEmojiPanel()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
-        if (voiceClientDelegate.isInitialized()) voiceClient.unbind()
+        if (voiceClientDelegate.isInitialized()) {
+            voiceUnbindJob?.cancel()
+            voiceUnbindJob = scope.launch {
+                delay(VOICE_UNBIND_GRACE_MS)
+                voiceUnbindJob = null
+                voiceClient.unbind()
+            }
+        }
         voiceCancellationPending = false
         if (learnedPersistence.deletionPending) scheduleLearnedDataDelete()
         saveLearnedWords()
@@ -2187,6 +2210,10 @@ class SlideInputMethodService :
             return
         }
         if (!MicPermissionActivity.hasPermission(this)) {
+            // The user has just signalled intent to dictate, so start the speech process while
+            // the permission dialog is up: its fork and bind overlap the dialog instead of being
+            // paid serially on the second tap. No model is loaded until dictation starts.
+            voiceClient.bind()
             startActivity(MicPermissionActivity.intent(this))
             return
         }
@@ -2267,16 +2294,28 @@ class SlideInputMethodService :
         )
     }
 
-    override fun onVoiceError(reason: String) {
+    override fun onVoiceError(error: VoiceInput.Error) {
         if (voiceCancellationPending) {
             voiceCancellationPending = false
             return
         }
         if (voiceEditorGeneration != editorGeneration) return
         voiceOverlay?.apply {
-            errorText = reason
+            errorText = getString(voiceErrorText(error))
             state = VoiceInput.State.Idle
         }
+    }
+
+    /** The user-facing words for a speech-process error code, owned by the keyboard side. */
+    private fun voiceErrorText(error: VoiceInput.Error): Int = when (error) {
+        VoiceInput.Error.StillClosing -> R.string.voice_error_still_closing
+        VoiceInput.Error.PermissionMissing -> R.string.voice_error_permission
+        VoiceInput.Error.ModelUnavailable -> R.string.voice_error_model
+        VoiceInput.Error.MicUnavailable -> R.string.voice_error_mic_unavailable
+        VoiceInput.Error.MicStopped -> R.string.voice_error_mic_stopped
+        VoiceInput.Error.DecodeFailed -> R.string.voice_error_decode
+        VoiceInput.Error.ServiceUnavailable -> R.string.voice_error_service
+        VoiceInput.Error.ProcessDied -> R.string.voice_error_process_died
     }
 
     /**
@@ -4110,6 +4149,13 @@ class SlideInputMethodService :
 
     private companion object {
         const val TAG = "SlideIME"
+
+        /**
+         * How long a hidden keyboard keeps the speech process (and its loaded model) alive.
+         * Long enough to cover switching fields or apps mid-thought; short enough that the
+         * memory is returned once dictation is actually over.
+         */
+        const val VOICE_UNBIND_GRACE_MS = 30_000L
         const val DOUBLE_TAP_WINDOW_MS = 300L
         const val DOUBLE_SPACE_WINDOW_MS = 800L
         const val HAPTIC_DURATION_MS = 12L
