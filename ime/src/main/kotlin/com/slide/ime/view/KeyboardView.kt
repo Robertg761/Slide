@@ -204,6 +204,18 @@ class KeyboardView @JvmOverloads constructor(
     }
 
     private val reusableRect = RectF()
+
+    /** Reused across draws; `Paint.fontMetrics` allocates a fresh object per read. */
+    private val reusableFontMetrics = Paint.FontMetrics()
+
+    /**
+     * Shifted key labels, memoized per label.
+     *
+     * [displayLabel] runs once per letter key per frame; calling `uppercase()` there allocates
+     * ~30 strings every frame the keyboard draws shifted. The alphabet is small and stable, so
+     * the map stays tiny and survives layout changes.
+     */
+    private val uppercaseLabels = HashMap<String, String>()
     private val trailPath = Path()
     private val iconPath = Path()
 
@@ -244,6 +256,15 @@ class KeyboardView @JvmOverloads constructor(
     private var gesturePointerId: Int? = null
     private val gesturePoints = ArrayList<GesturePoint>()
     private val completedGesturePoints = ArrayList<GesturePoint>(TRAIL_POINTS)
+
+    /**
+     * Length of [gesturePoints] as a running sum, accumulated as points arrive.
+     *
+     * The preview gate needs the path length every tick and the finish path needs it once more;
+     * re-walking the whole polyline each time made those checks O(points) on a buffer that grows
+     * for the entire swipe.
+     */
+    private var gesturePathLength = 0f
     private var completedGestureTime = 0L
     private var gestureStartTime = 0L
     private var lastGesturePreviewTime = 0L
@@ -571,8 +592,9 @@ class KeyboardView @JvmOverloads constructor(
         labelPaint.typeface = keyLabelTypeface
         val maxText = min(placed.width * if (key.type == KeyType.CHARACTER) 0.65f else 0.8f, placed.height * 0.58f)
         labelPaint.textSize = min(if (key.type == KeyType.CHARACTER) sp(22f) else sp(15f), maxText)
-        val metrics = labelPaint.fontMetrics
-        val baseline = placed.centerY - (metrics.ascent + metrics.descent) / 2f
+        labelPaint.getFontMetrics(reusableFontMetrics)
+        val baseline = placed.centerY -
+            (reusableFontMetrics.ascent + reusableFontMetrics.descent) / 2f
         canvas.drawText(displayLabel(key), placed.centerX, baseline, labelPaint)
 
         val hint = KeyHintStyle.visibleHint(key, settings.showNumberRow)
@@ -711,8 +733,9 @@ class KeyboardView @JvmOverloads constructor(
         labelPaint.color = keyboardTheme.hintText
         labelPaint.typeface = keyLabelTypeface
         labelPaint.textSize = min(sp(12f), placed.width * 0.28f)
-        val metrics = labelPaint.fontMetrics
-        val baseline = placed.centerY - (metrics.ascent + metrics.descent) / 2f
+        labelPaint.getFontMetrics(reusableFontMetrics)
+        val baseline = placed.centerY -
+            (reusableFontMetrics.ascent + reusableFontMetrics.descent) / 2f
         canvas.drawText(keyboardLayout.label, placed.centerX, baseline, labelPaint)
     }
 
@@ -788,7 +811,12 @@ class KeyboardView @JvmOverloads constructor(
             ShiftState.SHIFTED -> "⬆"
             ShiftState.LOCKED -> "⇪"
         }
-        KeyType.CHARACTER -> if (shiftState != ShiftState.OFF) key.label.uppercase() else key.label
+        KeyType.CHARACTER ->
+            if (shiftState != ShiftState.OFF) {
+                uppercaseLabels.getOrPut(key.label) { key.label.uppercase() }
+            } else {
+                key.label
+            }
         else -> key.label
     }
 
@@ -863,8 +891,13 @@ class KeyboardView @JvmOverloads constructor(
                     dp(8f), dp(8f), fillPaint,
                 )
             }
-            val metrics = emojiPaint.fontMetrics
-            canvas.drawText(emoji, index * cellWidth + cellWidth / 2f, rowTop + dp(24f) - (metrics.ascent + metrics.descent) / 2f, emojiPaint)
+            emojiPaint.getFontMetrics(reusableFontMetrics)
+            canvas.drawText(
+                emoji,
+                index * cellWidth + cellWidth / 2f,
+                rowTop + dp(24f) - (reusableFontMetrics.ascent + reusableFontMetrics.descent) / 2f,
+                emojiPaint,
+            )
         }
     }
 
@@ -1355,6 +1388,7 @@ class KeyboardView @JvmOverloads constructor(
         gestureStartTime = pointer.downTime
         lastGesturePreviewTime = pointer.downTime
         gesturePoints.clear()
+        gesturePathLength = 0f
         gesturePoints += GesturePoint(pointer.downX, pointer.downY, 0L)
     }
 
@@ -1363,12 +1397,13 @@ class KeyboardView @JvmOverloads constructor(
             .coerceAtLeast(gesturePoints.lastOrNull()?.timeMs ?: 0L)
         val last = gesturePoints.lastOrNull()
         if (last != null && last.x == x && last.y == y && last.timeMs == elapsed) return
+        if (last != null) gesturePathLength += hypot(x - last.x, y - last.y)
         gesturePoints += GesturePoint(x, y, elapsed)
 
         if (
             gesturePoints.size >= MIN_GESTURE_POINTS &&
             eventTime - lastGesturePreviewTime >= GESTURE_PREVIEW_INTERVAL_MS &&
-            pathLength(gesturePoints) >=
+            gesturePathLength >=
             (gesturePointerId?.let(pointers::get)?.placed?.width ?: 0f) *
             MIN_GESTURE_PREVIEW_PATH_FACTOR
         ) {
@@ -1386,7 +1421,7 @@ class KeyboardView @JvmOverloads constructor(
     private fun finishGesture(pointer: Pointer) {
         val points = ArrayList(gesturePoints)
         val decodable = points.size >= MIN_GESTURE_POINTS &&
-            pathLength(points) >= pointer.placed.width * MIN_GESTURE_PATH_FACTOR
+            gesturePathLength >= pointer.placed.width * MIN_GESTURE_PATH_FACTOR
         abandonGesture(clearPreviewCandidates = !decodable)
         if (decodable) {
             val trailStart = (points.size - TRAIL_POINTS).coerceAtLeast(0)
@@ -1404,20 +1439,13 @@ class KeyboardView @JvmOverloads constructor(
         }
     }
 
-    private fun pathLength(points: List<GesturePoint>): Float {
-        var total = 0f
-        for (i in 1 until points.size) {
-            total += hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y)
-        }
-        return total
-    }
-
     private fun abandonGesture(clearPreviewCandidates: Boolean = true) {
         if (gesturePointerId != null) {
             listener?.onGesturePreviewCancelled(clearPreviewCandidates)
         }
         gesturePointerId = null
         gesturePoints.clear()
+        gesturePathLength = 0f
     }
 
     // endregion

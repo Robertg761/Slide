@@ -127,6 +127,9 @@ class EmojiPanelView(context: Context) : View(context) {
         textAlign = Paint.Align.CENTER
         textSize = sp(14f)
     }
+
+    /** Reused across draws; `Paint.fontMetrics` allocates a fresh object per read. */
+    private val reusableFontMetrics = Paint.FontMetrics()
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeWidth = dp(1f) }
     private val iconPath = Path()
@@ -597,8 +600,9 @@ class EmojiPanelView(context: Context) : View(context) {
         val bottom = tabHeight()
 
         emojiPaint.textSize = sp(TAB_ICON_SP)
-        val metrics = emojiPaint.fontMetrics
-        val baseline = bottom / 2f - (metrics.ascent + metrics.descent) / 2f
+        emojiPaint.getFontMetrics(reusableFontMetrics)
+        val baseline =
+            bottom / 2f - (reusableFontMetrics.ascent + reusableFontMetrics.descent) / 2f
 
         for (tab in 0 until count) {
             val left = tab * tabWidth
@@ -676,8 +680,8 @@ class EmojiPanelView(context: Context) : View(context) {
         canvas.clipRect(0f, top, width.toFloat(), top + gridHeight())
 
         emojiPaint.textSize = sp(EMOJI_SP)
-        val metrics = emojiPaint.fontMetrics
-        val centreOffset = -(metrics.ascent + metrics.descent) / 2f
+        emojiPaint.getFontMetrics(reusableFontMetrics)
+        val centreOffset = -(reusableFontMetrics.ascent + reusableFontMetrics.descent) / 2f
 
         // Only the rows actually on screen are drawn. The alternative is 1900 drawText calls per
         // frame during a fling, which is the difference between a smooth scroll and a slideshow.
@@ -712,11 +716,11 @@ class EmojiPanelView(context: Context) : View(context) {
         labelPaint.color = keyboardTheme.hintText
         labelPaint.textSize = sp(14f)
         val centre = gridTop() + gridHeight() / 2f
-        val metrics = labelPaint.fontMetrics
+        labelPaint.getFontMetrics(reusableFontMetrics)
         canvas.drawText(
             if (selectedTab == RECENTS_TAB) EMPTY_RECENTS else EMPTY_CATEGORY,
             width / 2f,
-            centre - (metrics.ascent + metrics.descent) / 2f,
+            centre - (reusableFontMetrics.ascent + reusableFontMetrics.descent) / 2f,
             labelPaint,
         )
     }
@@ -738,8 +742,9 @@ class EmojiPanelView(context: Context) : View(context) {
         }
 
         labelPaint.color = keyboardTheme.specialKeyText
-        val metrics = labelPaint.fontMetrics
-        val baseline = top + footerHeight() / 2f - (metrics.ascent + metrics.descent) / 2f
+        labelPaint.getFontMetrics(reusableFontMetrics)
+        val baseline = top + footerHeight() / 2f -
+            (reusableFontMetrics.ascent + reusableFontMetrics.descent) / 2f
         canvas.drawText(BACK_LABEL, backWidth / 2f, baseline, labelPaint)
 
         drawBackspace(canvas, width - backWidth / 2f, top + footerHeight() / 2f)
@@ -803,8 +808,9 @@ class EmojiPanelView(context: Context) : View(context) {
 
         val slot = popupRect.width() / forms.size
         emojiPaint.textSize = sp(EMOJI_SP)
-        val metrics = emojiPaint.fontMetrics
-        val centreY = popupRect.centerY() - (metrics.ascent + metrics.descent) / 2f
+        emojiPaint.getFontMetrics(reusableFontMetrics)
+        val centreY = popupRect.centerY() -
+            (reusableFontMetrics.ascent + reusableFontMetrics.descent) / 2f
 
         for (index in forms.indices) {
             val left = popupRect.left + index * slot

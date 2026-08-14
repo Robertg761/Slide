@@ -25,7 +25,18 @@ class SampledTrace private constructor(
      * the middle of the keyboard can still match a word whose ideal path is large and off to one
      * side. Absolute position is not lost -- the location channel measures it separately.
      */
-    fun normalized(): SampledTrace {
+    fun normalized(): SampledTrace =
+        SampledTrace(FloatArray(size), FloatArray(size)).also { normalizedInto(it) }
+
+    /**
+     * [normalized], but written into [out]'s arrays instead of allocating.
+     *
+     * The decoder normalises one template per scored word, thousands of times per swipe; letting
+     * it reuse one scratch trace removes that entire allocation stream. [out] must have the same
+     * sample count as this trace.
+     */
+    fun normalizedInto(out: SampledTrace) {
+        require(out.size == size) { "Scratch trace has ${out.size} samples, need $size" }
         var meanX = 0f
         var meanY = 0f
         for (i in xs.indices) {
@@ -47,13 +58,10 @@ class SampledTrace private constructor(
         // centred at the origin makes it maximally distant from every real word template.
         val scale = if (radius < EPSILON) 0f else 1f / radius
 
-        val outX = FloatArray(size)
-        val outY = FloatArray(size)
         for (i in xs.indices) {
-            outX[i] = (xs[i] - meanX) * scale
-            outY[i] = (ys[i] - meanY) * scale
+            out.xs[i] = (xs[i] - meanX) * scale
+            out.ys[i] = (ys[i] - meanY) * scale
         }
-        return SampledTrace(outX, outY)
     }
 
     /** Straight-line length of the path, summed segment by segment. */
@@ -78,21 +86,35 @@ class SampledTrace private constructor(
             return resample(xs, ys, points.size, count)
         }
 
+        /** An all-zero trace of [count] samples, for reuse via [resampleInto]/[normalizedInto]. */
+        fun scratch(count: Int): SampledTrace {
+            require(count >= 2) { "A resampled trace needs at least two points" }
+            return SampledTrace(FloatArray(count), FloatArray(count))
+        }
+
         /**
          * Walks the polyline in equal arc-length steps, interpolating within whichever segment
          * each step lands in.
          */
-        fun resample(xs: FloatArray, ys: FloatArray, length: Int, count: Int): SampledTrace {
+        fun resample(xs: FloatArray, ys: FloatArray, length: Int, count: Int): SampledTrace =
+            scratch(count).also { resampleInto(xs, ys, length, it) }
+
+        /** [resample], but written into [out]'s arrays instead of allocating. */
+        fun resampleInto(xs: FloatArray, ys: FloatArray, length: Int, out: SampledTrace) {
+            val count = out.size
             require(count >= 2) { "A resampled trace needs at least two points" }
+            val outX = out.xs
+            val outY = out.ys
 
-            val outX = FloatArray(count)
-            val outY = FloatArray(count)
-
-            if (length == 0) return SampledTrace(outX, outY)
+            if (length == 0) {
+                outX.fill(0f)
+                outY.fill(0f)
+                return
+            }
             if (length == 1) {
                 outX.fill(xs[0])
                 outY.fill(ys[0])
-                return SampledTrace(outX, outY)
+                return
             }
 
             var total = 0f
@@ -105,7 +127,7 @@ class SampledTrace private constructor(
             if (total < EPSILON) {
                 outX.fill(xs[0])
                 outY.fill(ys[0])
-                return SampledTrace(outX, outY)
+                return
             }
 
             val step = total / (count - 1)
@@ -137,7 +159,6 @@ class SampledTrace private constructor(
 
             outX[count - 1] = xs[length - 1]
             outY[count - 1] = ys[length - 1]
-            return SampledTrace(outX, outY)
         }
 
         /** Builds a trace directly from already-sampled coordinates, for templates and tests. */

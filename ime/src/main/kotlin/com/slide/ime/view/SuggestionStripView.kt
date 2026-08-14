@@ -75,6 +75,15 @@ class SuggestionStripView(context: Context) : View(context) {
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, value, resources.displayMetrics)
 
     private val words = ArrayList<String>(MAX_VISIBLE)
+
+    /** See [ellipsized]. */
+    private var ellipsizedWidth = 0f
+    private val ellipsizedNormal = HashMap<String, String>()
+    private val ellipsizedBold = HashMap<String, String>()
+
+    /** Reused across draws; `Paint.fontMetrics` allocates a fresh object per read. */
+    private val reusableMetrics = Paint.FontMetrics()
+
     private var pressedIndex = -1
     private var micPressed = false
     private var settingsPressed = false
@@ -200,6 +209,8 @@ class SuggestionStripView(context: Context) : View(context) {
         // word has since landed in that slot.
         cancelPendingLongPress()
         words.clear()
+        ellipsizedNormal.clear()
+        ellipsizedBold.clear()
         requested.forEach(words::add)
         pressedIndex = -1
         settingsPressed = false
@@ -238,11 +249,11 @@ class SuggestionStripView(context: Context) : View(context) {
                 textPaint.color = keyboardTheme.hintText
                 textPaint.typeface = Typeface.DEFAULT
                 textPaint.textSize = minOf(sp(12f), suggestionWidth() * 0.04f)
-                val metrics = textPaint.fontMetrics
+                textPaint.getFontMetrics(reusableMetrics)
                 canvas.drawText(
                     emptyMessage,
                     suggestionLeft() + suggestionWidth() / 2f,
-                    height / 2f - (metrics.ascent + metrics.descent) / 2f,
+                    height / 2f - (reusableMetrics.ascent + reusableMetrics.descent) / 2f,
                     textPaint,
                 )
             }
@@ -252,8 +263,8 @@ class SuggestionStripView(context: Context) : View(context) {
         textPaint.textSize = sp(16f)
         val cellWidth = suggestionWidth() / MAX_VISIBLE
         // Vertically centre on the text's own middle rather than its baseline.
-        val metrics = textPaint.fontMetrics
-        val baseline = height / 2f - (metrics.ascent + metrics.descent) / 2f
+        textPaint.getFontMetrics(reusableMetrics)
+        val baseline = height / 2f - (reusableMetrics.ascent + reusableMetrics.descent) / 2f
 
         // Keep the best candidate in the centre. That stable target is easier to scan and matches
         // the placement people have learned from mature mobile keyboards.
@@ -284,7 +295,7 @@ class SuggestionStripView(context: Context) : View(context) {
             textPaint.typeface = if (index == 0) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
 
             canvas.drawText(
-                ellipsize(words[index], cellWidth - dp(12f)),
+                ellipsized(words[index], cellWidth - dp(12f), bold = index == 0),
                 left + cellWidth / 2f,
                 baseline,
                 textPaint,
@@ -481,6 +492,23 @@ class SuggestionStripView(context: Context) : View(context) {
         var end = word.length
         while (end > 1 && textPaint.measureText(word.substring(0, end) + "…") > available) end--
         return word.substring(0, end) + "…"
+    }
+
+    /**
+     * [ellipsize], memoized per word and paint weight.
+     *
+     * The measure-and-trim loop runs string concatenations and text measurement inside [onDraw],
+     * which repaints on every press highlight; the same three words do not need re-trimming each
+     * frame. Cleared when the words change and when the cell width does.
+     */
+    private fun ellipsized(word: String, available: Float, bold: Boolean): String {
+        if (available != ellipsizedWidth) {
+            ellipsizedNormal.clear()
+            ellipsizedBold.clear()
+            ellipsizedWidth = available
+        }
+        val cache = if (bold) ellipsizedBold else ellipsizedNormal
+        return cache.getOrPut(word) { ellipsize(word, available) }
     }
 
     override fun onInitializeAccessibilityNodeInfo(info: AccessibilityNodeInfo) {
