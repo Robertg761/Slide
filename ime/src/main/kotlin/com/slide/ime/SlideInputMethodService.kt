@@ -360,6 +360,15 @@ class SlideInputMethodService :
     private var gesturePreviewJob: Job? = null
     private var gesturePreviewGeneration = 0L
 
+    /**
+     * The words before the current swipe, resolved once per stroke for the live preview.
+     *
+     * Valid only while [swipePreviewContextGeneration] equals the stroke's preview generation,
+     * which every cancel, completion, and editor transition bumps.
+     */
+    private var swipePreviewContext: PrecedingWord.Context? = null
+    private var swipePreviewContextGeneration = -1L
+
     /** Completed swipes and following edits are chained so off-thread inference cannot reorder input. */
     private val gestureInputQueue = OrderedInputQueue(scope) { editorGeneration }
 
@@ -854,34 +863,56 @@ class SlideInputMethodService :
         return super.onKeyDown(keyCode, event)
     }
 
+    /** The overlays that can cover or replace the keys, topmost first. */
+    private enum class Panel { VOICE, SETTINGS, SEARCH, EMOJI }
+
+    /**
+     * The topmost panel over the keys, or null when the plain keyboard is showing.
+     *
+     * Derived from the same view state as the individual `*Shown` predicates, so it can never
+     * disagree with them — and every "is anything covering the keys?" decision goes through it.
+     * A panel added here is automatically part of back handling, gesture gating, and prediction
+     * gating, instead of needing each of those call sites edited in step.
+     */
+    private val activePanel: Panel?
+        get() = when {
+            voiceOverlayShown -> Panel.VOICE
+            keyboardSettingsPanelShown -> Panel.SETTINGS
+            searchModeShown -> Panel.SEARCH
+            emojiPanelShown -> Panel.EMOJI
+            else -> null
+        }
+
+    private val anyPanelShown: Boolean get() = activePanel != null
+
     /**
      * Closes the topmost panel, reporting whether there was one.
      *
      * Dictation sits above the picker, so it goes first. Backing out of it counts as cancelling
      * rather than finishing: a transcript the user backed away from is not one they asked for.
      */
-    private fun handleBack(): Boolean = when {
-        voiceOverlayShown -> {
+    private fun handleBack(): Boolean = when (activePanel) {
+        Panel.VOICE -> {
             onVoiceDismissed(committed = false)
             true
         }
 
-        keyboardSettingsPanelShown -> {
+        Panel.SETTINGS -> {
             hideKeyboardSettingsPanel(restoreEditorUi = true)
             true
         }
 
-        searchModeShown -> {
+        Panel.SEARCH -> {
             exitEmojiSearch(showPicker = true)
             true
         }
 
-        emojiPanelShown -> {
+        Panel.EMOJI -> {
             hideEmojiPanel()
             true
         }
 
-        else -> false
+        null -> false
     }
 
     /**
@@ -898,12 +929,7 @@ class SlideInputMethodService :
     private var backCallbackRegistered = false
 
     private fun refreshBackCallback() {
-        setBackCallbackRegistered(
-            voiceOverlayShown ||
-                keyboardSettingsPanelShown ||
-                searchModeShown ||
-                emojiPanelShown,
-        )
+        setBackCallbackRegistered(anyPanelShown)
     }
 
     private fun setBackCallbackRegistered(registered: Boolean) {
@@ -1081,10 +1107,7 @@ class SlideInputMethodService :
             clearSuggestions()
             return
         }
-        if (
-            searchModeShown || emojiPanelShown || voiceOverlayShown ||
-            keyboardSettingsPanelShown || layer != Layer.ALPHA
-        ) return
+        if (anyPanelShown || layer != Layer.ALPHA) return
 
         // Keep a live preview visible while final inference runs. If this trace never produced a
         // preview, clear older candidates now so they cannot rewrite the wrong swipe.
@@ -1307,10 +1330,7 @@ class SlideInputMethodService :
     private fun gestureModeAvailable(): Boolean =
         settings.gestureTypingEnabled &&
             editorInputPolicy.allowsSuggestions &&
-            !searchModeShown &&
-            !emojiPanelShown &&
-            !voiceOverlayShown &&
-            !keyboardSettingsPanelShown &&
+            !anyPanelShown &&
             layer == Layer.ALPHA
 
     private fun clearGesturePreview() {
@@ -1458,10 +1478,7 @@ class SlideInputMethodService :
 
     override fun onGesturePreview(points: List<GesturePoint>) {
         if (!settings.gestureTypingEnabled || !editorInputPolicy.allowsSuggestions) return
-        if (
-            searchModeShown || emojiPanelShown || voiceOverlayShown ||
-            keyboardSettingsPanelShown || layer != Layer.ALPHA
-        ) return
+        if (anyPanelShown || layer != Layer.ALPHA) return
         if (gestureDecoder == null || currentGestureKeyMap() == null) return
 
         gestureUndoState.invalidate()
@@ -1479,7 +1496,16 @@ class SlideInputMethodService :
                 val decoder = gestureDecoder ?: break
                 val keys = currentGestureKeyMap() ?: break
                 val blockOffensive = settings.blockOffensiveWords
-                val context = precedingContextForSwipe()
+                // One blocking Binder round trip into the editor per stroke, not per tick: the
+                // words before the swipe cannot change while the finger is still down, and the
+                // preview generation is bumped by every path that could make them change (cancel,
+                // completion, editor transitions).
+                val context = swipePreviewContext
+                    .takeIf { swipePreviewContextGeneration == generation }
+                    ?: precedingContextForSwipe().also {
+                        swipePreviewContext = it
+                        swipePreviewContextGeneration = generation
+                    }
                 val candidates = try {
                     withContext(Dispatchers.Default) {
                         gestureDecodeMutex.withLock {
@@ -3099,10 +3125,7 @@ class SlideInputMethodService :
             editorInputPolicy.allowsSuggestions &&
             gestureDecoder != null &&
             layer == Layer.ALPHA &&
-            !searchModeShown &&
-            !emojiPanelShown &&
-            !voiceOverlayShown &&
-            !keyboardSettingsPanelShown
+            !anyPanelShown
     }
 
     // endregion
@@ -3343,10 +3366,7 @@ class SlideInputMethodService :
     private fun saveLearnedWords() {
         val ticket = learnedPersistence.beginSave() ?: return
 
-        val words = UserDictionary().also { it.restore(userDictionary.entries()) }
-        val pairs = UserBigrams().also { it.restore(userBigrams.entries()) }
-        val touches = SpatialTouchModel().also { it.restore(spatialTouchModel.entries()) }
-        val gestures = GestureAdaptation().also { it.restore(gestureAdaptation.snapshot()) }
+        val (words, pairs, touches, gestures) = copyLearnedModels()
         scope.launch {
             val result = withContext(Dispatchers.IO) {
                 LEARNED_DATA_IO.withLock {
@@ -3398,14 +3418,30 @@ class SlideInputMethodService :
         val pendingDeleteResolved: Boolean,
     )
 
+    /** Main-thread deep copies of the four learned models, taken for a background write. */
+    private data class LearnedModelCopies(
+        val words: UserDictionary,
+        val pairs: UserBigrams,
+        val touches: SpatialTouchModel,
+        val gestures: GestureAdaptation,
+    )
+
+    /**
+     * The one place the copy ritual lives: a fifth learned model added here is snapshotted by
+     * every save path — ordinary, final, or clear — instead of needing each site edited in step.
+     */
+    private fun copyLearnedModels() = LearnedModelCopies(
+        words = UserDictionary().also { it.restore(userDictionary.entries()) },
+        pairs = UserBigrams().also { it.restore(userBigrams.entries()) },
+        touches = SpatialTouchModel().also { it.restore(spatialTouchModel.entries()) },
+        gestures = GestureAdaptation().also { it.restore(gestureAdaptation.snapshot()) },
+    )
+
     /** Captures only when destruction could otherwise strand a write or a clear. */
     private fun captureFinalLearnedData(): FinalLearnedData? {
         if (!learnedPersistence.needsFinalization) return null
 
-        val words = UserDictionary().also { it.restore(userDictionary.entries()) }
-        val pairs = UserBigrams().also { it.restore(userBigrams.entries()) }
-        val touches = SpatialTouchModel().also { it.restore(spatialTouchModel.entries()) }
-        val gestures = GestureAdaptation().also { it.restore(gestureAdaptation.snapshot()) }
+        val (words, pairs, touches, gestures) = copyLearnedModels()
         return FinalLearnedData(
             words = words,
             pairs = pairs,
@@ -3787,7 +3823,7 @@ class SlideInputMethodService :
     private fun updatePredictions() {
         if (composing.isNotEmpty()) return
         if (!fieldSuggestionsEnabled()) return
-        if (searchModeShown || emojiPanelShown || voiceOverlayShown || keyboardSettingsPanelShown) return
+        if (anyPanelShown) return
 
         val suggester = typingSuggester ?: return
         val context = precedingContextForSwipe()
@@ -3973,7 +4009,7 @@ class SlideInputMethodService :
         if (selectionStart != selectionEnd || selectionStart < 0) return
         if (stripMode != StripMode.Empty) return
         if (!fieldSuggestionsEnabled()) return
-        if (searchModeShown || emojiPanelShown || voiceOverlayShown || keyboardSettingsPanelShown) return
+        if (anyPanelShown) return
 
         val suggester = typingSuggester ?: return
         val keys = currentGestureKeyMap() ?: return
