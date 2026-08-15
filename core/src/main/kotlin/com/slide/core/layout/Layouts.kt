@@ -29,15 +29,14 @@ object Layouts {
      */
     private val emoji = Key("\u263A\uFE0E", KeyType.EMOJI, gestureEligible = false)
     private val globe = Key("\u25ce", KeyType.GLOBE, gestureEligible = false)
+    /** The comma has its own bottom-row key, as on Gboard, so it is not among the alternates. */
     private val period = Key(
         ".",
         KeyType.CHARACTER,
-        // The comma leads the alternates because the emoji key took its place in the bottom row,
-        // which is what Gboard does too. It is the one alternate here that is not punctuation
-        // people reach for occasionally.
-        alternates = listOf(",", "!", "?", "…", "-", "_", "/", ";", ":"),
+        alternates = listOf("!", "?", "…", "-", "_", "/", ";", ":"),
         gestureEligible = false,
     )
+    private val comma = Key(",", KeyType.CHARACTER, gestureEligible = false)
 
     /** Optional persistent digit row (setting A8). */
     val numberRow = KeyRow(
@@ -95,7 +94,8 @@ object Layouts {
                     delete,
                 ),
             ),
-            KeyRow(listOf(toSymbols, emoji, space, period, enter)),
+            // Space donates a unit to the comma so the row keeps the grid's total width.
+            KeyRow(listOf(toSymbols, comma, emoji, space.copy(widthWeight = 4f), period, enter)),
         ),
     )
 
@@ -251,7 +251,7 @@ object Layouts {
         ),
     )
 
-    /** First symbols page (`?123`). */
+    /** First symbols page (`?123`), arranged as Gboard's: `_` and `/` earn first-page spots. */
     val SymbolsEn = KeyboardLayout(
         id = "symbols_en",
         label = "Symbols",
@@ -260,18 +260,16 @@ object Layouts {
             KeyRow("1234567890".map { sym(it.toString()) }),
             KeyRow(
                 listOf(
-                    sym("@"), sym("#"), sym("$", "€£¥¢"), sym("%", "‰"), sym("&"),
-                    sym("-", "_–—~"), sym("+", "±"), sym("(", "[{<"), sym(")", "]}>"),
+                    sym("@"), sym("#"), sym("$", "€£¥¢"), sym("_"), sym("&"),
+                    sym("-", "–—~"), sym("+", "±"), sym("(", "[{<"), sym(")", "]}>"), sym("/"),
                 ),
-                leadingGap = 0.5f,
-                trailingGap = 0.5f,
             ),
             KeyRow(
                 listOf(toSymbolsAlt) +
                     listOf(sym("*"), sym("\""), sym("'"), sym(":"), sym(";"), sym("!"), sym("?")) +
                     listOf(delete),
             ),
-            KeyRow(listOf(toAlpha, emoji, space, period, enter)),
+            KeyRow(listOf(toAlpha, comma, space, period, enter)),
         ),
     )
 
@@ -289,23 +287,22 @@ object Layouts {
             KeyRow(
                 listOf(
                     sym("~"), sym("`"), sym("|"), sym("•"), sym("√"),
-                    sym("π"), sym("÷"), sym("×"), sym("¶"), sym("∆"),
+                    sym("π"), sym("÷"), sym("×"), sym("§", "¶"), sym("∆"),
                 ),
             ),
             KeyRow(
                 listOf(
                     sym("£"), sym("¢"), sym("€"), sym("¥"), sym("^"),
-                    sym("°"), sym("="), sym("{"), sym("}"),
+                    sym("°"), sym("="), sym("{"), sym("}"), sym("\\"),
                 ),
-                leadingGap = 0.5f,
-                trailingGap = 0.5f,
             ),
             KeyRow(
                 listOf(toSymbols) +
-                    listOf(sym("\\"), sym("/"), sym("<"), sym(">"), sym("["), sym("]"), sym("©", "®™")) +
+                    listOf(sym("%", "‰"), sym("©"), sym("®"), sym("™"), sym("✓"), sym("["), sym("]")) +
                     listOf(delete),
             ),
-            KeyRow(listOf(toAlpha, emoji, space, period, enter)),
+            // The angle brackets flank the space bar here, exactly where Gboard keeps them.
+            KeyRow(listOf(toAlpha, sym("<", "‹«"), space, sym(">", "›»"), enter)),
         ),
     )
 

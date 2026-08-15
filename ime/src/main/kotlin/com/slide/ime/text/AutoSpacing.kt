@@ -69,6 +69,31 @@ internal object AutoSpacing {
         }
     }
 
+    /**
+     * Whether a literal key tap needs a leading space, given [swipedWordBehindCursor]: the last
+     * swipe-committed text while the cursor still rests at its end, or null once anything else
+     * has happened.
+     *
+     * A tap at a word edge normally continues that word (`hello|` + `s` is `hellos`), but a
+     * just-swiped word is complete: typing straight after it starts the next word, spaced the
+     * way a second swipe would be. The swiped text is checked against [textBeforeCursor] itself,
+     * not just the caller's cursor bookkeeping, so a stale record can never push a space into
+     * the middle of a word.
+     */
+    fun beforeTypedWord(
+        textBeforeCursor: CharSequence?,
+        swipedWordBehindCursor: String? = null,
+    ): Boolean {
+        val followsSwipedWord = !swipedWordBehindCursor.isNullOrEmpty() &&
+            textBeforeCursor != null &&
+            textBeforeCursor.endsWith(swipedWordBehindCursor)
+        return beforeWord(
+            textBeforeCursor,
+            typingAfterApostrophe = true,
+            continuingTypedWord = !followsSwipedWord,
+        )
+    }
+
     private fun ambiguousQuoteCloses(text: CharSequence, quoteStart: Int): Boolean {
         if (quoteStart <= 0) return false
         val previous = Character.codePointBefore(text, quoteStart)

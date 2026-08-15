@@ -4,6 +4,20 @@
 
 ### Added
 
+- Typing right after a swiped word now inserts the separating space automatically, so
+  swipe-then-type no longer glues the tapped letters onto the swiped word. The space appears
+  only while the cursor still rests at the end of the swipe's own committed text, verified
+  against the editor, and a Shift tap in between (to capitalise the next word) no longer
+  breaks either this or the Backspace swipe-undo.
+- The dictation overlay gained an explicit Done/Cancel button pair where the space bar
+  normally sits — tapping anywhere else still finishes — plus a live recording timer beside
+  the status line, and Done dims while there is nothing to finish.
+- The keyboard now matches Gboard's arrangement: the number row is on by default, a dedicated
+  comma key joins the bottom row, `_` and `/` moved onto the first symbols page, the second
+  page gained `§`, `\`, `%`, `©` `®` `™` `✓` as their own keys with `<` `>` flanking the space
+  bar, and with the number row shown the letter keys hint their symbol alternates instead of
+  repeating the digits.
+
 - A clipboard panel and a text-editing panel, reached from shortcuts that share the suggestion
   strip while it has no candidates, as Gboard's toolbar does. The clipboard remembers what was
   copied while Slide was running: unpinned items stay in memory only and expire after an hour,
