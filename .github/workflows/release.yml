@@ -260,7 +260,7 @@ jobs:
           persist-credentials: false
 
       - name: Download the reference unsigned build
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: unsigned-release-${{ github.sha }}
           path: reference
@@ -317,7 +317,7 @@ jobs:
       apk_sha256: ${{ steps.digest.outputs.apk_sha256 }}
     steps:
       - name: Download the exact unprivileged build
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: unsigned-release-${{ github.sha }}
           path: input
@@ -422,7 +422,7 @@ jobs:
       contents: write
     steps:
       - name: Download the verified signed artifact
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: signed-release-${{ github.sha }}
           path: dist
