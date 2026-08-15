@@ -93,7 +93,7 @@ class VoiceInputService : Service() {
     private fun start(sessionId: Long, model: WhisperModel) {
         if (!sessions.start(sessionId)) {
             if (sessionId != VoiceInput.NO_SESSION_ID && !sessions.isCurrent(sessionId)) {
-                sendError(sessionId, "Voice typing is still closing")
+                sendError(sessionId, VoiceInput.Error.StillClosing)
                 sendState(sessionId, VoiceInput.State.Idle)
             }
             return
@@ -102,14 +102,14 @@ class VoiceInputService : Service() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
-            finishWithError(sessionId, "Microphone permission is needed for voice typing")
+            finishWithError(sessionId, VoiceInput.Error.PermissionMissing)
             return
         }
 
         work = scope.launch {
             sendStateIfCurrent(sessionId, VoiceInput.State.Preparing)
             if (!transcriber.load(model)) {
-                finishWithError(sessionId, "Speech model could not be loaded")
+                finishWithError(sessionId, VoiceInput.Error.ModelUnavailable)
                 return@launch
             }
             if (!sessions.isCurrent(sessionId)) return@launch
@@ -127,7 +127,7 @@ class VoiceInputService : Service() {
                 },
             )
             if (!started) {
-                finishWithError(sessionId, "The microphone is not available")
+                finishWithError(sessionId, VoiceInput.Error.MicUnavailable)
                 return@launch
             }
             if (!sessions.isCurrent(sessionId)) {
@@ -155,7 +155,10 @@ class VoiceInputService : Service() {
                 when (val result = transcriber.transcribe(audio)) {
                     is WhisperTranscriber.Result.Text -> sendResultIfCurrent(sessionId, result.value)
                     WhisperTranscriber.Result.NoSpeech -> sendResultIfCurrent(sessionId, "")
-                    is WhisperTranscriber.Result.Failed -> sendErrorIfCurrent(sessionId, result.reason)
+                    is WhisperTranscriber.Result.Failed -> {
+                        Log.w(TAG, "Decode failed: ${result.reason}")
+                        sendErrorIfCurrent(sessionId, VoiceInput.Error.DecodeFailed)
+                    }
                 }
             } finally {
                 // WhisperTranscriber also wipes this copy. Keep the service boundary defensive if
@@ -181,17 +184,17 @@ class VoiceInputService : Service() {
         when (reason) {
             AudioRecorder.EndReason.RecordingLimitReached -> stop(sessionId)
             AudioRecorder.EndReason.CaptureFailed ->
-                finishWithError(sessionId, "The microphone stopped unexpectedly")
+                finishWithError(sessionId, VoiceInput.Error.MicStopped)
         }
     }
 
-    private fun finishWithError(sessionId: Long, reason: String) {
+    private fun finishWithError(sessionId: Long, error: VoiceInput.Error) {
         if (!sessions.finish(sessionId)) return
         val abandoned = work
         work = null
         abandoned?.cancel()
         recorder.cancel()
-        sendError(sessionId, reason)
+        sendError(sessionId, error)
         sendState(sessionId, VoiceInput.State.Idle)
     }
 
@@ -213,8 +216,8 @@ class VoiceInputService : Service() {
         if (sessions.isCurrent(sessionId)) sendResult(sessionId, text)
     }
 
-    private fun sendErrorIfCurrent(sessionId: Long, reason: String) {
-        if (sessions.isCurrent(sessionId)) sendError(sessionId, reason)
+    private fun sendErrorIfCurrent(sessionId: Long, error: VoiceInput.Error) {
+        if (sessions.isCurrent(sessionId)) sendError(sessionId, error)
     }
 
     private fun sendState(sessionId: Long, state: VoiceInput.State) =
@@ -232,14 +235,9 @@ class VoiceInputService : Service() {
         },
     )
 
-    private fun sendError(sessionId: Long, reason: String) {
-        Log.w(TAG, reason)
-        send(
-            sessionId,
-            Message.obtain(null, VoiceInput.MSG_ERROR).apply {
-                data = Bundle().apply { putString(VoiceInput.KEY_REASON, reason) }
-            },
-        )
+    private fun sendError(sessionId: Long, error: VoiceInput.Error) {
+        Log.w(TAG, "Voice session failed: ${error.name}")
+        send(sessionId, Message.obtain(null, VoiceInput.MSG_ERROR, error.ordinal, 0))
     }
 
     /** Called only on the service main thread. */

@@ -2,12 +2,14 @@ package com.slide.asr
 
 import android.content.Context
 import android.util.Log
+import java.util.concurrent.Executors
+import java.util.concurrent.ExecutorService
 import kotlin.math.abs
 import kotlin.math.min
 import kotlin.coroutines.resume
 import kotlinx.coroutines.CoroutineDispatcher
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -25,8 +27,23 @@ import kotlinx.coroutines.withContext
  */
 class WhisperTranscriber(
     private val context: Context,
-    private val dispatcher: CoroutineDispatcher = Dispatchers.Default,
+    dispatcher: CoroutineDispatcher? = null,
 ) {
+
+    /**
+     * Owned only when no dispatcher was injected. Model load and decode block a thread inside JNI
+     * for whole seconds at a time; giving them their own thread keeps that block off
+     * `Dispatchers.Default`, whose small shared pool serves everything else in the process.
+     */
+    private val ownedDecodeExecutor: ExecutorService? =
+        if (dispatcher == null) {
+            Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "SlideWhisperDecode") }
+        } else {
+            null
+        }
+
+    private val dispatcher: CoroutineDispatcher =
+        dispatcher ?: checkNotNull(ownedDecodeExecutor).asCoroutineDispatcher()
 
     /** What went wrong, for a caller that has to explain itself to a user. */
     sealed interface Result {
@@ -169,6 +186,9 @@ class WhisperTranscriber(
         withContext(NonCancellable + dispatcher) {
             mutex.withLock { releaseLocked() }
         }
+        // Runs after the final decode-thread work above has completed; shutdown() lets any
+        // already-queued task finish, so this never aborts an in-flight native call.
+        ownedDecodeExecutor?.shutdown()
     }
 
     private fun cancelToken(token: Long) {

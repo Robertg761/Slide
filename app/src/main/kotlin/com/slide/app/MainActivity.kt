@@ -137,7 +137,11 @@ private fun SetupScreen(repository: SettingsRepository) {
     // The download belongs to the process, not to this composition: rotating away neither cancels
     // it nor starts a second one, and the screen that happens to exist when it finishes reports it.
     val downloading by UpdateManager.isDownloading.collectAsState()
+    val downloadedBytes by UpdateManager.downloadedBytes.collectAsState()
     val installOutcome by UpdateManager.outcome.collectAsState()
+    // The automatic check runs without the user asking, so its failure is reported inline in the
+    // Updates card rather than as a modal dialog that would greet them on every offline open.
+    var autoCheckFailed by remember { mutableStateOf(false) }
     LaunchedEffect(installOutcome) {
         when (val finished = installOutcome) {
             null -> return@LaunchedEffect
@@ -181,7 +185,11 @@ private fun SetupScreen(repository: SettingsRepository) {
     LaunchedEffect(settings.updateChecksEnabled, settings.includeAlphaUpdates) {
         if (settings.updateChecksEnabled) {
             runCatchingCancellable { UpdateManager.check(context, settings.includeAlphaUpdates) }
-                .onSuccess { availableUpdate = it }
+                .onSuccess {
+                    availableUpdate = it
+                    autoCheckFailed = false
+                }
+                .onFailure { autoCheckFailed = true }
         }
     }
 
@@ -418,7 +426,9 @@ private fun SetupScreen(repository: SettingsRepository) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
 
-                    val model = WhisperModel.Default
+                    // Resolved through the stored setting so this card can never disagree with
+                    // the model the keyboard actually loads; unknown values fall back to Default.
+                    val model = WhisperModel.fromId(settings.voiceModelId)
                     Text(model.label, style = MaterialTheme.typography.bodyLarge)
                     Text(
                         "${model.description} Slide packages one verified model to keep every " +
@@ -434,9 +444,17 @@ private fun SetupScreen(repository: SettingsRepository) {
                     Text("Updates", style = MaterialTheme.typography.titleMedium)
                     Text("Slide contacts GitHub when settings opens with update checks enabled, when you enable checks or change prerelease inclusion, and when you tap Check now. Android always confirms installation.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     SettingSwitch("Check GitHub for updates", settings.updateChecksEnabled) { value -> scope.launch { repository.update { it.copy(updateChecksEnabled = value) } } }
+                    if (settings.updateChecksEnabled && autoCheckFailed) {
+                        Text(
+                            "The automatic update check could not reach GitHub. Check your " +
+                                "connection, then tap Check now to retry.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
                     if (settings.updateChecksEnabled) {
                         SettingSwitch("Include prereleases", settings.includeAlphaUpdates) { value -> scope.launch { repository.update { it.copy(includeAlphaUpdates = value) } } }
-                        Button(onClick = { scope.launch { runCatchingCancellable { UpdateManager.check(context, settings.includeAlphaUpdates) }.onSuccess { availableUpdate = it; updateMessage = if (it == null) "You already have the newest selected release." else null }.onFailure { updateMessage = "Could not check for updates: ${it.message ?: "network error"}" } } }) { Text("Check now") }
+                        Button(onClick = { scope.launch { runCatchingCancellable { UpdateManager.check(context, settings.includeAlphaUpdates) }.onSuccess { availableUpdate = it; autoCheckFailed = false; updateMessage = if (it == null) "You already have the newest selected release." else null }.onFailure { updateMessage = "Could not check for updates: ${it.message ?: "network error"}" } } }) { Text("Check now") }
                     }
                 }
             }
@@ -488,8 +506,12 @@ private fun SetupScreen(repository: SettingsRepository) {
             text = {
                 Text(
                     if (downloading) {
-                        "Downloading Slide ${update.version}. Slide is large — this can take a " +
-                            "minute. Android will ask you to confirm the installation."
+                        val downloadedMb = downloadedBytes / BYTES_PER_MB
+                        val totalMb = update.apkSize / BYTES_PER_MB
+                        val percent =
+                            if (update.apkSize > 0) downloadedBytes * 100 / update.apkSize else 0
+                        "Downloading Slide ${update.version}: $downloadedMb of $totalMb MB " +
+                            "($percent%). Android will ask you to confirm the installation."
                     } else {
                         update.notes.ifBlank { "A newer signed Slide release is available." }
                     },
@@ -793,6 +815,8 @@ private suspend inline fun <T> runCatchingCancellable(block: () -> T): Result<T>
     if (t is CancellationException) throw t
     Result.failure(t)
 }
+
+private const val BYTES_PER_MB = 1_000_000L
 
 private fun isKeyboardEnabled(context: Context): Boolean {
     val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager

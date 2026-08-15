@@ -13,6 +13,7 @@ import android.widget.Checkable
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 import androidx.core.graphics.ColorUtils
@@ -56,6 +57,7 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
     private val secondaryText = mutableListOf<TextView>()
     private val dividers = mutableListOf<View>()
     private val switches = mutableListOf<ToggleBinding>()
+    private val sliders = mutableListOf<SliderBinding>()
     private val themeChips = linkedMapOf<ThemeOption, TextView>()
     private var binding = false
 
@@ -111,7 +113,16 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
         addToggle(
             body,
             "Autocorrection",
-            "Correct likely misspellings when a word is finished.",
+            // Mirrors the settings app's copy so the two surfaces never tell different stories
+            // about why autocorrection is not running.
+            describe = {
+                when {
+                    it.suggestionsEnabled -> "Correct likely misspellings when a word is finished."
+                    it.autocorrectEnabled ->
+                        "Paused while the suggestion strip is off; it will resume when the strip is on."
+                    else -> "Turn on the suggestion strip to enable autocorrection."
+                }
+            },
             read = { it.autocorrectEnabled },
             enabledWhen = { it.suggestionsEnabled },
         ) { value, checked -> value.copy(autocorrectEnabled = checked) }
@@ -129,6 +140,22 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
         addToggle(body, "Number row", read = { it.showNumberRow }) { value, checked ->
             value.copy(showNumberRow = checked)
         }
+        addSlider(
+            body,
+            "Keyboard height",
+            valueRange = 0.7f..1.4f,
+            steps = 6,
+            read = { it.keyHeightScale },
+            formatValue = { "${(it * 100).toInt()}%" },
+        ) { value, chosen -> value.copy(keyHeightScale = chosen) }
+        addSlider(
+            body,
+            "Space below keys",
+            valueRange = 0f..32f,
+            steps = 7,
+            read = { it.bottomPaddingDp },
+            formatValue = { "${it.toInt()} dp" },
+        ) { value, chosen -> value.copy(bottomPaddingDp = chosen) }
         addToggle(body, "Key borders", read = { it.showKeyBorders }) { value, checked ->
             value.copy(showKeyBorders = checked)
         }
@@ -138,9 +165,27 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
         addToggle(body, "Haptic feedback", read = { it.hapticEnabled }) { value, checked ->
             value.copy(hapticEnabled = checked)
         }
+        addSlider(
+            body,
+            "Haptic strength",
+            valueRange = 0.1f..1f,
+            steps = 8,
+            read = { it.hapticStrength },
+            formatValue = { "${(it * 100).toInt()}%" },
+            enabledWhen = { it.hapticEnabled },
+        ) { value, chosen -> value.copy(hapticStrength = chosen) }
         addToggle(body, "Sound on keypress", read = { it.soundEnabled }) { value, checked ->
             value.copy(soundEnabled = checked)
         }
+        addSlider(
+            body,
+            "Keypress volume",
+            valueRange = 0.1f..1f,
+            steps = 8,
+            read = { it.soundVolume },
+            formatValue = { "${(it * 100).toInt()}%" },
+            enabledWhen = { it.soundEnabled },
+        ) { value, chosen -> value.copy(soundVolume = chosen) }
 
         addSection(body, "Privacy")
         addToggle(
@@ -207,21 +252,26 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
         parent: LinearLayout,
         title: String,
         description: String? = null,
+        /** Settings-dependent description, re-evaluated on every bind; overrides [description]. */
+        describe: ((KeyboardSettings) -> String)? = null,
         read: (KeyboardSettings) -> Boolean,
         enabledWhen: (KeyboardSettings) -> Boolean = { true },
         update: (KeyboardSettings, Boolean) -> KeyboardSettings,
     ) {
+        val describeWith = describe ?: description?.let { fixed -> { _: KeyboardSettings -> fixed } }
         val labels = LinearLayout(context).apply {
             orientation = VERTICAL
             gravity = Gravity.CENTER_VERTICAL
             importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
         }
         labels.addView(primaryLabel(title, 15f), LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
-        if (description != null) {
-            labels.addView(
-                secondaryLabel(description),
-                LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT),
-            )
+        val descriptionView = describeWith?.let { describeSetting ->
+            secondaryLabel(describeSetting(settings)).also { view ->
+                labels.addView(
+                    view,
+                    LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT),
+                )
+            }
         }
 
         val control = Switch(context).apply {
@@ -231,13 +281,12 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
         val row = AccessibleToggleRow(context, control).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            minimumHeight = dp(if (description == null) 50f else 62f)
+            minimumHeight = dp(if (describeWith == null) 50f else 62f)
             setPadding(dp(8f), dp(4f), dp(4f), dp(4f))
             isClickable = true
             isFocusable = true
             descendantFocusability = FOCUS_BLOCK_DESCENDANTS
             importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
-            contentDescription = if (description == null) title else "$title. $description"
             setOnClickListener { if (control.isEnabled) control.toggle() }
         }
         row.addView(labels, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
@@ -245,7 +294,7 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
         parent.addView(row, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         addDivider(parent)
 
-        val toggle = ToggleBinding(row, control, read, enabledWhen, update)
+        val toggle = ToggleBinding(row, control, title, descriptionView, describeWith, read, enabledWhen, update)
         switches += toggle
         control.setOnCheckedChangeListener { _, checked ->
             if (binding) return@setOnCheckedChangeListener
@@ -254,6 +303,78 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
             listener?.onKeyboardSettingsChanged(updated)
             row.sendAccessibilityEvent(android.view.accessibility.AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)
         }
+    }
+
+    /**
+     * A titled SeekBar row that mirrors the settings app's slider behaviour: the value label
+     * tracks the thumb live, and the changed setting is published once the gesture settles so
+     * the keyboard is not re-laid-out on every pixel of movement.
+     */
+    private fun addSlider(
+        parent: LinearLayout,
+        title: String,
+        valueRange: ClosedFloatingPointRange<Float>,
+        /** Intermediate stops between the endpoints, matching Compose's `Slider(steps = …)`. */
+        steps: Int,
+        read: (KeyboardSettings) -> Float,
+        formatValue: (Float) -> String,
+        enabledWhen: (KeyboardSettings) -> Boolean = { true },
+        update: (KeyboardSettings, Float) -> KeyboardSettings,
+    ) {
+        val positions = steps + 1
+        fun valueAt(progress: Int): Float =
+            valueRange.start +
+                (valueRange.endInclusive - valueRange.start) * progress / positions
+
+        val valueLabel = secondaryLabel(formatValue(read(settings)))
+        val header = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+        }
+        header.addView(primaryLabel(title, 15f), LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+        header.addView(valueLabel, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
+
+        val control = SeekBar(context).apply {
+            max = positions
+            // The row carries the accessibility semantics; the bar itself stays reachable so
+            // TalkBack's slider actions keep working.
+            contentDescription = title
+        }
+        control.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
+                valueLabel.text = formatValue(valueAt(progress))
+            }
+
+            override fun onStartTrackingTouch(bar: SeekBar) = Unit
+
+            override fun onStopTrackingTouch(bar: SeekBar) {
+                if (binding) return
+                val updated = update(settings, valueAt(bar.progress))
+                settings = updated
+                listener?.onKeyboardSettingsChanged(updated)
+            }
+        })
+
+        val row = LinearLayout(context).apply {
+            orientation = VERTICAL
+            setPadding(dp(8f), dp(4f), dp(4f), dp(4f))
+        }
+        row.addView(header, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        row.addView(control, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        parent.addView(row, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        addDivider(parent)
+
+        sliders += SliderBinding(
+            row = row,
+            control = control,
+            valueLabel = valueLabel,
+            valueRange = valueRange,
+            positions = positions,
+            read = read,
+            formatValue = formatValue,
+            enabledWhen = enabledWhen,
+        )
     }
 
     /**
@@ -319,6 +440,20 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
             toggle.row.isEnabled = enabled
             toggle.row.alpha = if (enabled) 1f else 0.42f
             toggle.control.isChecked = toggle.read(settings)
+            val description = toggle.describe?.invoke(settings)
+            toggle.descriptionView?.text = description
+            toggle.row.contentDescription =
+                if (description == null) toggle.title else "${toggle.title}. $description"
+        }
+        sliders.forEach { slider ->
+            val enabled = slider.enabledWhen(settings)
+            slider.control.isEnabled = enabled
+            slider.row.alpha = if (enabled) 1f else 0.42f
+            val value = slider.read(settings)
+            val span = slider.valueRange.endInclusive - slider.valueRange.start
+            val fraction = ((value - slider.valueRange.start) / span).coerceIn(0f, 1f)
+            slider.control.progress = Math.round(fraction * slider.positions)
+            slider.valueLabel.text = slider.formatValue(value)
         }
         binding = false
         applyThemeChips()
@@ -345,6 +480,12 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
                     ColorUtils.setAlphaComponent(keyboardTheme.specialKeyBackground, 0xCC),
                 ),
             )
+        }
+        sliders.forEach { slider ->
+            slider.control.thumbTintList = ColorStateList.valueOf(keyboardTheme.accentBackground)
+            slider.control.progressTintList = ColorStateList.valueOf(keyboardTheme.accentBackground)
+            slider.control.progressBackgroundTintList =
+                ColorStateList.valueOf(keyboardTheme.divider)
         }
         applyThemeChips()
     }
@@ -384,9 +525,23 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
     private data class ToggleBinding(
         val row: View,
         val control: Switch,
+        val title: String,
+        val descriptionView: TextView?,
+        val describe: ((KeyboardSettings) -> String)?,
         val read: (KeyboardSettings) -> Boolean,
         val enabledWhen: (KeyboardSettings) -> Boolean,
         val update: (KeyboardSettings, Boolean) -> KeyboardSettings,
+    )
+
+    private data class SliderBinding(
+        val row: View,
+        val control: SeekBar,
+        val valueLabel: TextView,
+        val valueRange: ClosedFloatingPointRange<Float>,
+        val positions: Int,
+        val read: (KeyboardSettings) -> Float,
+        val formatValue: (Float) -> String,
+        val enabledWhen: (KeyboardSettings) -> Boolean,
     )
 
     private data class ThemeOption(
@@ -396,8 +551,8 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
     )
 }
 
-/** Geometry-drawn back arrow avoids depending on an OEM font glyph. */
-private class BackIconView(context: Context) : View(context) {
+/** Geometry-drawn back arrow avoids depending on an OEM font glyph. Shared by the key panels. */
+internal class BackIconView(context: Context) : View(context) {
     private val density = resources.displayMetrics.density
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE

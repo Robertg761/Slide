@@ -81,6 +81,9 @@ class VoiceOverlayView(context: Context) : View(context) {
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
 
+    /** Reused across draws; `Paint.fontMetrics` allocates a fresh object per read. */
+    private val reusableFontMetrics = Paint.FontMetrics()
+
     private val indicatorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
@@ -306,8 +309,13 @@ class VoiceOverlayView(context: Context) : View(context) {
             halfHeight, halfHeight, fillPaint,
         )
 
-        val metrics = textPaint.fontMetrics
-        canvas.drawText(label, centerX, centerY - (metrics.ascent + metrics.descent) / 2f, textPaint)
+        textPaint.getFontMetrics(reusableFontMetrics)
+        canvas.drawText(
+            label,
+            centerX,
+            centerY - (reusableFontMetrics.ascent + reusableFontMetrics.descent) / 2f,
+            textPaint,
+        )
     }
 
     private fun updateCancelBounds() {

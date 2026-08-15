@@ -88,16 +88,24 @@ class EmojiData(
         return result
     }
 
-    /** The index of an emoji in any of its toned forms, or -1. Used to resolve recents. */
-    fun indexOf(value: String): Int {
-        for (index in emoji.indices) {
-            if (emoji[index] == value) return index
-            variants[index]?.let { forms ->
-                if (forms.any { it == value }) return index
+    /**
+     * Every form of every emoji, mapped back to its entry index.
+     *
+     * Built once on first use: [indexOf] is called per cell while the recents grid binds, and a
+     * linear scan over ~2,000 entries and their tone variants per cell is measurable UI-thread
+     * work, while this map is a few tens of kilobytes.
+     */
+    private val indexByForm: Map<String, Int> by lazy {
+        HashMap<String, Int>(emoji.size * 2).also { map ->
+            for (index in emoji.indices) {
+                map.putIfAbsent(emoji[index], index)
+                variants[index]?.forEach { form -> map.putIfAbsent(form, index) }
             }
         }
-        return -1
     }
+
+    /** The index of an emoji in any of its toned forms, or -1. Used to resolve recents. */
+    fun indexOf(value: String): Int = indexByForm[value] ?: -1
 
     /**
      * Category ids are stored one to a byte, so they have to be read back unsigned.

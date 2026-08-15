@@ -89,6 +89,9 @@ object UpdateManager {
     private const val MAX_RELEASE_URL_CHARS = 2 * 1024
     private const val TAG = "SlideUpdates"
 
+    /** Granularity of published download progress. */
+    private const val PROGRESS_PUBLISH_BYTES = 512L * 1024
+
     /** Leave enough room for the download plus Package Installer's separate staging copy. */
     private const val FREE_SPACE_HEADROOM = 64L * 1024 * 1024
 
@@ -114,9 +117,19 @@ object UpdateManager {
      */
     val isDownloading: StateFlow<Boolean> = downloadInProgress.asStateFlow()
 
+    /**
+     * Bytes written by the running download, so a several-hundred-megabyte transfer reads as
+     * moving rather than hung. Zeroed when a new download claims the slot.
+     */
+    private val downloadedBytesFlow = MutableStateFlow(0L)
+    val downloadedBytes: StateFlow<Long> = downloadedBytesFlow.asStateFlow()
+
     /** Claims the single-flight slot, or reports that someone else holds it. */
-    internal fun beginDownload(): Boolean =
-        downloadInProgress.compareAndSet(expect = false, update = true)
+    internal fun beginDownload(): Boolean {
+        val claimed = downloadInProgress.compareAndSet(expect = false, update = true)
+        if (claimed) downloadedBytesFlow.value = 0L
+        return claimed
+    }
 
     internal fun endDownload() {
         downloadInProgress.value = false
@@ -578,6 +591,7 @@ object UpdateManager {
                 partial.outputStream().use { output ->
                     val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
                     var total = 0L
+                    var publishedTotal = 0L
                     while (true) {
                         // The only suspension point in an otherwise straight-line blocking copy.
                         // Without it a canceled download runs to completion in the background; the
@@ -592,7 +606,14 @@ object UpdateManager {
                         output.write(buffer, 0, count)
                         digest.update(buffer, 0, count)
                         total += count
+                        // Published in coarse steps: every emission can recompose the dialog, and
+                        // nobody needs progress at 8 KB granularity.
+                        if (total - publishedTotal >= PROGRESS_PUBLISH_BYTES) {
+                            publishedTotal = total
+                            downloadedBytesFlow.value = total
+                        }
                     }
+                    downloadedBytesFlow.value = total
                     total
                 }
             }

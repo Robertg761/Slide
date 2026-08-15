@@ -150,12 +150,12 @@ A 1:1 inventory of Gboard's feature surface, used as the master checklist for Sl
 
 | # | Feature | Tier | Effort | Notes |
 |---|---|---|---|---|
-| G1 | Toolbar above the keys with feature shortcuts | V1 | M | |
+| G1 | Toolbar above the keys with feature shortcuts | V1 | M | **Built** as Gboard does it: clipboard and text-editing shortcuts share the suggestion strip while it has no candidates. Device pass outstanding. |
 | G2 | Reorderable / customisable toolbar items | V2 | M | |
-| G3 | Clipboard manager (history) | V1 | M | |
-| G4 | Pin clipboard items | V1 | S | |
-| G5 | Clipboard auto-expiry (1h like Gboard) | V1 | S | |
-| G6 | Text editing panel (select/copy/cut/paste, arrows, select-all) | V1 | M | Very popular; low risk. |
+| G3 | Clipboard manager (history) | V1 | M | **Built.** Copies observed while Slide runs; recents stay in memory only, sensitive-flagged clips are never recorded. Device pass outstanding. |
+| G4 | Pin clipboard items | V1 | S | **Built.** Pins persist under the no-backup directory, so clips never ride cloud backup or transfer. |
+| G5 | Clipboard auto-expiry (1h like Gboard) | V1 | S | **Built.** Unpinned items are dropped an hour after they were copied. |
+| G6 | Text editing panel (select/copy/cut/paste, arrows, select-all) | V1 | M | **Built.** Hold-to-repeat arrows, Select mode (Shift-held arrows), Select all, Copy, Cut, Paste, Delete. Device pass outstanding. |
 | G7 | One-handed mode (shift left/right) | V2 | M | |
 | G8 | Floating keyboard (drag anywhere) | V2 | L | |
 | G9 | Resizable keyboard | V2 | M | |

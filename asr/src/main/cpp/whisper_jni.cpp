@@ -337,6 +337,12 @@ Java_com_slide_asr_WhisperNative_transcribe(
             // identical deterministic pass, while noisy audio retains a bounded second chance.
             params.greedy.best_of = 2;
             params.temperature_inc = 0.4F;
+            // audio_ctx deliberately stays at its default (the full 30-second window), although
+            // bounding it to the clip length is the classic short-utterance speedup. Measured
+            // against this exact model and fixture on x86-64, a bounded context misdecodes
+            // "ask not" as "asked not" at every margin up to ~1250 of 1500 positions, and on a
+            // 4-second slice hallucinates a clause outright. The encode-time saving is not worth
+            // transcripts that read wrong.
 
             status = whisper_full(session->ctx, params, audio.data(), audio.count());
         } // Always wipe and discard any JNI float copy before allocating the transcript string.

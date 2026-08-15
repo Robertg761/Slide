@@ -88,6 +88,7 @@ import com.slide.ime.quality.ModelReadiness
 import com.slide.ime.quality.QualityInputMode
 import com.slide.ime.quality.QualityModel
 import com.slide.ime.quality.TypingQualityCollector
+import com.slide.ime.view.ClipboardPanelView
 import com.slide.ime.view.EmojiGlyphs
 import com.slide.ime.view.EmojiPanelView
 import com.slide.ime.view.EnterAction
@@ -96,6 +97,7 @@ import com.slide.ime.view.KeyboardSettingsPanelView
 import com.slide.ime.view.KeyboardView
 import com.slide.ime.view.ShiftState
 import com.slide.ime.view.SuggestionStripView
+import com.slide.ime.view.TextEditPanelView
 import com.slide.ime.view.VoiceOverlayView
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
@@ -122,7 +124,9 @@ class SlideInputMethodService :
     KeyboardSettingsPanelView.Listener,
     EmojiPanelView.Listener,
     VoiceOverlayView.Listener,
-    VoiceInputClient.Listener {
+    VoiceInputClient.Listener,
+    TextEditPanelView.Listener,
+    ClipboardPanelView.Listener {
 
     private lateinit var settingsRepository: SettingsRepository
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -132,21 +136,39 @@ class SlideInputMethodService :
     private var voiceOverlay: VoiceOverlayView? = null
     private var emojiPanel: EmojiPanelView? = null
     private var keyboardSettingsPanel: KeyboardSettingsPanelView? = null
+    private var textEditPanel: TextEditPanelView? = null
+    private var clipboardPanel: ClipboardPanelView? = null
+
+    /**
+     * Created with the service and listening for as long as it lives: history only exists if
+     * copies were observed when they happened. Android already scopes clipboard access to the
+     * active default IME, and [ClipboardHistory] refuses sensitive clips and keeps recents
+     * in memory only.
+     */
+    private val clipboardHistory by lazy { ClipboardHistory(this) }
     private var keyboardFrame: KeyboardFrame? = null
     private var inputRoot: View? = null
     private var settings = KeyboardSettings()
     private var settingsLoaded = false
 
     /**
-     * Connected to the speech process only while the keyboard is on screen.
+     * Connected to the speech process only while the keyboard is on screen, plus a short grace
+     * period after it hides.
      *
-     * Staying bound would keep a process alive — and eventually a few hundred megabytes of model
-     * with it — for as long as Slide is the selected keyboard, which is essentially always.
+     * Staying bound indefinitely would keep a process alive — and eventually a few hundred
+     * megabytes of model with it — for as long as Slide is the selected keyboard, which is
+     * essentially always. But tearing down at the instant the keyboard hides makes the common
+     * switch-field-and-dictate-again flow pay process start plus model load every time. The
+     * [VOICE_UNBIND_GRACE_MS] window keeps the model warm across brief hides and still lets the
+     * memory go when dictation is actually done.
      */
     private val voiceClientDelegate = lazy {
         VoiceInputClient(this).also { it.listener = this }
     }
     private val voiceClient by voiceClientDelegate
+
+    /** Pending delayed release of the speech process; cancelled when the keyboard returns. */
+    private var voiceUnbindJob: Job? = null
 
     /** Which of the three key layers is on screen. */
     private enum class Layer { ALPHA, SYMBOLS, SYMBOLS_ALT }
@@ -352,6 +374,15 @@ class SlideInputMethodService :
     private var gesturePreviewJob: Job? = null
     private var gesturePreviewGeneration = 0L
 
+    /**
+     * The words before the current swipe, resolved once per stroke for the live preview.
+     *
+     * Valid only while [swipePreviewContextGeneration] equals the stroke's preview generation,
+     * which every cancel, completion, and editor transition bumps.
+     */
+    private var swipePreviewContext: PrecedingWord.Context? = null
+    private var swipePreviewContextGeneration = -1L
+
     /** Completed swipes and following edits are chained so off-thread inference cannot reorder input. */
     private val gestureInputQueue = OrderedInputQueue(scope) { editorGeneration }
 
@@ -376,6 +407,7 @@ class SlideInputMethodService :
 
     override fun onCreate() {
         super.onCreate()
+        clipboardHistory.startListening()
         typingQuality.recordModelReadiness(QualityModel.TYPING_SUGGESTER, ModelReadiness.NOT_READY)
         typingQuality.recordModelReadiness(QualityModel.SWIPE_DECODER, ModelReadiness.NOT_READY)
         removeLearnedDeletionListener = userDictionaryStore.addDeletionRequestListener { generation ->
@@ -643,6 +675,16 @@ class SlideInputMethodService :
             settings = this@SlideInputMethodService.settings
             visibility = View.GONE
         }
+        val textEdit = TextEditPanelView(this).apply {
+            listener = this@SlideInputMethodService
+            keyboardTheme = theme
+            visibility = View.GONE
+        }
+        val clipboard = ClipboardPanelView(this).apply {
+            listener = this@SlideInputMethodService
+            keyboardTheme = theme
+            visibility = View.GONE
+        }
 
         suggestionStrip = strip
         keyboardView = view
@@ -650,6 +692,8 @@ class SlideInputMethodService :
         voiceOverlay = overlay
         emojiPanel = emoji
         keyboardSettingsPanel = keyboardSettings
+        textEditPanel = textEdit
+        clipboardPanel = clipboard
         updateGestureAvailability()
 
         // Emoji, voice, and settings sit on top of the keys rather than replacing them, so the
@@ -661,6 +705,8 @@ class SlideInputMethodService :
             addView(emoji, MATCH_PARENT, MATCH_PARENT)
             addView(overlay, MATCH_PARENT, MATCH_PARENT)
             addView(keyboardSettings, MATCH_PARENT, MATCH_PARENT)
+            addView(textEdit, MATCH_PARENT, MATCH_PARENT)
+            addView(clipboard, MATCH_PARENT, MATCH_PARENT)
         }
         keyboardFrame = keys
 
@@ -684,6 +730,8 @@ class SlideInputMethodService :
         selfEdit = false
         cancelVoiceForEditorTransition()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
+        hideTextEditPanel(restoreEditorUi = false)
+        hideClipboardPanel(restoreEditorUi = false)
     }
 
     override fun onFinishInput() {
@@ -694,6 +742,8 @@ class SlideInputMethodService :
         selfEdit = false
         cancelVoiceForEditorTransition()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
+        hideTextEditPanel(restoreEditorUi = false)
+        hideClipboardPanel(restoreEditorUi = false)
         super.onFinishInput()
     }
 
@@ -706,6 +756,8 @@ class SlideInputMethodService :
         selfEdit = false
         cancelVoiceForEditorTransition()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
+        hideTextEditPanel(restoreEditorUi = false)
+        hideClipboardPanel(restoreEditorUi = false)
         exitEmojiSearch(showPicker = false)
         layer = Layer.ALPHA
         hideEmojiPanel()
@@ -763,6 +815,8 @@ class SlideInputMethodService :
         voiceOverlay?.keyboardTheme = theme
         emojiPanel?.keyboardTheme = theme
         keyboardSettingsPanel?.keyboardTheme = theme
+        textEditPanel?.keyboardTheme = theme
+        clipboardPanel?.keyboardTheme = theme
         // The frame's navigation-bar strip and any rounding the window puts around the input view
         // are the two places the keyboard's own colour does not otherwise reach, and both sit right
         // along the bottom edge where a mismatch reads as the keyboard not fitting the screen.
@@ -770,13 +824,21 @@ class SlideInputMethodService :
         inputRoot?.setBackgroundColor(theme.background)
     }
 
+    override fun onWindowShown() {
+        super.onWindowShown()
+        // The keyboard is back before the grace period ran out; keep the speech process and its
+        // loaded model for the next dictation instead of paying the reload.
+        voiceUnbindJob?.cancel()
+        voiceUnbindJob = null
+    }
+
     /**
-     * Releases the speech process whenever the keyboard leaves the screen.
+     * Schedules release of the speech process when the keyboard leaves the screen.
      *
-     * The alternative — staying bound so the next dictation starts instantly — keeps a process
-     * holding the whole model alive for as long as Slide is the selected keyboard, which is
-     * essentially always. Paying a few hundred milliseconds of reload at the start of a dictation,
-     * where the overlay already says "Getting ready", is the better trade.
+     * Unbinding immediately would make every hide-and-return dictation pay process start plus
+     * model load again; never unbinding would keep hundreds of megabytes resident for as long as
+     * Slide is the selected keyboard, which is essentially always. The delay keeps quick returns
+     * instant and still lets the memory go once the user has moved on.
      */
     override fun onWindowHidden() {
         super.onWindowHidden()
@@ -789,7 +851,16 @@ class SlideInputMethodService :
         exitEmojiSearch(showPicker = false)
         hideEmojiPanel()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
-        if (voiceClientDelegate.isInitialized()) voiceClient.unbind()
+        hideTextEditPanel(restoreEditorUi = false)
+        hideClipboardPanel(restoreEditorUi = false)
+        if (voiceClientDelegate.isInitialized()) {
+            voiceUnbindJob?.cancel()
+            voiceUnbindJob = scope.launch {
+                delay(VOICE_UNBIND_GRACE_MS)
+                voiceUnbindJob = null
+                voiceClient.unbind()
+            }
+        }
         voiceCancellationPending = false
         if (learnedPersistence.deletionPending) scheduleLearnedDataDelete()
         saveLearnedWords()
@@ -809,6 +880,8 @@ class SlideInputMethodService :
         gestureUndoState.invalidate()
         cancelVoiceForEditorTransition()
         hideKeyboardSettingsPanel(restoreEditorUi = false)
+        hideTextEditPanel(restoreEditorUi = false)
+        hideClipboardPanel(restoreEditorUi = false)
         literalWordInProgress = false
         abandonComposing()
         selfEdit = false
@@ -831,34 +904,68 @@ class SlideInputMethodService :
         return super.onKeyDown(keyCode, event)
     }
 
+    /** The overlays that can cover or replace the keys, topmost first. */
+    private enum class Panel { VOICE, SETTINGS, TEXT_EDIT, CLIPBOARD, SEARCH, EMOJI }
+
+    /**
+     * The topmost panel over the keys, or null when the plain keyboard is showing.
+     *
+     * Derived from the same view state as the individual `*Shown` predicates, so it can never
+     * disagree with them — and every "is anything covering the keys?" decision goes through it.
+     * A panel added here is automatically part of back handling, gesture gating, and prediction
+     * gating, instead of needing each of those call sites edited in step.
+     */
+    private val activePanel: Panel?
+        get() = when {
+            voiceOverlayShown -> Panel.VOICE
+            keyboardSettingsPanelShown -> Panel.SETTINGS
+            textEditPanelShown -> Panel.TEXT_EDIT
+            clipboardPanelShown -> Panel.CLIPBOARD
+            searchModeShown -> Panel.SEARCH
+            emojiPanelShown -> Panel.EMOJI
+            else -> null
+        }
+
+    private val anyPanelShown: Boolean get() = activePanel != null
+
     /**
      * Closes the topmost panel, reporting whether there was one.
      *
      * Dictation sits above the picker, so it goes first. Backing out of it counts as cancelling
      * rather than finishing: a transcript the user backed away from is not one they asked for.
      */
-    private fun handleBack(): Boolean = when {
-        voiceOverlayShown -> {
+    private fun handleBack(): Boolean = when (activePanel) {
+        Panel.VOICE -> {
             onVoiceDismissed(committed = false)
             true
         }
 
-        keyboardSettingsPanelShown -> {
+        Panel.SETTINGS -> {
             hideKeyboardSettingsPanel(restoreEditorUi = true)
             true
         }
 
-        searchModeShown -> {
+        Panel.TEXT_EDIT -> {
+            hideTextEditPanel(restoreEditorUi = true)
+            true
+        }
+
+        Panel.CLIPBOARD -> {
+            hideClipboardPanel(restoreEditorUi = true)
+            true
+        }
+
+        Panel.SEARCH -> {
             exitEmojiSearch(showPicker = true)
             true
         }
 
-        emojiPanelShown -> {
+        Panel.EMOJI -> {
             hideEmojiPanel()
             true
         }
 
-        else -> false
+        null -> false
     }
 
     /**
@@ -875,12 +982,7 @@ class SlideInputMethodService :
     private var backCallbackRegistered = false
 
     private fun refreshBackCallback() {
-        setBackCallbackRegistered(
-            voiceOverlayShown ||
-                keyboardSettingsPanelShown ||
-                searchModeShown ||
-                emojiPanelShown,
-        )
+        setBackCallbackRegistered(anyPanelShown)
     }
 
     private fun setBackCallbackRegistered(registered: Boolean) {
@@ -915,11 +1017,14 @@ class SlideInputMethodService :
         // from entering after that destruction.
         (gestureDecoder as? AutoCloseable)?.close()
         finalLearnedData?.let(::flushFinalLearnedData)
+        clipboardHistory.stopListening()
         keyboardView = null
         suggestionStrip = null
         voiceOverlay = null
         emojiPanel = null
         keyboardSettingsPanel = null
+        textEditPanel = null
+        clipboardPanel = null
         super.onDestroy()
     }
 
@@ -1058,10 +1163,7 @@ class SlideInputMethodService :
             clearSuggestions()
             return
         }
-        if (
-            searchModeShown || emojiPanelShown || voiceOverlayShown ||
-            keyboardSettingsPanelShown || layer != Layer.ALPHA
-        ) return
+        if (anyPanelShown || layer != Layer.ALPHA) return
 
         // Keep a live preview visible while final inference runs. If this trace never produced a
         // preview, clear older candidates now so they cannot rewrite the wrong swipe.
@@ -1284,10 +1386,7 @@ class SlideInputMethodService :
     private fun gestureModeAvailable(): Boolean =
         settings.gestureTypingEnabled &&
             editorInputPolicy.allowsSuggestions &&
-            !searchModeShown &&
-            !emojiPanelShown &&
-            !voiceOverlayShown &&
-            !keyboardSettingsPanelShown &&
+            !anyPanelShown &&
             layer == Layer.ALPHA
 
     private fun clearGesturePreview() {
@@ -1435,10 +1534,7 @@ class SlideInputMethodService :
 
     override fun onGesturePreview(points: List<GesturePoint>) {
         if (!settings.gestureTypingEnabled || !editorInputPolicy.allowsSuggestions) return
-        if (
-            searchModeShown || emojiPanelShown || voiceOverlayShown ||
-            keyboardSettingsPanelShown || layer != Layer.ALPHA
-        ) return
+        if (anyPanelShown || layer != Layer.ALPHA) return
         if (gestureDecoder == null || currentGestureKeyMap() == null) return
 
         gestureUndoState.invalidate()
@@ -1456,7 +1552,16 @@ class SlideInputMethodService :
                 val decoder = gestureDecoder ?: break
                 val keys = currentGestureKeyMap() ?: break
                 val blockOffensive = settings.blockOffensiveWords
-                val context = precedingContextForSwipe()
+                // One blocking Binder round trip into the editor per stroke, not per tick: the
+                // words before the swipe cannot change while the finger is still down, and the
+                // preview generation is bumped by every path that could make them change (cancel,
+                // completion, editor transitions).
+                val context = swipePreviewContext
+                    .takeIf { swipePreviewContextGeneration == generation }
+                    ?: precedingContextForSwipe().also {
+                        swipePreviewContext = it
+                        swipePreviewContextGeneration = generation
+                    }
                 val candidates = try {
                     withContext(Dispatchers.Default) {
                         gestureDecodeMutex.withLock {
@@ -1798,6 +1903,8 @@ class SlideInputMethodService :
         if (voiceOverlayShown) onVoiceDismissed(committed = false)
         exitEmojiSearch(showPicker = false)
         hideEmojiPanel()
+        hideTextEditPanel(restoreEditorUi = false)
+        hideClipboardPanel(restoreEditorUi = false)
         clearSuggestions()
 
         panel.settings = settings
@@ -1828,6 +1935,245 @@ class SlideInputMethodService :
 
     private val keyboardSettingsPanelShown: Boolean
         get() = keyboardSettingsPanel?.visibility == View.VISIBLE
+
+    // region Text editing and clipboard panels
+
+    private val textEditPanelShown: Boolean
+        get() = textEditPanel?.visibility == View.VISIBLE
+
+    private val clipboardPanelShown: Boolean
+        get() = clipboardPanel?.visibility == View.VISIBLE
+
+    // Queued like the settings and voice shortcuts: a swipe that just ended may still be
+    // decoding, and opening a panel now would gate gesture mode off and silently drop its word.
+    override fun onTextEditRequested() {
+        if (queueBehindGestureInput(::showTextEditPanel)) return
+        showTextEditPanel()
+    }
+
+    override fun onClipboardRequested() {
+        if (queueBehindGestureInput(::showClipboardPanel)) return
+        showClipboardPanel()
+    }
+
+    private fun showTextEditPanel() {
+        val panel = textEditPanel ?: return
+        if (panel.visibility == View.VISIBLE) return
+
+        // Like settings, an interaction mode over the keys: the word in progress settles first so
+        // cursor movement operates on finished text, and rival panels close underneath it.
+        if (composing.isNotEmpty()) {
+            val connection = currentInputConnection ?: return
+            if (!finishComposing(connection).settled) return
+        }
+        if (voiceOverlayShown) onVoiceDismissed(committed = false)
+        exitEmojiSearch(showPicker = false)
+        hideEmojiPanel()
+        hideClipboardPanel(restoreEditorUi = false)
+        hideKeyboardSettingsPanel(restoreEditorUi = false)
+        clearSuggestions()
+
+        panel.reset()
+        panel.visibility = View.VISIBLE
+        suggestionStrip?.voiceEnabled = false
+        suggestionStrip?.setEmptyMessage("Edit text")
+        updateGestureAvailability()
+        refreshBackCallback()
+        panel.announceForAccessibility("Text editing opened")
+    }
+
+    private fun hideTextEditPanel(restoreEditorUi: Boolean) {
+        val panel = textEditPanel ?: return
+        if (panel.visibility != View.VISIBLE) return
+        panel.reset()
+        panel.visibility = View.GONE
+
+        suggestionStrip?.voiceEnabled = voiceAvailableForEditor()
+        clearSuggestions()
+        refreshSuggestionEmptyMessage()
+        updateGestureAvailability()
+        refreshBackCallback()
+        if (restoreEditorUi) {
+            updateShiftFromCursor()
+            updatePredictions()
+            keyboardView?.announceForAccessibility("Text editing closed")
+        }
+    }
+
+    override fun onTextEditDismissed() {
+        hideTextEditPanel(restoreEditorUi = true)
+    }
+
+    override fun onTextEditSelectingChanged(selecting: Boolean) {
+        performHaptic()
+        announce(if (selecting) "Arrows now extend the selection" else "Selection mode off")
+    }
+
+    override fun onTextEditAction(action: TextEditPanelView.Action) {
+        val connection = currentInputConnection ?: return
+        performHaptic()
+        when (action) {
+            TextEditPanelView.Action.Left -> sendCursorKey(connection, KeyEvent.KEYCODE_DPAD_LEFT)
+            TextEditPanelView.Action.Right -> sendCursorKey(connection, KeyEvent.KEYCODE_DPAD_RIGHT)
+            TextEditPanelView.Action.Up -> sendCursorKey(connection, KeyEvent.KEYCODE_DPAD_UP)
+            TextEditPanelView.Action.Down -> sendCursorKey(connection, KeyEvent.KEYCODE_DPAD_DOWN)
+            TextEditPanelView.Action.SelectAll -> {
+                connection.performContextMenuAction(android.R.id.selectAll)
+                announce("Selected all")
+            }
+            TextEditPanelView.Action.Copy -> {
+                connection.performContextMenuAction(android.R.id.copy)
+                announce("Copied")
+            }
+            TextEditPanelView.Action.Cut -> {
+                connection.performContextMenuAction(android.R.id.cut)
+                announce("Cut")
+            }
+            TextEditPanelView.Action.Paste -> {
+                connection.performContextMenuAction(android.R.id.paste)
+                announce("Pasted")
+            }
+            TextEditPanelView.Action.Delete -> {
+                sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+            }
+        }
+    }
+
+    /**
+     * Arrow presses travel as real key events so each editor's own cursor logic applies —
+     * multi-line movement, RTL runs, list widgets. While Select mode is on, Shift is held around
+     * the arrow, which is exactly how a hardware keyboard extends a selection.
+     */
+    private fun sendCursorKey(connection: InputConnection, keyCode: Int) {
+        val selecting = textEditPanel?.selecting == true
+        val now = SystemClock.uptimeMillis()
+        val meta = if (selecting) KeyEvent.META_SHIFT_ON or KeyEvent.META_SHIFT_LEFT_ON else 0
+        if (selecting) {
+            connection.sendKeyEvent(
+                KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_SHIFT_LEFT, 0, meta),
+            )
+        }
+        connection.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0, meta))
+        connection.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0, meta))
+        if (selecting) {
+            connection.sendKeyEvent(
+                KeyEvent(now, now, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_SHIFT_LEFT, 0, 0),
+            )
+        }
+    }
+
+    private fun showClipboardPanel() {
+        val panel = clipboardPanel ?: return
+        if (panel.visibility == View.VISIBLE) return
+
+        if (composing.isNotEmpty()) {
+            val connection = currentInputConnection ?: return
+            if (!finishComposing(connection).settled) return
+        }
+        if (voiceOverlayShown) onVoiceDismissed(committed = false)
+        exitEmojiSearch(showPicker = false)
+        hideEmojiPanel()
+        hideTextEditPanel(restoreEditorUi = false)
+        hideKeyboardSettingsPanel(restoreEditorUi = false)
+        clearSuggestions()
+
+        refreshClipboardPanelItems()
+        panel.visibility = View.VISIBLE
+        suggestionStrip?.voiceEnabled = false
+        suggestionStrip?.setEmptyMessage("Clipboard")
+        updateGestureAvailability()
+        refreshBackCallback()
+        panel.announceForAccessibility("Clipboard opened")
+    }
+
+    private fun hideClipboardPanel(restoreEditorUi: Boolean) {
+        val panel = clipboardPanel ?: return
+        if (panel.visibility != View.VISIBLE) return
+        panel.visibility = View.GONE
+
+        suggestionStrip?.voiceEnabled = voiceAvailableForEditor()
+        clearSuggestions()
+        refreshSuggestionEmptyMessage()
+        updateGestureAvailability()
+        refreshBackCallback()
+        if (restoreEditorUi) {
+            updateShiftFromCursor()
+            updatePredictions()
+            keyboardView?.announceForAccessibility("Clipboard closed")
+        }
+    }
+
+    private fun refreshClipboardPanelItems() {
+        clipboardPanel?.setItems(
+            clipboardHistory.entries().map { ClipboardPanelView.Item(it.text, it.pinned) },
+        )
+    }
+
+    override fun onClipboardDismissed() {
+        hideClipboardPanel(restoreEditorUi = true)
+    }
+
+    override fun onClipboardItemPicked(text: String) {
+        if (queueBehindGestureInput { processClipboardPaste(text) }) return
+        processClipboardPaste(text)
+    }
+
+    /** Mirrors the emoji commit path, which is the other panel that inserts literal text. */
+    private fun processClipboardPaste(text: String) {
+        gestureUndoState.invalidate()
+        performHaptic()
+        val connection = currentInputConnection ?: return
+        val selfEditWasPending = selfEdit
+        selfEdit = true
+        val finish = finishComposing(connection)
+        if (!finish.settled) {
+            selfEdit = SelfEditFallback.afterAttempt(
+                selfEditWasPending,
+                finish.callbackPossible,
+                selfEdit,
+            )
+            return
+        }
+        val committed = if (editorInputPolicy.usesRawKeyEvents) {
+            handleRawText(connection, text)
+        } else {
+            connection.commitText(text, 1)
+        }
+        if (!committed) {
+            selfEdit = SelfEditFallback.afterAttempt(
+                selfEditWasPending,
+                callbackPossible = finish.callbackPossible,
+                fallbackStillArmed = selfEdit,
+            )
+            return
+        }
+        selfEdit = SelfEditFallback.afterAttempt(
+            selfEditWasPending,
+            callbackPossible = true,
+            fallbackStillArmed = selfEdit,
+        )
+        lastAutocorrect = null
+        literalWordInProgress = false
+        hideClipboardPanel(restoreEditorUi = false)
+        updateShiftFromCursor()
+        announce("Pasted")
+    }
+
+    override fun onClipboardItemPinToggled(text: String, pinned: Boolean) {
+        performHaptic()
+        if (pinned) clipboardHistory.pin(text) else clipboardHistory.unpin(text)
+        refreshClipboardPanelItems()
+        announce(if (pinned) "Pinned" else "Unpinned")
+    }
+
+    override fun onClipboardItemDeleted(text: String) {
+        performHaptic()
+        clipboardHistory.remove(text)
+        refreshClipboardPanelItems()
+        announce("Deleted from clipboard history")
+    }
+
+    // endregion
 
     /**
      * Holding a candidate teaches the keyboard a word, or takes one back.
@@ -2187,6 +2533,10 @@ class SlideInputMethodService :
             return
         }
         if (!MicPermissionActivity.hasPermission(this)) {
+            // The user has just signalled intent to dictate, so start the speech process while
+            // the permission dialog is up: its fork and bind overlap the dialog instead of being
+            // paid serially on the second tap. No model is loaded until dictation starts.
+            voiceClient.bind()
             startActivity(MicPermissionActivity.intent(this))
             return
         }
@@ -2267,16 +2617,28 @@ class SlideInputMethodService :
         )
     }
 
-    override fun onVoiceError(reason: String) {
+    override fun onVoiceError(error: VoiceInput.Error) {
         if (voiceCancellationPending) {
             voiceCancellationPending = false
             return
         }
         if (voiceEditorGeneration != editorGeneration) return
         voiceOverlay?.apply {
-            errorText = reason
+            errorText = getString(voiceErrorText(error))
             state = VoiceInput.State.Idle
         }
+    }
+
+    /** The user-facing words for a speech-process error code, owned by the keyboard side. */
+    private fun voiceErrorText(error: VoiceInput.Error): Int = when (error) {
+        VoiceInput.Error.StillClosing -> R.string.voice_error_still_closing
+        VoiceInput.Error.PermissionMissing -> R.string.voice_error_permission
+        VoiceInput.Error.ModelUnavailable -> R.string.voice_error_model
+        VoiceInput.Error.MicUnavailable -> R.string.voice_error_mic_unavailable
+        VoiceInput.Error.MicStopped -> R.string.voice_error_mic_stopped
+        VoiceInput.Error.DecodeFailed -> R.string.voice_error_decode
+        VoiceInput.Error.ServiceUnavailable -> R.string.voice_error_service
+        VoiceInput.Error.ProcessDied -> R.string.voice_error_process_died
     }
 
     /**
@@ -3060,10 +3422,7 @@ class SlideInputMethodService :
             editorInputPolicy.allowsSuggestions &&
             gestureDecoder != null &&
             layer == Layer.ALPHA &&
-            !searchModeShown &&
-            !emojiPanelShown &&
-            !voiceOverlayShown &&
-            !keyboardSettingsPanelShown
+            !anyPanelShown
     }
 
     // endregion
@@ -3304,10 +3663,7 @@ class SlideInputMethodService :
     private fun saveLearnedWords() {
         val ticket = learnedPersistence.beginSave() ?: return
 
-        val words = UserDictionary().also { it.restore(userDictionary.entries()) }
-        val pairs = UserBigrams().also { it.restore(userBigrams.entries()) }
-        val touches = SpatialTouchModel().also { it.restore(spatialTouchModel.entries()) }
-        val gestures = GestureAdaptation().also { it.restore(gestureAdaptation.snapshot()) }
+        val (words, pairs, touches, gestures) = copyLearnedModels()
         scope.launch {
             val result = withContext(Dispatchers.IO) {
                 LEARNED_DATA_IO.withLock {
@@ -3359,14 +3715,30 @@ class SlideInputMethodService :
         val pendingDeleteResolved: Boolean,
     )
 
+    /** Main-thread deep copies of the four learned models, taken for a background write. */
+    private data class LearnedModelCopies(
+        val words: UserDictionary,
+        val pairs: UserBigrams,
+        val touches: SpatialTouchModel,
+        val gestures: GestureAdaptation,
+    )
+
+    /**
+     * The one place the copy ritual lives: a fifth learned model added here is snapshotted by
+     * every save path — ordinary, final, or clear — instead of needing each site edited in step.
+     */
+    private fun copyLearnedModels() = LearnedModelCopies(
+        words = UserDictionary().also { it.restore(userDictionary.entries()) },
+        pairs = UserBigrams().also { it.restore(userBigrams.entries()) },
+        touches = SpatialTouchModel().also { it.restore(spatialTouchModel.entries()) },
+        gestures = GestureAdaptation().also { it.restore(gestureAdaptation.snapshot()) },
+    )
+
     /** Captures only when destruction could otherwise strand a write or a clear. */
     private fun captureFinalLearnedData(): FinalLearnedData? {
         if (!learnedPersistence.needsFinalization) return null
 
-        val words = UserDictionary().also { it.restore(userDictionary.entries()) }
-        val pairs = UserBigrams().also { it.restore(userBigrams.entries()) }
-        val touches = SpatialTouchModel().also { it.restore(spatialTouchModel.entries()) }
-        val gestures = GestureAdaptation().also { it.restore(gestureAdaptation.snapshot()) }
+        val (words, pairs, touches, gestures) = copyLearnedModels()
         return FinalLearnedData(
             words = words,
             pairs = pairs,
@@ -3748,7 +4120,7 @@ class SlideInputMethodService :
     private fun updatePredictions() {
         if (composing.isNotEmpty()) return
         if (!fieldSuggestionsEnabled()) return
-        if (searchModeShown || emojiPanelShown || voiceOverlayShown || keyboardSettingsPanelShown) return
+        if (anyPanelShown) return
 
         val suggester = typingSuggester ?: return
         val context = precedingContextForSwipe()
@@ -3934,7 +4306,7 @@ class SlideInputMethodService :
         if (selectionStart != selectionEnd || selectionStart < 0) return
         if (stripMode != StripMode.Empty) return
         if (!fieldSuggestionsEnabled()) return
-        if (searchModeShown || emojiPanelShown || voiceOverlayShown || keyboardSettingsPanelShown) return
+        if (anyPanelShown) return
 
         val suggester = typingSuggester ?: return
         val keys = currentGestureKeyMap() ?: return
@@ -4110,6 +4482,13 @@ class SlideInputMethodService :
 
     private companion object {
         const val TAG = "SlideIME"
+
+        /**
+         * How long a hidden keyboard keeps the speech process (and its loaded model) alive.
+         * Long enough to cover switching fields or apps mid-thought; short enough that the
+         * memory is returned once dictation is actually over.
+         */
+        const val VOICE_UNBIND_GRACE_MS = 30_000L
         const val DOUBLE_TAP_WINDOW_MS = 300L
         const val DOUBLE_SPACE_WINDOW_MS = 800L
         const val HAPTIC_DURATION_MS = 12L

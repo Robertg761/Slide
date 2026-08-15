@@ -57,6 +57,10 @@ class AsrBuildConfigurationTest {
         assertTrue(bridge.contains("params.greedy.best_of = 2"))
         assertTrue(bridge.contains("params.temperature_inc = 0.4F"))
         assertTrue(bridge.contains("params.flash_attn = true"))
+        // Bounding audio_ctx to the clip length is the classic short-utterance speedup, and it
+        // measurably corrupts transcripts with this model ("ask not" -> "asked not" on the JFK
+        // fixture, hallucinated clauses on short slices). Guard against it coming back.
+        assertTrue("audio_ctx must stay at the full default window", !bridge.contains("params.audio_ctx ="))
     }
 
     @Test

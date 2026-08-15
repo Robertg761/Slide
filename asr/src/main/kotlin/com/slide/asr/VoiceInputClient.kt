@@ -34,7 +34,8 @@ class VoiceInputClient(private val context: Context) {
         /** The finished transcript. Empty when the user said nothing. */
         fun onVoiceResult(text: String)
 
-        fun onVoiceError(reason: String)
+        /** The session ended without a transcript; the code says why, the listener owns the words. */
+        fun onVoiceError(error: VoiceInput.Error)
     }
 
     var listener: Listener? = null
@@ -88,9 +89,7 @@ class VoiceInputClient(private val context: Context) {
 
             VoiceInput.MSG_ERROR -> {
                 if (session.finish(sessionId)) {
-                    listener?.onVoiceError(
-                        message.data.getString(VoiceInput.KEY_REASON) ?: "Voice typing failed",
-                    )
+                    listener?.onVoiceError(VoiceInput.Error.fromOrdinal(message.arg1))
                 }
                 true
             }
@@ -103,7 +102,7 @@ class VoiceInputClient(private val context: Context) {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             if (binder == null) {
                 clearBindingRegistration()
-                reportActiveFailure("Voice typing service could not be started")
+                reportActiveFailure(VoiceInput.Error.ServiceUnavailable)
                 return
             }
             service = Messenger(binder)
@@ -114,19 +113,19 @@ class VoiceInputClient(private val context: Context) {
 
         override fun onServiceDisconnected(name: ComponentName?) {
             service = null
-            reportActiveFailure("Voice typing stopped because the speech process ended")
+            reportActiveFailure(VoiceInput.Error.ProcessDied)
         }
 
         override fun onBindingDied(name: ComponentName?) {
             service = null
             clearBindingRegistration()
-            reportActiveFailure("Voice typing stopped because the speech service became unavailable")
+            reportActiveFailure(VoiceInput.Error.ServiceUnavailable)
         }
 
         override fun onNullBinding(name: ComponentName?) {
             service = null
             clearBindingRegistration()
-            reportActiveFailure("Voice typing service is unavailable")
+            reportActiveFailure(VoiceInput.Error.ServiceUnavailable)
         }
     }
 
@@ -152,7 +151,7 @@ class VoiceInputClient(private val context: Context) {
             // No callback will ever arrive for a refused bind, so nothing else would ever drop the
             // registration: unbind() used to skip it and the connection leaked until process death.
             clearBindingRegistration()
-            reportActiveFailure("Voice typing service could not be started")
+            reportActiveFailure(VoiceInput.Error.ServiceUnavailable)
         }
     }
 
@@ -190,7 +189,7 @@ class VoiceInputClient(private val context: Context) {
         if (sessionId == VoiceInput.NO_SESSION_ID) return
         pendingStart = null
         if (service == null) {
-            reportActiveFailure("Voice typing stopped because the speech service is unavailable")
+            reportActiveFailure(VoiceInput.Error.ServiceUnavailable)
             return
         }
         send(request(VoiceInput.MSG_STOP, sessionId))
@@ -238,14 +237,14 @@ class VoiceInputClient(private val context: Context) {
         } catch (e: RemoteException) {
             Log.w(TAG, "Speech process is gone", e)
             service = null
-            reportActiveFailure("Voice typing stopped because the speech process ended")
+            reportActiveFailure(VoiceInput.Error.ProcessDied)
             false
         }
     }
 
-    private fun reportActiveFailure(reason: String) {
+    private fun reportActiveFailure(error: VoiceInput.Error) {
         pendingStart = null
-        if (session.consumeUnexpectedFailure()) listener?.onVoiceError(reason)
+        if (session.consumeUnexpectedFailure()) listener?.onVoiceError(error)
         // Also acknowledges an expected cancellation whose service died before replying.
         listener?.onVoiceState(VoiceInput.State.Idle)
     }

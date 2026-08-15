@@ -90,10 +90,10 @@ data class DecoderConfig(
  * from "hello" drawn slightly left; shape alone happily matches a word on the wrong side of the
  * keyboard; frequency alone would just return "the" every time.
  *
- * The pruning stage is deliberately allocation-free and reuses its buffers across decodes, since
- * it touches every word in a bucket. Scoring does allocate per surviving candidate; that is only
- * acceptable because pruning cuts the survivors down to a few hundred, and is worth revisiting if
- * profiling on a real device says otherwise.
+ * Both the pruning and the scoring stages are allocation-free and reuse their buffers across
+ * decodes: pruning because it touches every word in a bucket, scoring because it resamples and
+ * normalises a template for every survivor, which used to be the decoder's dominant source of
+ * garbage.
  */
 class GestureDecoder(
     private val lexicon: Lexicon,
@@ -113,6 +113,17 @@ class GestureDecoder(
 
     private val templateX = FloatArray(MAX_WORD_LENGTH)
     private val templateY = FloatArray(MAX_WORD_LENGTH)
+
+    /**
+     * Scratch traces reused across every scored word, guarded by [decode]'s synchronization.
+     *
+     * Scoring resamples and normalises one template per surviving candidate — up to
+     * [DecoderConfig.maxScored] per swipe. Allocating fresh traces each time made that loop the
+     * decoder's dominant source of garbage (four arrays and two objects per word); reusing two
+     * scratch traces removes it entirely.
+     */
+    private val templateTrace = SampledTrace.scratch(config.sampleCount)
+    private val normalizedTemplate = SampledTrace.scratch(config.sampleCount)
 
     private val results = ScoreBoard(config.maxResults)
 
@@ -286,10 +297,11 @@ class GestureDecoder(
         val corners = buildTemplate(wordIndex, length, keys)
         if (corners < 2) return Float.NEGATIVE_INFINITY
 
-        val template = SampledTrace.resample(templateX, templateY, corners, config.sampleCount)
+        SampledTrace.resampleInto(templateX, templateY, corners, templateTrace)
 
-        val location = meanDistance(trace, template)
-        val shape = meanDistance(normalizedTrace, template.normalized())
+        val location = meanDistance(trace, templateTrace)
+        templateTrace.normalizedInto(normalizedTemplate)
+        val shape = meanDistance(normalizedTrace, normalizedTemplate)
 
         val locationSigma = keys.keyWidth * config.locationSigmaFactor
         val locationTerm = -(location * location) / (2f * locationSigma * locationSigma)
@@ -330,10 +342,8 @@ class GestureDecoder(
 
     /** Resolves the preceding word to a lexicon index; -1 when there is nothing to look up. */
     private fun contextIndexFor(previousWord: String?): Int {
-        if ((bigrams == null && trigrams == null) || previousWord.isNullOrEmpty()) return -1
-        val cleaned = previousWord.lowercase().trim('\'')
-        if (cleaned.isEmpty() || !cleaned.all { it in 'a'..'z' || it == '\'' }) return -1
-        return lexicon.indexOf(cleaned)
+        if (bigrams == null && trigrams == null) return -1
+        return lexicon.contextIndexOf(previousWord)
     }
 
     /**

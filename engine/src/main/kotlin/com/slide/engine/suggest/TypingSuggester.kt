@@ -999,10 +999,8 @@ class TypingSuggester(
      * look up and the corrector falls back to spelling alone for that keystroke.
      */
     private fun contextIndexFor(previousWord: String?): Int {
-        if ((bigrams == null && trigrams == null) || previousWord.isNullOrEmpty()) return -1
-        val cleaned = previousWord.lowercase().trim('\'')
-        if (cleaned.isEmpty() || !cleaned.all { it in 'a'..'z' || it == '\'' }) return -1
-        return lexicon.indexOf(cleaned)
+        if (bigrams == null && trigrams == null) return -1
+        return lexicon.contextIndexOf(previousWord)
     }
 
     // endregion

@@ -5,6 +5,7 @@ import android.util.Log
 import androidx.datastore.core.DataMigration
 import androidx.datastore.core.DataStore
 import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
+import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
@@ -37,6 +38,15 @@ import kotlinx.coroutines.sync.withLock
 /** User-facing keyboard preferences. */
 data class KeyboardSettings(
     val themeId: String = Themes.ID_DYNAMIC,
+    /**
+     * Whether an *unresolvable* [themeId] falls back to Dark when the system is dark, rather
+     * than always to Light.
+     *
+     * This is a resilience policy for a corrupt or legacy theme id, not a user preference:
+     * explicit preset selections always win, and Dynamic follows the system on its own.
+     * Deliberately not surfaced in any settings UI — a switch here would read as "follow system
+     * dark mode" while controlling only a fallback almost nobody ever hits.
+     */
     val followSystemDarkMode: Boolean = true,
     val showKeyBorders: Boolean = false,
     val showKeyPreview: Boolean = true,
@@ -221,7 +231,7 @@ private val LEGACY_SETTINGS_MIGRATION_COMPLETE =
     booleanPreferencesKey("legacy_settings_migration_complete")
 
 /** Preferences keys are name-based, so validate the erased value before copying the legacy key. */
-private fun isBackupEligibleSetting(name: String, value: Any): Boolean = when (name) {
+internal fun isBackupEligibleSetting(name: String, value: Any): Boolean = when (name) {
     "theme_id", "voice_model" -> value is String
     "key_height_scale", "bottom_padding_dp", "haptic_strength", "sound_volume" -> value is Float
     "learned_data_clear_epoch" -> value is Long
@@ -494,30 +504,7 @@ class SettingsRepository(private val context: Context) {
     suspend fun update(transform: (KeyboardSettings) -> KeyboardSettings) {
         try {
             context.dataStore.edit { prefs ->
-                val updated = transform(prefs.toSettings())
-                prefs[Keys.THEME_ID] = updated.themeId
-                prefs[Keys.FOLLOW_SYSTEM_DARK] = updated.followSystemDarkMode
-                prefs[Keys.KEY_BORDERS] = updated.showKeyBorders
-                prefs[Keys.KEY_PREVIEW] = updated.showKeyPreview
-                prefs[Keys.NUMBER_ROW] = updated.showNumberRow
-                prefs[Keys.KEY_HEIGHT] = updated.keyHeightScale
-                prefs[Keys.BOTTOM_PADDING] = updated.bottomPaddingDp
-                prefs[Keys.HAPTIC] = updated.hapticEnabled
-                prefs[Keys.HAPTIC_STRENGTH] = updated.hapticStrength
-                prefs[Keys.SOUND] = updated.soundEnabled
-                prefs[Keys.SOUND_VOLUME] = updated.soundVolume
-                prefs[Keys.GESTURE_TYPING] = updated.gestureTypingEnabled
-                prefs[Keys.SUGGESTIONS] = updated.suggestionsEnabled
-                prefs[Keys.AUTOCORRECT] = updated.autocorrectEnabled
-                prefs[Keys.INCOGNITO_MODE] = updated.incognitoModeEnabled
-                prefs[Keys.LEARNED_DATA_CLEAR_EPOCH] = updated.learnedDataClearEpoch
-                prefs[Keys.BLOCK_OFFENSIVE] = updated.blockOffensiveWords
-                prefs[Keys.VOICE_MODEL] = updated.voiceModelId
-                prefs[Keys.AUTO_CAPITALIZE] = updated.autoCapitalize
-                prefs[Keys.DOUBLE_SPACE_PERIOD] = updated.doubleSpacePeriod
-                prefs[Keys.EMOJI_SKIN_TONE] = updated.emojiSkinTone
-                prefs[Keys.UPDATE_CHECKS] = updated.updateChecksEnabled
-                prefs[Keys.INCLUDE_ALPHA_UPDATES] = updated.includeAlphaUpdates
+                prefs.writeKeyboardSettings(transform(prefs.toSettings()))
             }
         } catch (e: IOException) {
             Log.w(TAG, "Could not save the changed settings", e)
@@ -533,62 +520,7 @@ class SettingsRepository(private val context: Context) {
         }
     }
 
-    private fun Preferences.toSettings(): KeyboardSettings {
-        val defaults = KeyboardSettings()
-        return KeyboardSettings(
-            themeId = this[Keys.THEME_ID] ?: defaults.themeId,
-            followSystemDarkMode = this[Keys.FOLLOW_SYSTEM_DARK] ?: defaults.followSystemDarkMode,
-            showKeyBorders = this[Keys.KEY_BORDERS] ?: defaults.showKeyBorders,
-            showKeyPreview = this[Keys.KEY_PREVIEW] ?: defaults.showKeyPreview,
-            showNumberRow = this[Keys.NUMBER_ROW] ?: defaults.showNumberRow,
-            keyHeightScale = this[Keys.KEY_HEIGHT] ?: defaults.keyHeightScale,
-            bottomPaddingDp = this[Keys.BOTTOM_PADDING] ?: defaults.bottomPaddingDp,
-            hapticEnabled = this[Keys.HAPTIC] ?: defaults.hapticEnabled,
-            hapticStrength = this[Keys.HAPTIC_STRENGTH] ?: defaults.hapticStrength,
-            soundEnabled = this[Keys.SOUND] ?: defaults.soundEnabled,
-            soundVolume = this[Keys.SOUND_VOLUME] ?: defaults.soundVolume,
-            gestureTypingEnabled = this[Keys.GESTURE_TYPING] ?: defaults.gestureTypingEnabled,
-            suggestionsEnabled = this[Keys.SUGGESTIONS] ?: defaults.suggestionsEnabled,
-            autocorrectEnabled = this[Keys.AUTOCORRECT] ?: defaults.autocorrectEnabled,
-            incognitoModeEnabled = this[Keys.INCOGNITO_MODE] ?: defaults.incognitoModeEnabled,
-            learnedDataClearEpoch =
-                this[Keys.LEARNED_DATA_CLEAR_EPOCH] ?: defaults.learnedDataClearEpoch,
-            blockOffensiveWords = this[Keys.BLOCK_OFFENSIVE] ?: defaults.blockOffensiveWords,
-            voiceModelId = this[Keys.VOICE_MODEL] ?: defaults.voiceModelId,
-            autoCapitalize = this[Keys.AUTO_CAPITALIZE] ?: defaults.autoCapitalize,
-            doubleSpacePeriod = this[Keys.DOUBLE_SPACE_PERIOD] ?: defaults.doubleSpacePeriod,
-            emojiSkinTone = this[Keys.EMOJI_SKIN_TONE] ?: defaults.emojiSkinTone,
-            updateChecksEnabled = this[Keys.UPDATE_CHECKS] ?: defaults.updateChecksEnabled,
-            includeAlphaUpdates = this[Keys.INCLUDE_ALPHA_UPDATES] ?: defaults.includeAlphaUpdates,
-        )
-    }
-
-    private object Keys {
-        val THEME_ID = stringPreferencesKey("theme_id")
-        val FOLLOW_SYSTEM_DARK = booleanPreferencesKey("follow_system_dark")
-        val KEY_BORDERS = booleanPreferencesKey("key_borders")
-        val KEY_PREVIEW = booleanPreferencesKey("key_preview")
-        val NUMBER_ROW = booleanPreferencesKey("number_row")
-        val KEY_HEIGHT = floatPreferencesKey("key_height_scale")
-        val BOTTOM_PADDING = floatPreferencesKey("bottom_padding_dp")
-        val HAPTIC = booleanPreferencesKey("haptic_enabled")
-        val HAPTIC_STRENGTH = floatPreferencesKey("haptic_strength")
-        val SOUND = booleanPreferencesKey("sound_enabled")
-        val SOUND_VOLUME = floatPreferencesKey("sound_volume")
-        val GESTURE_TYPING = booleanPreferencesKey("gesture_typing")
-        val SUGGESTIONS = booleanPreferencesKey("suggestions_enabled")
-        val AUTOCORRECT = booleanPreferencesKey("autocorrect_enabled")
-        val INCOGNITO_MODE = booleanPreferencesKey("incognito_mode_enabled")
-        val LEARNED_DATA_CLEAR_EPOCH = longPreferencesKey("learned_data_clear_epoch")
-        val BLOCK_OFFENSIVE = booleanPreferencesKey("block_offensive_words")
-        val VOICE_MODEL = stringPreferencesKey("voice_model")
-        val AUTO_CAPITALIZE = booleanPreferencesKey("auto_capitalize")
-        val DOUBLE_SPACE_PERIOD = booleanPreferencesKey("double_space_period")
-        val EMOJI_SKIN_TONE = intPreferencesKey("emoji_skin_tone")
-        val UPDATE_CHECKS = booleanPreferencesKey("update_checks_enabled")
-        val INCLUDE_ALPHA_UPDATES = booleanPreferencesKey("include_alpha_updates")
-        val RECENT_EMOJI = stringPreferencesKey("recent_emoji")
-    }
+    private fun Preferences.toSettings(): KeyboardSettings = toKeyboardSettings()
 
     private companion object {
         const val TAG = "SlideSettings"
@@ -599,4 +531,95 @@ class SettingsRepository(private val context: Context) {
         /** A control character, so it can never appear inside an emoji sequence. */
         const val RECENT_SEPARATOR = "\u001F"
     }
+}
+
+/**
+ * The stored form of every field in [KeyboardSettings].
+ *
+ * [writeKeyboardSettings], [Preferences.toKeyboardSettings], and [isBackupEligibleSetting] must
+ * all know about every field, and they live as file-level functions — rather than inside
+ * [SettingsRepository] — so `KeyboardSettingsTest` can round-trip them directly: a new field
+ * that misses one of the three lists fails a JVM test instead of silently never persisting.
+ */
+private object Keys {
+    val THEME_ID = stringPreferencesKey("theme_id")
+    val FOLLOW_SYSTEM_DARK = booleanPreferencesKey("follow_system_dark")
+    val KEY_BORDERS = booleanPreferencesKey("key_borders")
+    val KEY_PREVIEW = booleanPreferencesKey("key_preview")
+    val NUMBER_ROW = booleanPreferencesKey("number_row")
+    val KEY_HEIGHT = floatPreferencesKey("key_height_scale")
+    val BOTTOM_PADDING = floatPreferencesKey("bottom_padding_dp")
+    val HAPTIC = booleanPreferencesKey("haptic_enabled")
+    val HAPTIC_STRENGTH = floatPreferencesKey("haptic_strength")
+    val SOUND = booleanPreferencesKey("sound_enabled")
+    val SOUND_VOLUME = floatPreferencesKey("sound_volume")
+    val GESTURE_TYPING = booleanPreferencesKey("gesture_typing")
+    val SUGGESTIONS = booleanPreferencesKey("suggestions_enabled")
+    val AUTOCORRECT = booleanPreferencesKey("autocorrect_enabled")
+    val INCOGNITO_MODE = booleanPreferencesKey("incognito_mode_enabled")
+    val LEARNED_DATA_CLEAR_EPOCH = longPreferencesKey("learned_data_clear_epoch")
+    val BLOCK_OFFENSIVE = booleanPreferencesKey("block_offensive_words")
+    val VOICE_MODEL = stringPreferencesKey("voice_model")
+    val AUTO_CAPITALIZE = booleanPreferencesKey("auto_capitalize")
+    val DOUBLE_SPACE_PERIOD = booleanPreferencesKey("double_space_period")
+    val EMOJI_SKIN_TONE = intPreferencesKey("emoji_skin_tone")
+    val UPDATE_CHECKS = booleanPreferencesKey("update_checks_enabled")
+    val INCLUDE_ALPHA_UPDATES = booleanPreferencesKey("include_alpha_updates")
+    val RECENT_EMOJI = stringPreferencesKey("recent_emoji")
+}
+
+internal fun MutablePreferences.writeKeyboardSettings(updated: KeyboardSettings) {
+    this[Keys.THEME_ID] = updated.themeId
+    this[Keys.FOLLOW_SYSTEM_DARK] = updated.followSystemDarkMode
+    this[Keys.KEY_BORDERS] = updated.showKeyBorders
+    this[Keys.KEY_PREVIEW] = updated.showKeyPreview
+    this[Keys.NUMBER_ROW] = updated.showNumberRow
+    this[Keys.KEY_HEIGHT] = updated.keyHeightScale
+    this[Keys.BOTTOM_PADDING] = updated.bottomPaddingDp
+    this[Keys.HAPTIC] = updated.hapticEnabled
+    this[Keys.HAPTIC_STRENGTH] = updated.hapticStrength
+    this[Keys.SOUND] = updated.soundEnabled
+    this[Keys.SOUND_VOLUME] = updated.soundVolume
+    this[Keys.GESTURE_TYPING] = updated.gestureTypingEnabled
+    this[Keys.SUGGESTIONS] = updated.suggestionsEnabled
+    this[Keys.AUTOCORRECT] = updated.autocorrectEnabled
+    this[Keys.INCOGNITO_MODE] = updated.incognitoModeEnabled
+    this[Keys.LEARNED_DATA_CLEAR_EPOCH] = updated.learnedDataClearEpoch
+    this[Keys.BLOCK_OFFENSIVE] = updated.blockOffensiveWords
+    this[Keys.VOICE_MODEL] = updated.voiceModelId
+    this[Keys.AUTO_CAPITALIZE] = updated.autoCapitalize
+    this[Keys.DOUBLE_SPACE_PERIOD] = updated.doubleSpacePeriod
+    this[Keys.EMOJI_SKIN_TONE] = updated.emojiSkinTone
+    this[Keys.UPDATE_CHECKS] = updated.updateChecksEnabled
+    this[Keys.INCLUDE_ALPHA_UPDATES] = updated.includeAlphaUpdates
+}
+
+internal fun Preferences.toKeyboardSettings(): KeyboardSettings {
+    val defaults = KeyboardSettings()
+    return KeyboardSettings(
+        themeId = this[Keys.THEME_ID] ?: defaults.themeId,
+        followSystemDarkMode = this[Keys.FOLLOW_SYSTEM_DARK] ?: defaults.followSystemDarkMode,
+        showKeyBorders = this[Keys.KEY_BORDERS] ?: defaults.showKeyBorders,
+        showKeyPreview = this[Keys.KEY_PREVIEW] ?: defaults.showKeyPreview,
+        showNumberRow = this[Keys.NUMBER_ROW] ?: defaults.showNumberRow,
+        keyHeightScale = this[Keys.KEY_HEIGHT] ?: defaults.keyHeightScale,
+        bottomPaddingDp = this[Keys.BOTTOM_PADDING] ?: defaults.bottomPaddingDp,
+        hapticEnabled = this[Keys.HAPTIC] ?: defaults.hapticEnabled,
+        hapticStrength = this[Keys.HAPTIC_STRENGTH] ?: defaults.hapticStrength,
+        soundEnabled = this[Keys.SOUND] ?: defaults.soundEnabled,
+        soundVolume = this[Keys.SOUND_VOLUME] ?: defaults.soundVolume,
+        gestureTypingEnabled = this[Keys.GESTURE_TYPING] ?: defaults.gestureTypingEnabled,
+        suggestionsEnabled = this[Keys.SUGGESTIONS] ?: defaults.suggestionsEnabled,
+        autocorrectEnabled = this[Keys.AUTOCORRECT] ?: defaults.autocorrectEnabled,
+        incognitoModeEnabled = this[Keys.INCOGNITO_MODE] ?: defaults.incognitoModeEnabled,
+        learnedDataClearEpoch =
+            this[Keys.LEARNED_DATA_CLEAR_EPOCH] ?: defaults.learnedDataClearEpoch,
+        blockOffensiveWords = this[Keys.BLOCK_OFFENSIVE] ?: defaults.blockOffensiveWords,
+        voiceModelId = this[Keys.VOICE_MODEL] ?: defaults.voiceModelId,
+        autoCapitalize = this[Keys.AUTO_CAPITALIZE] ?: defaults.autoCapitalize,
+        doubleSpacePeriod = this[Keys.DOUBLE_SPACE_PERIOD] ?: defaults.doubleSpacePeriod,
+        emojiSkinTone = this[Keys.EMOJI_SKIN_TONE] ?: defaults.emojiSkinTone,
+        updateChecksEnabled = this[Keys.UPDATE_CHECKS] ?: defaults.updateChecksEnabled,
+        includeAlphaUpdates = this[Keys.INCLUDE_ALPHA_UPDATES] ?: defaults.includeAlphaUpdates,
+    )
 }

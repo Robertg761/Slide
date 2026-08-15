@@ -2,4 +2,13 @@
 <resources>
     <string name="ime_name">Slide</string>
     <string name="subtype_en">English (US)</string>
+    <string name="mic_permission_denied_permanently">Voice typing needs the microphone. Allow the Microphone permission for Slide in Settings.</string>
+    <string name="voice_error_still_closing">Voice typing is still closing</string>
+    <string name="voice_error_permission">Microphone permission is needed for voice typing</string>
+    <string name="voice_error_model">The speech model could not be loaded</string>
+    <string name="voice_error_mic_unavailable">The microphone is not available</string>
+    <string name="voice_error_mic_stopped">The microphone stopped unexpectedly</string>
+    <string name="voice_error_decode">Speech recognition failed</string>
+    <string name="voice_error_service">Voice typing is unavailable right now</string>
+    <string name="voice_error_process_died">Voice typing stopped because the speech process ended</string>
 </resources>

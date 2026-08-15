@@ -84,18 +84,8 @@ internal class CtcSwipeBeamSearch(
             }
         }
 
-        val contextIndex = previousWord
-            ?.lowercase()
-            ?.trim('\'')
-            ?.takeIf { it.all { char -> char in 'a'..'z' || char == '\'' } }
-            ?.let(lexicon::indexOf)
-            ?: -1
-        val olderContextIndex = previousPreviousWord
-            ?.lowercase()
-            ?.trim('\'')
-            ?.takeIf { it.all { char -> char in 'a'..'z' || char == '\'' } }
-            ?.let(lexicon::indexOf)
-            ?: -1
+        val contextIndex = lexicon.contextIndexOf(previousWord)
+        val olderContextIndex = lexicon.contextIndexOf(previousPreviousWord)
         val board = ResultBoard(maxResults)
         for (slot in 0 until beamSize) {
             val node = beamNodes[slot]
