@@ -20,11 +20,12 @@
 
 ### Changed
 
-- Short dictations no longer pay Whisper's full 30-second encoder window: the encoder context is
-  bounded to the clip length plus a safety margin, with a floor that protects accuracy on very
-  short clips. Model load and decode also moved to a dedicated thread, and the speech process now
-  survives the keyboard hiding for a 30-second grace period, so switching fields mid-thought no
-  longer pays process start plus model reload.
+- Whisper's model load and decode moved to a dedicated thread instead of blocking a shared
+  worker pool, and the speech process now survives the keyboard hiding for a 30-second grace
+  period, so switching fields mid-thought no longer pays process start plus model reload. The
+  classic short-utterance speedup of bounding the encoder context to the clip length was tried,
+  measured against the packaged model, and rejected: it corrupts transcripts ("ask not" decoding
+  as "asked not", hallucinated clauses on short clips), and a source guard now keeps it out.
 - A microphone permission denied with "don't ask again" now routes to the app's system settings
   page with an explanatory toast instead of the mic key silently doing nothing forever. Voice
   errors cross the process boundary as codes and are worded on the keyboard side from string

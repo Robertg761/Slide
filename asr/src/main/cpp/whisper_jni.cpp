@@ -55,15 +55,6 @@ struct CancellationToken {
     std::atomic<bool> cancelled{false};
 };
 
-// One encoder position covers 20 ms of 16 kHz input: two 10 ms mel frames per position.
-constexpr int SAMPLES_PER_AUDIO_POSITION = 320;
-// Slack past the end of the clip, ~2.5 s, so trimming or endpointing jitter never squeezes real
-// speech against the edge of the encoder's context.
-constexpr int AUDIO_CTX_MARGIN = 128;
-// Never decode with less than ~5 s of encoder context; below this the positional embeddings are
-// far enough from training conditions to cost accuracy on short clips.
-constexpr int MIN_AUDIO_CTX = 256;
-
 /** JNI allocation helpers leave a pending Java exception when they return null. */
 void clear_pending_java_exception(JNIEnv *env, const char *operation) {
     if (env->ExceptionCheck()) {
@@ -346,17 +337,12 @@ Java_com_slide_asr_WhisperNative_transcribe(
             // identical deterministic pass, while noisy audio retains a bounded second chance.
             params.greedy.best_of = 2;
             params.temperature_inc = 0.4F;
-            // Left at its default, the encoder attends over its entire 30-second window (1500
-            // positions for this model family) no matter how short the clip is, so a 3-second
-            // dictation pays a 30-second encode. Bound the context to the audio actually
-            // present plus a safety margin; the floor keeps very short clips from decoding with
-            // so little positional context that accuracy suffers.
-            const int positions = static_cast<int>(
-                    (static_cast<jlong>(audio.count()) + SAMPLES_PER_AUDIO_POSITION - 1) /
-                    SAMPLES_PER_AUDIO_POSITION);
-            params.audio_ctx = std::min(
-                    whisper_n_audio_ctx(session->ctx),
-                    std::max(MIN_AUDIO_CTX, positions + AUDIO_CTX_MARGIN));
+            // audio_ctx deliberately stays at its default (the full 30-second window), although
+            // bounding it to the clip length is the classic short-utterance speedup. Measured
+            // against this exact model and fixture on x86-64, a bounded context misdecodes
+            // "ask not" as "asked not" at every margin up to ~1250 of 1500 positions, and on a
+            // 4-second slice hallucinates a clause outright. The encode-time saving is not worth
+            // transcripts that read wrong.
 
             status = whisper_full(session->ctx, params, audio.data(), audio.count());
         } // Always wipe and discard any JNI float copy before allocating the transcript string.

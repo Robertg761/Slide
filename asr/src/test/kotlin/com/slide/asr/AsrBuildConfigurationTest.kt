@@ -57,11 +57,10 @@ class AsrBuildConfigurationTest {
         assertTrue(bridge.contains("params.greedy.best_of = 2"))
         assertTrue(bridge.contains("params.temperature_inc = 0.4F"))
         assertTrue(bridge.contains("params.flash_attn = true"))
-        // Short clips must not pay the encoder's full 30-second window, and the bound must keep
-        // both its accuracy floor and its clip-length margin.
-        assertTrue(bridge.contains("params.audio_ctx = std::min("))
-        assertTrue(bridge.contains("whisper_n_audio_ctx(session->ctx)"))
-        assertTrue(bridge.contains("std::max(MIN_AUDIO_CTX, positions + AUDIO_CTX_MARGIN)"))
+        // Bounding audio_ctx to the clip length is the classic short-utterance speedup, and it
+        // measurably corrupts transcripts with this model ("ask not" -> "asked not" on the JFK
+        // fixture, hallucinated clauses on short slices). Guard against it coming back.
+        assertTrue("audio_ctx must stay at the full default window", !bridge.contains("params.audio_ctx ="))
     }
 
     @Test
