@@ -454,7 +454,7 @@ private fun SetupScreen(repository: SettingsRepository) {
                     }
                     if (settings.updateChecksEnabled) {
                         SettingSwitch("Include prereleases", settings.includeAlphaUpdates) { value -> scope.launch { repository.update { it.copy(includeAlphaUpdates = value) } } }
-                        Button(onClick = { scope.launch { runCatchingCancellable { UpdateManager.check(context, settings.includeAlphaUpdates) }.onSuccess { availableUpdate = it; updateMessage = if (it == null) "You already have the newest selected release." else null }.onFailure { updateMessage = "Could not check for updates: ${it.message ?: "network error"}" } } }) { Text("Check now") }
+                        Button(onClick = { scope.launch { runCatchingCancellable { UpdateManager.check(context, settings.includeAlphaUpdates) }.onSuccess { availableUpdate = it; autoCheckFailed = false; updateMessage = if (it == null) "You already have the newest selected release." else null }.onFailure { updateMessage = "Could not check for updates: ${it.message ?: "network error"}" } } }) { Text("Check now") }
                     }
                 }
             }

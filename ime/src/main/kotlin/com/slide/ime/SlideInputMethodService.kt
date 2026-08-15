@@ -1944,11 +1944,15 @@ class SlideInputMethodService :
     private val clipboardPanelShown: Boolean
         get() = clipboardPanel?.visibility == View.VISIBLE
 
+    // Queued like the settings and voice shortcuts: a swipe that just ended may still be
+    // decoding, and opening a panel now would gate gesture mode off and silently drop its word.
     override fun onTextEditRequested() {
+        if (queueBehindGestureInput(::showTextEditPanel)) return
         showTextEditPanel()
     }
 
     override fun onClipboardRequested() {
+        if (queueBehindGestureInput(::showClipboardPanel)) return
         showClipboardPanel()
     }
 
