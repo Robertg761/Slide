@@ -20,6 +20,7 @@ import com.slide.core.theme.KeyboardTheme
 import com.slide.core.theme.Themes
 import kotlin.math.PI
 import kotlin.math.cos
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
 
@@ -33,7 +34,9 @@ import kotlin.math.sin
  *
  * The microphone stays visually anchored through every state. Speech drives the surrounding bars
  * while listening; model loading and inference use a rotating arc, so the panel never appears
- * frozen while it is doing work.
+ * frozen while it is doing work. A Done/Cancel pair sits where the space bar would be — tapping
+ * anywhere else on the panel still finishes, but the buttons make both exits discoverable — and a
+ * timer next to the status line shows the microphone has been live exactly as long as expected.
  */
 class VoiceOverlayView(context: Context) : View(context) {
 
@@ -52,6 +55,10 @@ class VoiceOverlayView(context: Context) : View(context) {
 
     var state: VoiceInput.State = VoiceInput.State.Idle
         set(value) {
+            if (value == VoiceInput.State.Listening && field != VoiceInput.State.Listening) {
+                listeningSinceMs = AnimationUtils.currentAnimationTimeMillis()
+                timerSecondCache = -1L
+            }
             field = value
             if (value != VoiceInput.State.Listening) levelDynamics.reset()
             syncAnimation()
@@ -91,9 +98,16 @@ class VoiceOverlayView(context: Context) : View(context) {
     }
     private val arcBounds = RectF()
 
+    private enum class ActionButton { CANCEL, DONE }
+
     private var cancelBounds = floatArrayOf(0f, 0f, 0f, 0f)
-    private var pressedCancel = false
-    private var pressStartedOnCancel = false
+    private var doneBounds = floatArrayOf(0f, 0f, 0f, 0f)
+
+    /** The button the press landed on, or null when it started on the open panel. */
+    private var pressStartedOn: ActionButton? = null
+
+    /** The button drawn pressed; cleared for good once the finger slides off it. */
+    private var pressedButton: ActionButton? = null
 
     /**
      * The finger that started the press, and the only one whose lift ends the dictation.
@@ -104,31 +118,48 @@ class VoiceOverlayView(context: Context) : View(context) {
     private var pressPointerId: Int? = null
 
     private val accessibilityHelper = object : ExploreByTouchHelper(this) {
-        override fun getVirtualViewAt(x: Float, y: Float): Int =
-            if (isInCancel(x, y)) A11Y_CANCEL else A11Y_MAIN
+        override fun getVirtualViewAt(x: Float, y: Float): Int = when (buttonAt(x, y)) {
+            ActionButton.CANCEL -> A11Y_CANCEL
+            ActionButton.DONE -> A11Y_DONE
+            null -> A11Y_MAIN
+        }
 
         override fun getVisibleVirtualViews(virtualViewIds: MutableList<Int>) {
             virtualViewIds += A11Y_MAIN
             virtualViewIds += A11Y_CANCEL
+            virtualViewIds += A11Y_DONE
         }
 
         override fun onPopulateNodeForVirtualView(
             virtualViewId: Int,
             node: AccessibilityNodeInfoCompat,
         ) {
-            if (virtualViewId == A11Y_CANCEL) {
-                updateCancelBounds()
+            if (virtualViewId == A11Y_CANCEL || virtualViewId == A11Y_DONE) {
+                updateButtonBounds()
+                val bounds = if (virtualViewId == A11Y_CANCEL) cancelBounds else doneBounds
                 node.className = "android.widget.Button"
-                node.contentDescription = "Cancel voice typing"
-                node.isClickable = true
-                node.addAction(AccessibilityNodeInfoCompat.ACTION_CLICK)
+                if (virtualViewId == A11Y_CANCEL) {
+                    node.contentDescription = "Cancel voice typing"
+                    node.isClickable = true
+                    node.addAction(AccessibilityNodeInfoCompat.ACTION_CLICK)
+                } else {
+                    val actionable = doneActionable()
+                    node.contentDescription = when (state) {
+                        VoiceInput.State.Listening -> "Done. Finish voice typing"
+                        VoiceInput.State.Idle -> "Done. Close voice typing"
+                        else -> "Done"
+                    }
+                    node.isEnabled = actionable
+                    node.isClickable = actionable
+                    if (actionable) node.addAction(AccessibilityNodeInfoCompat.ACTION_CLICK)
+                }
                 node.setBoundsInParent(
-                    Rect(cancelBounds[0].toInt(), cancelBounds[1].toInt(), cancelBounds[2].toInt(), cancelBounds[3].toInt()),
+                    Rect(bounds[0].toInt(), bounds[1].toInt(), bounds[2].toInt(), bounds[3].toInt()),
                 )
                 return
             }
 
-            val actionable = state == VoiceInput.State.Listening || state == VoiceInput.State.Idle
+            val actionable = doneActionable()
             node.className = if (actionable) "android.widget.Button" else "android.widget.TextView"
             node.contentDescription = when (state) {
                 VoiceInput.State.Listening -> "Finish voice typing. ${statusText()}"
@@ -182,6 +213,11 @@ class VoiceOverlayView(context: Context) : View(context) {
      */
     private var animationStartMs = 0L
     private var previousFrameMs = 0L
+
+    /** When the microphone actually opened; drives the recording timer, not the wave. */
+    private var listeningSinceMs = 0L
+    private var timerSecondCache = -1L
+    private var timerTextCache = ""
 
     private val frame = object : Runnable {
         override fun run() {
@@ -284,67 +320,132 @@ class VoiceOverlayView(context: Context) : View(context) {
         textPaint.typeface = Typeface.DEFAULT
         // Placed off the circle's edge whether or not the circle is what is drawn, so that swapping
         // between the mic and the wave does not move the text.
-        canvas.drawText(statusText(), centerX, centerY + baseRadius + dp(36f), textPaint)
+        val statusLine = if (state == VoiceInput.State.Listening && errorText == null) {
+            "${statusText()} · ${recordingTimerText()}"
+        } else {
+            statusText()
+        }
+        canvas.drawText(statusLine, centerX, centerY + baseRadius + dp(36f), textPaint)
 
-        drawCancel(canvas)
+        drawActionButtons(canvas)
     }
 
-    private fun drawCancel(canvas: Canvas) {
-        val label = "Cancel"
-        textPaint.textSize = sp(14f)
-        textPaint.color = keyboardTheme.suggestionText
-
-        updateCancelBounds()
-        val centerX = width / 2f
-        val centerY = height * CANCEL_CENTRE_FRACTION
-        val halfHeight = dp(18f)
-
-        fillPaint.color = keyboardTheme.specialKeyBackground
-        fillPaint.alpha = 255
-        if (pressedCancel) {
-            fillPaint.color = keyboardTheme.keyPressedOverlay
+    /** The elapsed listening time as `m:ss`, rebuilt only when the second ticks over. */
+    private fun recordingTimerText(): String {
+        val seconds =
+            ((AnimationUtils.currentAnimationTimeMillis() - listeningSinceMs) / 1000L)
+                .coerceAtLeast(0L)
+        if (seconds != timerSecondCache) {
+            timerSecondCache = seconds
+            timerTextCache = "${seconds / 60}:${(seconds % 60).toString().padStart(2, '0')}"
         }
-        canvas.drawRoundRect(
-            cancelBounds[0], cancelBounds[1], cancelBounds[2], cancelBounds[3],
-            halfHeight, halfHeight, fillPaint,
-        )
+        return timerTextCache
+    }
 
+    private fun drawActionButtons(canvas: Canvas) {
+        updateButtonBounds()
+        textPaint.textSize = sp(14f)
+
+        drawPill(
+            canvas,
+            cancelBounds,
+            CANCEL_LABEL,
+            fill = keyboardTheme.specialKeyBackground,
+            labelColor = keyboardTheme.suggestionText,
+            pressed = pressedButton == ActionButton.CANCEL,
+            enabled = true,
+        )
+        drawPill(
+            canvas,
+            doneBounds,
+            DONE_LABEL,
+            fill = keyboardTheme.accentBackground,
+            labelColor = keyboardTheme.accentText,
+            pressed = pressedButton == ActionButton.DONE,
+            // While transcribing or preparing there is nothing to finish yet; the dimmed button
+            // says so without moving the layout underneath the user's thumb.
+            enabled = doneActionable(),
+        )
+    }
+
+    private fun drawPill(
+        canvas: Canvas,
+        bounds: FloatArray,
+        label: String,
+        fill: Int,
+        labelColor: Int,
+        pressed: Boolean,
+        enabled: Boolean,
+    ) {
+        val cornerRadius = (bounds[3] - bounds[1]) / 2f
+        fillPaint.color = fill
+        fillPaint.alpha = if (enabled) 255 else 110
+        canvas.drawRoundRect(
+            bounds[0], bounds[1], bounds[2], bounds[3],
+            cornerRadius, cornerRadius, fillPaint,
+        )
+        if (pressed && enabled) {
+            fillPaint.color = keyboardTheme.keyPressedOverlay
+            canvas.drawRoundRect(
+                bounds[0], bounds[1], bounds[2], bounds[3],
+                cornerRadius, cornerRadius, fillPaint,
+            )
+        }
+
+        textPaint.color = labelColor
+        textPaint.alpha = if (enabled) 255 else 140
         textPaint.getFontMetrics(reusableFontMetrics)
         canvas.drawText(
             label,
-            centerX,
-            centerY - (reusableFontMetrics.ascent + reusableFontMetrics.descent) / 2f,
+            (bounds[0] + bounds[2]) / 2f,
+            (bounds[1] + bounds[3]) / 2f -
+                (reusableFontMetrics.ascent + reusableFontMetrics.descent) / 2f,
             textPaint,
         )
+        textPaint.alpha = 255
     }
 
-    private fun updateCancelBounds() {
+    /** Whether Done (and a tap on the open panel) currently does anything. */
+    private fun doneActionable(): Boolean =
+        state == VoiceInput.State.Listening || state == VoiceInput.State.Idle
+
+    private fun updateButtonBounds() {
         textPaint.textSize = sp(14f)
-        val halfWidth = textPaint.measureText("Cancel") / 2f + dp(18f)
+        // Both pills take the wider label's width so the pair reads as one balanced control.
+        val halfWidth =
+            max(textPaint.measureText(CANCEL_LABEL), textPaint.measureText(DONE_LABEL)) / 2f +
+                dp(22f)
+        val halfGap = dp(7f)
         val centerX = width / 2f
-        val centerY = height * CANCEL_CENTRE_FRACTION
-        val halfHeight = dp(18f)
+        val centerY = height * ACTIONS_CENTRE_FRACTION
+        val halfHeight = dp(19f)
         cancelBounds = floatArrayOf(
-            centerX - halfWidth,
+            centerX - halfGap - halfWidth * 2f,
             centerY - halfHeight,
-            centerX + halfWidth,
+            centerX - halfGap,
+            centerY + halfHeight,
+        )
+        doneBounds = floatArrayOf(
+            centerX + halfGap,
+            centerY - halfHeight,
+            centerX + halfGap + halfWidth * 2f,
             centerY + halfHeight,
         )
     }
 
     private fun statusText(): String = errorText ?: when (state) {
         VoiceInput.State.Preparing -> "Loading offline speech…"
-        VoiceInput.State.Listening -> "Listening offline · tap when you're done"
+        VoiceInput.State.Listening -> "Listening offline"
         VoiceInput.State.Transcribing -> "Transcribing on device…"
-        VoiceInput.State.Idle -> "Tap to close"
+        VoiceInput.State.Idle -> "Tap Done to close"
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 pressPointerId = event.getPointerId(0)
-                pressedCancel = isInCancel(event.x, event.y)
-                pressStartedOnCancel = pressedCancel
+                pressStartedOn = buttonAt(event.x, event.y)
+                pressedButton = pressStartedOn
                 invalidate()
                 return true
             }
@@ -352,8 +453,11 @@ class VoiceOverlayView(context: Context) : View(context) {
             MotionEvent.ACTION_MOVE -> {
                 val index = pressPointerId?.let(event::findPointerIndex) ?: return true
                 if (index < 0) return true
-                if (pressedCancel && !isInCancel(event.getX(index), event.getY(index))) {
-                    pressedCancel = false
+                if (
+                    pressedButton != null &&
+                    buttonAt(event.getX(index), event.getY(index)) != pressedButton
+                ) {
+                    pressedButton = null
                     invalidate()
                 }
                 return true
@@ -382,20 +486,29 @@ class VoiceOverlayView(context: Context) : View(context) {
         // Null once the deciding finger has already left through ACTION_POINTER_UP: whatever is
         // lifting now is a bystander, and a bystander does not finish the dictation.
         val owned = pressPointerId != null && event.getPointerId(index) == pressPointerId
-        val cancelled = owned && pressStartedOnCancel && pressedCancel &&
-            isInCancel(event.getX(index), event.getY(index))
-        val mainActivated = owned && !pressStartedOnCancel
+        val liftedOn = buttonAt(event.getX(index), event.getY(index))
+        // A press that started on a button only fires if it never slid off and lifts on the same
+        // button; one that slid away is abandoned rather than treated as a panel tap.
+        val activatedButton = pressStartedOn
+            ?.takeIf { owned && pressedButton == it && liftedOn == it }
+        val mainActivated = owned && pressStartedOn == null
         clearPress()
 
-        // Tapping anywhere else finishes the dictation. While transcribing there is nothing to
-        // finish, so only Cancel does anything.
-        if (cancelled) {
+        // Tapping anywhere outside the buttons finishes the dictation, exactly as Done does.
+        // While transcribing there is nothing to finish, so only Cancel does anything.
+        if (activatedButton == ActionButton.CANCEL) {
             announceForAccessibility("Cancel voice typing")
             listener?.onVoiceDismissed(committed = false)
-        } else if (mainActivated && state == VoiceInput.State.Listening) {
+        } else if (
+            (activatedButton == ActionButton.DONE || mainActivated) &&
+            state == VoiceInput.State.Listening
+        ) {
             announceForAccessibility("Finish voice typing")
             listener?.onVoiceDismissed(committed = true)
-        } else if (mainActivated && state == VoiceInput.State.Idle) {
+        } else if (
+            (activatedButton == ActionButton.DONE || mainActivated) &&
+            state == VoiceInput.State.Idle
+        ) {
             announceForAccessibility("Close voice typing")
             listener?.onVoiceDismissed(committed = false)
         }
@@ -404,16 +517,21 @@ class VoiceOverlayView(context: Context) : View(context) {
 
     private fun clearPress() {
         pressPointerId = null
-        pressedCancel = false
-        pressStartedOnCancel = false
+        pressStartedOn = null
+        pressedButton = null
         invalidate()
     }
 
-    private fun isInCancel(x: Float, y: Float): Boolean =
-        run {
-            updateCancelBounds()
-            x in cancelBounds[0]..cancelBounds[2] && y in cancelBounds[1]..cancelBounds[3]
+    private fun buttonAt(x: Float, y: Float): ActionButton? {
+        updateButtonBounds()
+        return when {
+            x in cancelBounds[0]..cancelBounds[2] && y in cancelBounds[1]..cancelBounds[3] ->
+                ActionButton.CANCEL
+            x in doneBounds[0]..doneBounds[2] && y in doneBounds[1]..doneBounds[3] ->
+                ActionButton.DONE
+            else -> null
         }
+    }
 
     override fun onInitializeAccessibilityNodeInfo(info: AccessibilityNodeInfo) {
         super.onInitializeAccessibilityNodeInfo(info)
@@ -440,14 +558,19 @@ class VoiceOverlayView(context: Context) : View(context) {
     }
 
     private fun accessibilityDescription(): String =
-        "Voice typing. ${statusText()}. Cancel button. Tap the microphone area to finish when listening"
+        "Voice typing. ${statusText()}. Done and Cancel buttons. " +
+            "Tap the microphone area or Done to finish when listening"
 
     private companion object {
         const val MIC_CENTRE_FRACTION = 0.38f
         const val MIC_RADIUS_FRACTION = 0.16f
-        const val CANCEL_CENTRE_FRACTION = 0.82f
+        const val ACTIONS_CENTRE_FRACTION = 0.82f
         const val A11Y_MAIN = 0
         const val A11Y_CANCEL = 1
+        const val A11Y_DONE = 2
+
+        const val CANCEL_LABEL = "Cancel"
+        const val DONE_LABEL = "Done"
 
         const val BAR_COUNT = 11
         const val BAR_SPAN = 3.15f

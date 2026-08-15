@@ -42,9 +42,14 @@ class SymbolLayersTest {
         val first = keysOf(Layouts.SymbolsEn).map { it.outputText }
         val second = keysOf(Layouts.SymbolsAltEn).map { it.outputText }
 
-        for (character in listOf("=", "/", "\\", "<", ">", "[", "]", "{", "}", "|", "^")) {
+        for (character in listOf("=", "\\", "<", ">", "[", "]", "{", "}", "|", "^", "%", "✓")) {
             assertTrue("$character is not reachable", character in second)
             assertTrue("$character duplicates page one", character !in first)
+        }
+        // Gboard parity: the slash and low line earn first-page spots instead.
+        for (character in listOf("/", "_")) {
+            assertTrue("$character is not on page one", character in first)
+            assertTrue("$character duplicates page two", character !in second)
         }
     }
 

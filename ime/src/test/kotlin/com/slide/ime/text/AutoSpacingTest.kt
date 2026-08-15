@@ -44,4 +44,28 @@ class AutoSpacingTest {
         assertFalse(AutoSpacing.beforeWord("version2", continuingTypedWord = true))
         assertTrue(AutoSpacing.beforeWord("hello"))
     }
+
+    @Test
+    fun `typing straight after a swiped word starts a new word with a space`() {
+        assertTrue(AutoSpacing.beforeTypedWord("hello", swipedWordBehindCursor = "hello"))
+        // Mid-sentence swipes commit their own leading space; the record includes it.
+        assertTrue(AutoSpacing.beforeTypedWord("hi hello", swipedWordBehindCursor = " hello"))
+    }
+
+    @Test
+    fun `a swipe record that no longer matches the editor text continues the word instead`() {
+        // The user edited after the swipe (deleted a letter): back to extending the word.
+        assertFalse(AutoSpacing.beforeTypedWord("hell", swipedWordBehindCursor = "hello"))
+        assertFalse(AutoSpacing.beforeTypedWord("hello"))
+        assertFalse(AutoSpacing.beforeTypedWord("hello", swipedWordBehindCursor = null))
+    }
+
+    @Test
+    fun `typed contractions and fresh separators are unaffected by a swipe record`() {
+        assertFalse(AutoSpacing.beforeTypedWord("don'", swipedWordBehindCursor = "world"))
+        assertFalse(AutoSpacing.beforeTypedWord("hello ", swipedWordBehindCursor = "hello"))
+        assertTrue(AutoSpacing.beforeTypedWord("hello,"))
+        assertFalse(AutoSpacing.beforeTypedWord("hello, "))
+        assertFalse(AutoSpacing.beforeTypedWord(null, swipedWordBehindCursor = "hello"))
+    }
 }

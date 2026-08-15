@@ -1060,7 +1060,18 @@ class SlideInputMethodService :
         touchY: Float,
         pressedAtMs: Long,
     ) {
-        if (key.type != KeyType.DELETE) gestureUndoState.invalidate()
+        // A whole word the last swipe committed, still sitting untouched behind the cursor. A
+        // letter tapped now starts the next word rather than extending the swiped one, so it
+        // needs the separating space a fresh swipe would get. Captured before this keypress
+        // retires the record.
+        val swipedWordBehindCursor = gestureUndoState.snapshot()
+            ?.takeIf {
+                gestureUndoState.matchesEditorAndCursor(editorGeneration, collapsedCursorPosition())
+            }
+            ?.committedText
+        // Shift edits nothing, so it costs neither the swipe its Backspace undo nor the
+        // capitalised word about to follow it its separating space.
+        if (key.type != KeyType.DELETE && key.type != KeyType.SHIFT) gestureUndoState.invalidate()
         if (key.type != KeyType.SHIFT) lastShiftTapMs = 0L
         if (keyboardView?.searchMode == true) {
             handleSearchKey(key, text)
@@ -1143,7 +1154,7 @@ class SlideInputMethodService :
             KeyType.CHARACTER -> if (editorInputPolicy.usesRawKeyEvents) {
                 handleRawText(connection, appliedText)
             } else {
-                handleCharacter(connection, appliedText, touchX, touchY)
+                handleCharacter(connection, appliedText, touchX, touchY, swipedWordBehindCursor)
             }
         }
         if (key.type in EDITING_KEYS) {
@@ -2896,6 +2907,8 @@ class SlideInputMethodService :
         text: String,
         touchX: Float = Float.NaN,
         touchY: Float = Float.NaN,
+        /** The last swipe's committed word when the cursor still rests at its end, else null. */
+        swipedWordBehindCursor: String? = null,
     ): Boolean {
         var callbackPossible = false
         // Typing with the cursor parked in the middle of a reopened word: the region can only grow
@@ -2914,10 +2927,9 @@ class SlideInputMethodService :
             // so an address or URL is never rewritten behind the user's back.
             val wantsAutoSpace = composing.isEmpty() &&
                 editorInputPolicy.allowsSuggestions &&
-                AutoSpacing.beforeWord(
+                AutoSpacing.beforeTypedWord(
                     connection.getTextBeforeCursor(AUTO_SPACING_CONTEXT_CHARS, 0),
-                    typingAfterApostrophe = true,
-                    continuingTypedWord = true,
+                    swipedWordBehindCursor,
                 )
 
             // The space and the letter it makes room for are one edit. Reported separately they

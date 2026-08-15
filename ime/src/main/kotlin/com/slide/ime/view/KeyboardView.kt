@@ -1712,10 +1712,16 @@ internal object KeySurfaceStyle {
             type == KeyType.ALPHA
 }
 
-/** Digit hints disappear beside a real number row; punctuation hints remain useful. */
+/**
+ * Beside a real number row a digit hint is redundant, so the key surfaces the symbol its
+ * long-press popup leads with instead, as Gboard does; punctuation hints remain useful as-is.
+ */
 internal object KeyHintStyle {
-    fun visibleHint(key: Key, showNumberRow: Boolean): String? =
-        key.hint?.takeUnless { showNumberRow && it.length == 1 && it[0].isDigit() }
+    fun visibleHint(key: Key, showNumberRow: Boolean): String? {
+        val hint = key.hint ?: return null
+        if (!showNumberRow || hint.length != 1 || !hint[0].isDigit()) return hint
+        return key.alternates.firstOrNull { it.length == 1 && !it[0].isLetterOrDigit() }
+    }
 }
 
 /** Shared optical measurements for the five action icons in the key row and toolbar. */

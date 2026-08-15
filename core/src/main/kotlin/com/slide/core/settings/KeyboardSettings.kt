@@ -50,7 +50,7 @@ data class KeyboardSettings(
     val followSystemDarkMode: Boolean = true,
     val showKeyBorders: Boolean = false,
     val showKeyPreview: Boolean = true,
-    val showNumberRow: Boolean = false,
+    val showNumberRow: Boolean = true,
     /** Multiplier on the default key height, 0.7–1.4. */
     val keyHeightScale: Float = 1f,
     /** Extra space below the keyboard in dp, for gesture-nav comfort. */

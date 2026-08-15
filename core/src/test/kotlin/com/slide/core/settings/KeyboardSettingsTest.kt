@@ -341,7 +341,7 @@ class KeyboardSettingsTest {
             followSystemDarkMode = false,
             showKeyBorders = true,
             showKeyPreview = false,
-            showNumberRow = true,
+            showNumberRow = false,
             keyHeightScale = 1.3f,
             bottomPaddingDp = 24f,
             hapticEnabled = false,

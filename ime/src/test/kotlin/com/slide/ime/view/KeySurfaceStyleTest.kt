@@ -34,7 +34,23 @@ class KeySurfaceStyleTest {
     }
 
     @Test
-    fun `number row hides only redundant digit hints`() {
+    fun `number row swaps redundant digit hints for the popup's symbol`() {
+        // With a dedicated digit row above, the key advertises its symbol alternate instead.
+        assertEquals(
+            "%",
+            KeyHintStyle.visibleHint(
+                Key("q", hint = "1", alternates = listOf("1", "%")),
+                showNumberRow = true,
+            ),
+        )
+        // Accented letters are popup entries, not hints; the first symbol wins.
+        assertEquals(
+            "|",
+            KeyHintStyle.visibleHint(
+                Key("e", hint = "3", alternates = listOf("3", "è", "é", "|")),
+                showNumberRow = true,
+            ),
+        )
         assertEquals(null, KeyHintStyle.visibleHint(Key("q", hint = "1"), showNumberRow = true))
         assertEquals("@", KeyHintStyle.visibleHint(Key("a", hint = "@"), showNumberRow = true))
         assertEquals("1", KeyHintStyle.visibleHint(Key("q", hint = "1"), showNumberRow = false))
