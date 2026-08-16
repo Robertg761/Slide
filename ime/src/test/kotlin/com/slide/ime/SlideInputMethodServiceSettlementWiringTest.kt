@@ -137,6 +137,21 @@ class SlideInputMethodServiceSettlementWiringTest {
         assertOrdered(decode, "lastDecoderSource", "gestureAdaptation.rerank(raw)")
     }
 
+    @Test
+    fun `tap captures the completed swipe boundary before consuming gesture undo`() {
+        val commit = method("processKeyCommit", "onGestureComplete")
+        assertOrdered(
+            commit,
+            "val followsGestureWord =",
+            "gestureUndoState.invalidate()",
+        )
+        assertOrdered(
+            commit,
+            "followsWholeWordInput = followsGestureWord",
+            ")\n        }",
+        )
+    }
+
     private fun method(name: String, nextName: String): String {
         val start = source.indexOf("fun $name(")
         val end = source.indexOf("fun $nextName(", start + 1)

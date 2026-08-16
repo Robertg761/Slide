@@ -431,8 +431,8 @@ private fun SetupScreen(repository: SettingsRepository) {
                     val model = WhisperModel.fromId(settings.voiceModelId)
                     Text(model.label, style = MaterialTheme.typography.bodyLarge)
                     Text(
-                        "${model.description} Slide packages one verified model to keep every " +
-                            "install and security update smaller.",
+                        "${model.description} Slide packages one verified model and runs it " +
+                            "entirely on this device.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

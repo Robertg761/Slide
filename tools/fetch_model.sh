@@ -6,19 +6,19 @@
 # and voice input that needs a network round trip before it will work the first time is not
 # offline. The cost is APK size, which is the trade the brief asked for.
 #
-#   tools/fetch_model.sh base.en-q5_1
+#   tools/fetch_model.sh small.en-q5_1
 #
 # Quantised (q5_1) builds are used throughout: they are a third of the size of the float models for
 # a difference in word error rate that does not show up in dictation.
 set -euo pipefail
 
-MODEL="${1:-base.en-q5_1}"
+MODEL="${1:-small.en-q5_1}"
 MODEL_REVISION="5359861c739e955e79d9a303bcbc70fb988958b1"
-MODEL_SHA256="4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f"
+MODEL_SHA256="bfdff4894dcb76bbf647d56263ea2a96645423f1669176f4844a1bf8e478ad30"
 BASE_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/$MODEL_REVISION"
 
-if [[ "$MODEL" != "base.en-q5_1" ]]; then
-    echo "Unsupported model '$MODEL'; Slide ships only base.en-q5_1." >&2
+if [[ "$MODEL" != "small.en-q5_1" ]]; then
+    echo "Unsupported model '$MODEL'; Slide ships only small.en-q5_1." >&2
     exit 2
 fi
 

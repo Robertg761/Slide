@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-bash "$ROOT/tools/fetch_model.sh" base.en-q5_1
+bash "$ROOT/tools/fetch_model.sh" small.en-q5_1
 bash "$ROOT/tools/fetch_executorch.sh"
 bash "$ROOT/tools/fetch_swipe_models.sh"
 

@@ -98,7 +98,7 @@ EXPECTED_NATIVE_PATHS=(
 EXPECTED_RUNTIME_DATA_PATHS=(
     assets/bigrams_en.bin
     assets/emoji.bin
-    assets/ggml-base.en-q5_1.bin
+    assets/ggml-small.en-q5_1.bin
     assets/lexicon_en.bin
     assets/swipe/decoder.pte
     assets/swipe/encoder.pte
@@ -168,7 +168,7 @@ EXPECTED_PACKAGE="com.slide"
 EXPECTED_MIN_SDK="26"
 EXPECTED_TARGET_SDK="37"
 EXPECTED_BUILD_TOOLS="36.0.0"
-MODEL_PATH="assets/ggml-base.en-q5_1.bin"
+MODEL_PATH="assets/ggml-small.en-q5_1.bin"
 NOTICES_PATH="assets/THIRD_PARTY_NOTICES.txt"
 SWIPE_LICENSE_PATH="assets/swipe/FUTO_MODEL_LICENSE.md"
 SWIPE_ENCODER_PATH="assets/swipe/encoder.pte"
@@ -177,8 +177,8 @@ EMOJI_PATH="assets/emoji.bin"
 LEXICON_PATH="assets/lexicon_en.bin"
 BIGRAM_PATH="assets/bigrams_en.bin"
 TRIGRAM_PATH="assets/trigrams_en.bin"
-MODEL_SIZE="59721011"
-MODEL_SHA256="4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f"
+MODEL_SIZE="190098681"
+MODEL_SHA256="bfdff4894dcb76bbf647d56263ea2a96645423f1669176f4844a1bf8e478ad30"
 SWIPE_ENCODER_SHA256="725242bab5d14345e96ff214e8de2bfbc1f962c232d320df9c24cb82ffd1fbaf"
 SWIPE_DECODER_SHA256="01eaf16ac4bc0f1ed0698c240807f0e95e6d427bcf6de04983ffc50736744d85"
 EMOJI_SHA256="543a5883b9dfb0521bf8440f72fe000e37ae43de1ff6c70432ae9e02b646188f"

@@ -47,7 +47,7 @@ class BuildSbomTest(unittest.TestCase):
         components = first["components"]
         names = {component["name"] for component in components}
         self.assertIn("whisper.cpp (Slide provenance patch)", names)
-        self.assertIn("Whisper base.en q5_1", names)
+        self.assertIn("Whisper small.en q5_1", names)
         self.assertIn("FUTO Swipe encoder", names)
         self.assertIn("Slide emoji catalogue", names)
         self.assertTrue(

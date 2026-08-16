@@ -137,21 +137,22 @@ Synthetic and donated-corpus reports remain benchmarks, not evidence of physical
 
 ### Model choice
 
-Slide packages one model: `ggml-base.en-q5_1.bin` (59,721,011 bytes). A prior Galaxy S24
-Ultra benchmark loaded Base in about 100 ms and decoded an 11-second fixture in about 1.7 seconds.
-The former Small model decoded the same fixture in about 7.4 seconds and added roughly 181 MB to
-every APK and update, so it was removed. This is one device measurement, not a latency promise for
-all supported devices.
+Slide packages one model: `ggml-small.en-q5_1.bin` (190,098,681 bytes). Base decoded an 11-second
+clean fixture in about 1.7 seconds on a Galaxy S24 Ultra, while Small took about 7.4 seconds through
+the former portable backend. Real conversational microphone input showed that Base's error rate was
+not good enough for the keyboard. Small therefore gets the runtime-selected ARM64 kernels added in
+0.3.4 and becomes the accuracy-first default. A fresh phone timing is still required.
 
 The build fetch is pinned to immutable whisper.cpp model revision
 `5359861c739e955e79d9a303bcbc70fb988958b1` and verifies SHA-256
-`4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f`. The model is bundled
+`bfdff4894dcb76bbf647d56263ea2a96645423f1669176f4844a1bf8e478ad30`. The model is bundled
 and stored uncompressed for direct asset access; the installed app has no model downloader or
 model-choice UI.
 
 Current transcription is batch-oriented: the user starts and stops recording, then Whisper decodes
-the captured 16 kHz mono audio. A conservative local pre-pass trims only confidently silent leading
-and trailing frames. Low-confidence temperature retries remain available but are explicitly bounded.
+the complete captured 16 kHz mono audio. The app does not trim edge audio because phone-level
+amplitude heuristics can mistake a quiet first or last word for silence. Two candidates at two
+fallback temperatures preserve a low-confidence retry without whisper.cpp's 26-path worst case.
 ARM64 packages separately compiled ggml CPU backends and asks each for a compatibility score before
 loading the best match, preserving the Armv8 baseline while allowing dot-product, FP16, i8mm, SVE,
 and SME kernels on newer phones. Streaming partials, VAD endpointing, and GPU/NPU acceleration are

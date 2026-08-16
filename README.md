@@ -49,8 +49,8 @@ silence. Its complete microphone-to-editor flow has not yet been rerun on physic
 
 **Built, with hardware verification still incomplete**
 - **Voice typing.** Whisper runs in a separate `:asr` process; audio never crosses the process
-  boundary. The bundled Base English model selects a CPU backend compatible with each ARM64 phone,
-  trims only confident leading/trailing silence, and retains bounded accuracy fallbacks. The live
+  boundary. The bundled Small English model selects a CPU backend compatible with each ARM64 phone,
+  decodes the complete recording, and retains bounded low-confidence retries. The live
   panel uses responsive speech-level bars and an explicit on-device progress animation. There is no
   network, platform-recognizer, or cloud fallback path. A release-device run of the real
   microphone-to-editor flow is still outstanding.
@@ -127,16 +127,17 @@ The model terms are packaged with the app and gesture typing is visibly attribut
 in settings. Slide's trie beam search, context integration, fallback, and input handling are its
 own Apache-2.0 implementation.
 
-**Speech model** (gitignored, 59,721,011 bytes):
+**Speech model** (gitignored, 190,098,681 bytes):
 
 ```bash
-tools/fetch_model.sh base.en-q5_1
+tools/fetch_model.sh small.en-q5_1
 ```
 
 The fetcher is pinned to Hugging Face revision
 `5359861c739e955e79d9a303bcbc70fb988958b1` and SHA-256
-`4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f`. Base is the only
-packaged and selectable model; settings saved with the former Small choice migrate to Base.
+`bfdff4894dcb76bbf647d56263ea2a96645423f1669176f4844a1bf8e478ad30`. Small English is the
+only packaged model. Slide accepts the larger install so conversational microphone input does not
+depend on Whisper Base's much narrower accuracy margin.
 
 **whisper.cpp** is vendored under `third_party/whisper.cpp` at a pinned commit, stripped of
 bindings, examples, tests, and every backend Android cannot use. To refresh it:

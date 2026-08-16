@@ -331,10 +331,10 @@ Java_com_slide_asr_WhisperNative_transcribe(
             params.no_timestamps = true;
             params.suppress_blank = true;
             params.suppress_nst = true;
-            // The upstream fallback can expand one uncertain decode into 26 decoder paths:
-            // temperature zero, then five temperatures with five candidates each. Keep two
-            // stochastic candidates at two fallback temperatures. Clean audio still uses the
-            // identical deterministic pass, while noisy audio retains a bounded second chance.
+            // Small improves the first-pass recognition margin without making an uncertain result
+            // wait through whisper.cpp's default 26 decoder paths. Retain two independent
+            // candidates at two fallback temperatures: ambiguity still gets another chance, while
+            // a noisy microphone cannot leave the keyboard apparently stuck for tens of seconds.
             params.greedy.best_of = 2;
             params.temperature_inc = 0.4F;
             // audio_ctx deliberately stays at its default (the full 30-second window), although

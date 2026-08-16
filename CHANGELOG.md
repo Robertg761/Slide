@@ -61,6 +61,19 @@
   device was connected: the new panels, toolbar shortcuts, and voice-latency changes are
   structurally verified but not yet measured on hardware.
 
+### Changed
+
+- Offline dictation now uses Whisper Small English instead of Base and keeps the complete
+  recording. The larger recognizer supplies more model capacity for conversational microphone
+  input while a bounded low-confidence retry search avoids an open-ended transcription wait.
+- Tapping a letter after a completed swipe now starts a new word with a space. Mixed input such as
+  swiping `when` and tapping `I`, or swiping `after` and tapping `a`, no longer joins the words.
+
+### Privacy
+
+- The higher-accuracy speech model remains bundled and runs in the isolated on-device speech
+  process. There is still no cloud recognizer, runtime model download, telemetry, or audio upload.
+
 ## [0.3.4] - 2026-08-13
 
 ### Changed

@@ -66,8 +66,8 @@ A 1:1 inventory of Gboard's feature surface, used as the master checklist for Sl
 | # | Feature | Tier | Effort | Notes |
 |---|---|---|---|---|
 | C1 | Mic key → voice input panel | V1 | S | **Built.** Permission, listening, transcribing, failure, and cancellation states are wired. |
-| C2 | **On-device Whisper transcription** | V1 | XL | **Built.** One bundled Base English q5_1 model, conservative edge-silence trimming, bounded accuracy retries, and runtime-selected ARM64 CPU kernels. The native fixture was benchmarked on a Galaxy S24 Ultra previously; the current microphone-to-editor flow still needs a device run. |
-| C3 | Model manager — browse/download/delete models | V2 | M | Deliberately not shipped in 0.2.1: one immutable, checksummed Base model is bundled and there is no runtime model download. |
+| C2 | **On-device Whisper transcription** | V1 | XL | **Built.** One bundled Small English q5_1 model, complete-recording decode, bounded low-confidence retries, and runtime-selected ARM64 CPU kernels. The current microphone-to-editor flow still needs a fresh device run. |
+| C3 | Model manager — browse/download/delete models | V2 | M | Deliberately not shipped: one immutable, checksummed Small model is bundled and there is no runtime model download. |
 | C4 | Streaming partial results while speaking | V2 | L | Not built. Current transcription runs after Stop. |
 | C5 | Automatic punctuation & casing | V1 | S | Supplied by the local Whisper decode. |
 | C6 | Silence detection → auto-stop | V2 | M | Not built; current endpointing is manual with a safety recording limit. |
