@@ -49,7 +49,11 @@ class RealSwipeNeuralBenchmarkTest {
     @Test
     fun reportsTopOneAndTopFiveAccuracyForTheNeuralDecoderOnDevice() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
-        val lines = instrumentation.context.assets.open(ASSET).bufferedReader().readLines()
+        val lines = try {
+            instrumentation.context.assets.open(ASSET).bufferedReader().readLines()
+        } catch (_: Exception) {
+            emptyList()
+        }
         assumeTrue("add $ASSET to androidTest assets to run the on-device benchmark", lines.isNotEmpty())
 
         val context = instrumentation.targetContext
