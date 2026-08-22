@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.2] - 2026-08-22
+
+### Fixed
+
+- The on-device swipe benchmark now skips cleanly when its corpus file is absent instead of
+  failing continuous integration, and the release notes for this line extract correctly.
+  No user-facing changes: v0.5.1 was tagged but its publish was aborted before anything shipped,
+  so 0.5.2 carries the whole 0.5.1 delta.
+
 ## [0.5.0] - 2026-08-22
 
 ### Added
