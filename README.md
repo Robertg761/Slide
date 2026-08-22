@@ -26,7 +26,14 @@ Typing, themes, and gesture decoding were verified on a Galaxy S24 Ultra (Androi
 Base Whisper model also loaded and transcribed an 11-second fixture on that phone in a prior
 benchmark (about 100 ms load and 1.7 seconds decode). Version 0.3.4 restores runtime-selected
 optimized ARM64 kernels, bounds slow low-confidence retries, and skips confidently detected edge
-silence. Its complete microphone-to-editor flow has not yet been rerun on physical hardware.
+silence.
+
+The complete microphone-to-editor flow was verified on that phone in August 2026 with the packaged
+Small English model: cold load in about 370 ms, the 11-second fixture decoded at 1.66x realtime,
+and a live dictation session committed correctly to an editor field. The on-device swipe engine's
+instrumented tests passed in the same session. Early hands-on use flags three open areas: decode
+latency for short utterances (about 2 seconds of fixed work per clip before low-confidence
+retries), swipe accuracy during a fresh install's calibration warm-up, and voice overlay polish.
 
 **Working**
 - QWERTY typing with multi-touch rollover and slide-off correction
@@ -52,8 +59,9 @@ silence. Its complete microphone-to-editor flow has not yet been rerun on physic
   boundary. The bundled Small English model selects a CPU backend compatible with each ARM64 phone,
   decodes the complete recording, and retains bounded low-confidence retries. The live
   panel uses responsive speech-level bars and an explicit on-device progress animation. There is no
-  network, platform-recognizer, or cloud fallback path. A release-device run of the real
-  microphone-to-editor flow is still outstanding.
+  network, platform-recognizer, or cloud fallback path. The real microphone-to-editor flow ran
+  end to end on a physical device in August 2026 (see Status); decode latency for short utterances
+  and the overlay's visual polish are the remaining gaps.
 - **Autocorrect and typed-word suggestions.** The word being typed is held as composing text, so
   a correction replaces a region the editor owns rather than a character count the keyboard
   guessed at. A fast single-edit path handles ordinary slips; a trie-pruned weighted sequence
