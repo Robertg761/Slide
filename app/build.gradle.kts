@@ -20,6 +20,11 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Installs beside a release-signed Slide on test devices instead of failing
+            // INSTALL_FAILED_UPDATE_INCOMPATIBLE against it.
+            applicationIdSuffix = ".debug"
+        }
         release {
             // Release signing is deliberately outside Gradle. CI builds this unsigned artifact in
             // an unprivileged job; a separate approval-gated job signs it without checking out or
