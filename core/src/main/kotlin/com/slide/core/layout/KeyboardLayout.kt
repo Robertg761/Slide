@@ -74,6 +74,4 @@ enum class KeyType {
     EMOJI,
     MIC,
     SETTINGS,
-    /** Cycle languages / open IME picker on long press. */
-    GLOBE,
 }

@@ -8,6 +8,7 @@ import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -447,7 +448,41 @@ class KeyboardView @JvmOverloads constructor(
             contentHeight = contentHeight,
             topOffset = topPadding + header,
         )
+        updateSystemGestureExclusion(width)
         accessibilityHelper.invalidateRoot()
+    }
+
+    /**
+     * Keeps swipes that start on the outermost letter columns out of Android's back gesture.
+     *
+     * With gesture navigation, a finger landing on `q` or `p` and dragging inward sits inside the
+     * system's edge-trigger zone, and without an exclusion request the launch of every corner
+     * swipe is stolen by back navigation before this view ever sees it. Only the letter rows are
+     * excluded — they are where swipe typing starts, and they fit well inside the system's 200 dp
+     * per-edge budget — so the footer keeps its default behaviour.
+     */
+    private fun updateSystemGestureExclusion(viewWidth: Int) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        val letters = placedKeys.filter { placed ->
+            placed.key.gestureEligible &&
+                placed.key.type == KeyType.CHARACTER &&
+                placed.key.outputText.length == 1 &&
+                placed.key.outputText[0].lowercaseChar() in 'a'..'z'
+        }
+        if (letters.isEmpty() || viewWidth <= 0) {
+            setSystemGestureExclusionRects(emptyList())
+            return
+        }
+        val top = letters.minOf { it.top }.toInt()
+        val bottom = letters.maxOf { it.bottom }.toInt()
+        // Cover each edge column outright rather than a thin strip: the trigger zone is measured
+        // from the physical edge, and the finger lands on the key itself.
+        val reach = (viewWidth * GESTURE_EXCLUSION_WIDTH_FACTOR).toInt().coerceAtLeast(1)
+        val rects = listOf(
+            Rect(0, top, reach, bottom),
+            Rect(viewWidth - reach, top, viewWidth, bottom),
+        )
+        setSystemGestureExclusionRects(rects)
     }
 
     override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
@@ -1510,11 +1545,17 @@ class KeyboardView @JvmOverloads constructor(
         KeyType.EMOJI -> "Emoji"
         KeyType.MIC -> "Voice typing"
         KeyType.SETTINGS -> "Settings"
-        KeyType.GLOBE -> "Input method switcher"
     }
 
     private companion object {
         const val TRAIL_POINTS = 192
+
+        /**
+         * How far inward from each screen edge the back-gesture exclusion reaches, as a share of
+         * the view's width. One letter column plus its padding is the need; a wider claim buys
+         * nothing and eats into the system's per-edge budget.
+         */
+        const val GESTURE_EXCLUSION_WIDTH_FACTOR = 0.15f
 
         /**
          * The trail's taper, drawn as a few chunks rather than a per-point gradient. Six is enough

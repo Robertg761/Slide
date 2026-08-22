@@ -224,7 +224,7 @@ A 1:1 inventory of Gboard's feature surface, used as the master checklist for Sl
 | K3 | Password/secure field — no learning, no suggestions | V1 | S | |
 | K4 | Inline autofill suggestions (API 30+) | V2 | M | Password-manager chips in the strip. |
 | K5 | Physical keyboard passthrough | V3 | M | |
-| K6 | IME switcher (globe long-press → other keyboards) | V1 | S | |
+| K6 | IME switcher (globe long-press → other keyboards) | Skip | S | Deliberately omitted: Slide is single-language, and the system picker remains available from the platform. The in-keyboard ◎ key read as a stray button next to Space. |
 | K7 | RTL layout support | V2 | M | |
 | K8 | Accessibility / TalkBack support | V1 | M | **Partly built.** Labels and announcements exist; device-level TalkBack and font-scale verification remain. |
 | K9 | Landscape + foldable/large-screen layouts | V2 | M | |

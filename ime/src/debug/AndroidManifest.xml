@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Debug-variant-only declarations. This file merges into :ime's debug builds only, so anything
+    here is absent from release APKs by construction rather than by runtime gating.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!--
+            Guided capture session for swipe tuning: prompts words, records traces plus intended
+            labels into private storage for offline replay. Exported so adb can start it without
+            root; the activity still finishes instantly if the app is somehow not debuggable.
+        -->
+        <activity
+            android:name="com.slide.ime.SwipeCalibrationActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:taskAffinity="" />
+    </application>
+
+</manifest>

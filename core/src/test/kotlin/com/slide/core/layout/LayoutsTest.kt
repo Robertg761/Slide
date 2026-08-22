@@ -57,25 +57,6 @@ class LayoutsTest {
         )
     }
 
-    @Test
-    fun `IME switcher is conditional unique and preserves bottom row width`() {
-        for (layout in listOf(Layouts.QwertyEn, Layouts.SymbolsEn) + numericLayouts()) {
-            assertSame(layout, Layouts.withImeSwitcher(layout, false))
-            val switched = Layouts.withImeSwitcher(layout, true)
-            assertEquals(
-                "${layout.id} must expose exactly one switch key",
-                1,
-                switched.rows.sumOf { row -> row.keys.count { it.type == KeyType.GLOBE } },
-            )
-            assertEquals(
-                layout.rows.last().totalWeight,
-                switched.rows.last().totalWeight,
-                0.0001f,
-            )
-            assertSame(switched, Layouts.withImeSwitcher(switched, true))
-        }
-    }
-
     private fun outputs(layout: KeyboardLayout): Set<String> =
         layout.rows.flatMap(KeyRow::keys).map(Key::outputText).toSet()
 

@@ -28,7 +28,6 @@ object Layouts {
      * rather than as a yellow emoji sitting among monochrome glyphs.
      */
     private val emoji = Key("\u263A\uFE0E", KeyType.EMOJI, gestureEligible = false)
-    private val globe = Key("\u25ce", KeyType.GLOBE, gestureEligible = false)
     /** The comma has its own bottom-row key, as on Gboard, so it is not among the alternates. */
     private val period = Key(
         ".",
@@ -316,37 +315,4 @@ object Layouts {
         } else {
             layout.copy(rows = listOf(numberRow) + layout.rows)
         }
-
-    /**
-     * Adds the system-required next-IME affordance without permanently crowding every layout.
-     *
-     * Android only asks for the switch key when another enabled IME exists. The bottom row keeps
-     * its original width: alphabetic layouts donate one unit from Space; compact specialised pads
-     * share the new key's width proportionally across their existing keys.
-     */
-    fun withImeSwitcher(layout: KeyboardLayout, enabled: Boolean): KeyboardLayout {
-        if (!enabled || layout.rows.any { row -> row.keys.any { it.type == KeyType.GLOBE } }) {
-            return layout
-        }
-        val bottom = layout.rows.lastOrNull() ?: return layout
-        if (bottom.keys.isEmpty()) return layout
-
-        val globeWeight = minOf(1f, bottom.keys.sumOf { it.widthWeight.toDouble() }.toFloat() * 0.16f)
-        val spaceIndex = bottom.keys.indexOfFirst { it.type == KeyType.SPACE && it.widthWeight >= globeWeight + 1f }
-        val resized = if (spaceIndex >= 0) {
-            bottom.keys.mapIndexed { index, key ->
-                if (index == spaceIndex) key.copy(widthWeight = key.widthWeight - globeWeight) else key
-            }
-        } else {
-            val existingWeight = bottom.keys.sumOf { it.widthWeight.toDouble() }.toFloat()
-            val scale = ((existingWeight - globeWeight) / existingWeight).coerceAtLeast(0.5f)
-            bottom.keys.map { key -> key.copy(widthWeight = key.widthWeight * scale) }
-        }
-
-        val insertion = resized.indexOfFirst { it.type == KeyType.SPACE }
-            .takeIf { it >= 0 }
-            ?: resized.indexOfLast { it.type != KeyType.ENTER }.plus(1)
-        val keys = resized.toMutableList().apply { add(insertion, globe.copy(widthWeight = globeWeight)) }
-        return layout.copy(rows = layout.rows.dropLast(1) + bottom.copy(keys = keys))
-    }
 }

@@ -142,13 +142,14 @@ class SlideInputMethodServiceSettlementWiringTest {
         val commit = method("processKeyCommit", "onGestureComplete")
         assertOrdered(
             commit,
-            "val followsGestureWord =",
+            "val swipedWordBehindCursor =",
             "gestureUndoState.invalidate()",
         )
-        assertOrdered(
-            commit,
-            "followsWholeWordInput = followsGestureWord",
-            ")\n        }",
+        // The boundary is worth nothing unless the character handler actually receives it.
+        assertTrue(
+            commit.contains(
+                "handleCharacter(connection, appliedText, touchX, touchY, swipedWordBehindCursor)",
+            ),
         )
     }
 

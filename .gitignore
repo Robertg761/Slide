@@ -27,3 +27,8 @@ third_party/executorch/*.aar
 !engine/src/main/assets/bigrams_en.bin
 !engine/src/main/assets/trigrams_en.bin
 !core/src/main/assets/emoji.bin
+
+# Local-only benchmark corpus slice (FUTO swipe dataset, 258 MiB upstream). Not redistributable
+# from this repo; fetch it and rebuild with tools or the snippet in docs/typing-quality-benchmarks.md.
+engine/src/androidTest/assets/swipe_benchmark_subset.jsonl
+engine/src/androidTest/assets/swipe_session.jsonl
