@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.5.0] - 2026-08-22
+
+### Added
+
+- Dictation now shows the transcript while it is being decoded. Each segment whisper finalises
+  crosses into the keyboard as it completes, so the panel fills with words as they are recognised
+  instead of holding a spinner for the whole decode. The finished transcript remains the only one
+  committed, and a cancelled or failed decode discards its partials.
+
+### Changed
+
+- The voice panel was rebuilt from a device test session: it slides in and out instead of
+  appearing in place, sits on a rounded sheet with a soft top shadow, shows speech-level bars
+  driven by the microphone's attack and release rather than a fixed wobble, separates the growing
+  transcript from the status line typographically, and gives Done and Cancel full-height touch
+  targets.
+- The input-method switcher key between the emoji key and the space bar is gone. Slide is a
+  single-language keyboard and the small circle read as an unlabelled stray button; other keyboards
+  remain reachable through the system picker. (Parity item K6, deliberately skipped.)
+
+### Fixed
+
+- A swipe that starts on `q`, `p`, or the outer letter columns no longer triggers Android's back
+  gesture mid-stroke. The letter rows now claim system-gesture exclusion rectangles, so corner
+  swipes reach the decoder intact instead of being cut short by navigation.
+- Concurrent access to the swipe model's native runtime — the keyboard service loading while debug
+  tooling decodes — is serialised behind one process-wide lock, after two simultaneous loads were
+  observed to segfault.
+
 ## [0.4.0] - 2026-08-15
 
 ### Added
