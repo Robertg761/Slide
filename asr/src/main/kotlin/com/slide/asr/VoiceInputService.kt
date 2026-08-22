@@ -152,7 +152,15 @@ class VoiceInputService : Service() {
                 if (!sessions.isCurrent(sessionId)) return@launch
                 sendState(sessionId, VoiceInput.State.Transcribing)
 
-                when (val result = transcriber.transcribe(audio)) {
+                // Segments arrive on the decode thread; each is marshalled to the main scope and
+                // session-gated exactly like the level events above.
+                when (
+                    val result = transcriber.transcribe(audio) { partial ->
+                        scope.launch {
+                            if (sessions.isCurrent(sessionId)) sendPartial(sessionId, partial)
+                        }
+                    }
+                ) {
                     is WhisperTranscriber.Result.Text -> sendResultIfCurrent(sessionId, result.value)
                     WhisperTranscriber.Result.NoSpeech -> sendResultIfCurrent(sessionId, "")
                     is WhisperTranscriber.Result.Failed -> {
@@ -215,6 +223,13 @@ class VoiceInputService : Service() {
     private fun sendResultIfCurrent(sessionId: Long, text: String) {
         if (sessions.isCurrent(sessionId)) sendResult(sessionId, text)
     }
+
+    private fun sendPartial(sessionId: Long, text: String) = send(
+        sessionId,
+        Message.obtain(null, VoiceInput.MSG_PARTIAL).apply {
+            data = Bundle().apply { putString(VoiceInput.KEY_TEXT, text) }
+        },
+    )
 
     private fun sendErrorIfCurrent(sessionId: Long, error: VoiceInput.Error) {
         if (sessions.isCurrent(sessionId)) sendError(sessionId, error)

@@ -31,6 +31,9 @@ class VoiceInputClient(private val context: Context) {
         /** Microphone loudness, 0..1, roughly ten times a second while listening. */
         fun onVoiceLevel(level: Float)
 
+        /** The transcript so far, while the decode is still running. Superseded by [onVoiceResult]. */
+        fun onVoicePartial(text: String)
+
         /** The finished transcript. Empty when the user said nothing. */
         fun onVoiceResult(text: String)
 
@@ -76,6 +79,13 @@ class VoiceInputClient(private val context: Context) {
             VoiceInput.MSG_LEVEL -> {
                 if (session.accepts(sessionId)) {
                     listener?.onVoiceLevel(message.arg1.toFloat() / VoiceInput.LEVEL_SCALE)
+                }
+                true
+            }
+
+            VoiceInput.MSG_PARTIAL -> {
+                if (session.accepts(sessionId)) {
+                    listener?.onVoicePartial(message.data.getString(VoiceInput.KEY_TEXT).orEmpty())
                 }
                 true
             }

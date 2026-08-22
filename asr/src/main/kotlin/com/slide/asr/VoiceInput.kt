@@ -14,6 +14,9 @@ object VoiceInput {
     const val MSG_RESULT = 12
     const val MSG_ERROR = 13
 
+    /** The transcript so far, while the decode is still running. [KEY_TEXT] carries it. */
+    const val MSG_PARTIAL = 14
+
     const val KEY_TEXT = "text"
     const val KEY_MODEL = "model"
     const val KEY_SESSION_ID = "session_id"

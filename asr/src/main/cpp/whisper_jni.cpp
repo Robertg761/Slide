@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -53,6 +54,19 @@ struct Session {
 
 struct CancellationToken {
     std::atomic<bool> cancelled{false};
+};
+
+/**
+ * Carries the Kotlin partial-segment receiver into whisper's decode loop.
+ *
+ * whisper_full invokes the new-segment callback synchronously on the same thread that entered it,
+ * so the JNIEnv captured at transcribe entry stays valid for every callback — no thread attach and
+ * no global references are needed. The listener jobject is owned by the still-running JNI frame.
+ */
+struct PartialBridge {
+    JNIEnv *env = nullptr;
+    jobject listener = nullptr;
+    jmethodID method = nullptr;
 };
 
 /** JNI allocation helpers leave a pending Java exception when they return null. */
@@ -152,6 +166,53 @@ CancellationToken *as_cancellation_token(jlong handle) {
 bool should_abort(void *data) {
     const auto *token = static_cast<CancellationToken *>(data);
     return token != nullptr && token->cancelled.load(std::memory_order_relaxed);
+}
+
+/**
+ * Forwards one finalised whisper segment to Kotlin as raw UTF-8 bytes.
+ *
+ * Bytes rather than a jstring keep every byte sequence, including 4-byte UTF-8 an emoji transcript
+ * would contain, out of JNI's Modified-UTF-8 string API entirely. A receiver that throws gets cleared once and then
+ * detached: a broken UI callback must not retry on every segment of every future decode.
+ */
+void emit_partial_segment(
+        whisper_context *ctx, whisper_state *, int n_new, void *user_data) {
+    auto *bridge = static_cast<PartialBridge *>(user_data);
+    if (bridge == nullptr || bridge->env == nullptr || bridge->listener == nullptr ||
+        bridge->method == nullptr) {
+        return;
+    }
+    JNIEnv *env = bridge->env;
+    const int total = whisper_full_n_segments(ctx);
+    for (int index = total - n_new; index < total; ++index) {
+        const char *segment = whisper_full_get_segment_text(ctx, index);
+        if (segment == nullptr) continue;
+        const size_t length = std::strlen(segment);
+        if (length == 0) continue;
+
+        jbyteArray chunk = env->NewByteArray(static_cast<jsize>(length));
+        if (chunk == nullptr) {
+            clear_pending_java_exception(env, "partial-segment allocation");
+            bridge->method = nullptr;
+            return;
+        }
+        env->SetByteArrayRegion(
+                chunk, 0, static_cast<jsize>(length),
+                reinterpret_cast<const jbyte *>(segment));
+        if (env->ExceptionCheck()) {
+            clear_pending_java_exception(env, "partial-segment copy");
+            env->DeleteLocalRef(chunk);
+            bridge->method = nullptr;
+            return;
+        }
+        env->CallVoidMethod(bridge->listener, bridge->method, chunk);
+        env->DeleteLocalRef(chunk);
+        if (env->ExceptionCheck()) {
+            clear_pending_java_exception(env, "partial-segment delivery");
+            bridge->method = nullptr;
+            return;
+        }
+    }
 }
 
 /** Loads the best packaged ARM64 CPU backend directly through Android's native-library namespace. */
@@ -303,13 +364,34 @@ Java_com_slide_asr_WhisperNative_closeCancellationToken(JNIEnv *, jclass, jlong 
 JNI_EXPORT jbyteArray JNICALL
 Java_com_slide_asr_WhisperNative_transcribe(
         JNIEnv *env, jclass, jlong handle, jfloatArray samples, jint threads,
-        jlong cancellation_handle) {
+        jlong cancellation_handle, jobject partial_listener) {
     try {
         Session *session = as_session(handle);
         CancellationToken *cancellation = as_cancellation_token(cancellation_handle);
         if (session == nullptr || session->ctx == nullptr || cancellation == nullptr ||
             samples == nullptr) {
             return nullptr;
+        }
+
+        PartialBridge bridge;
+        if (partial_listener != nullptr) {
+            // Resolved once here rather than per segment: a method ID stays valid for the class's
+            // lifetime, and the decode loop must not pay a lookup on every callback.
+            jclass listenerClass = env->GetObjectClass(partial_listener);
+            if (listenerClass != nullptr) {
+                bridge.method = env->GetMethodID(
+                        listenerClass, "onPartialSegment", "([B)V");
+                env->DeleteLocalRef(listenerClass);
+                if (bridge.method == nullptr) {
+                    clear_pending_java_exception(env, "partial-listener lookup");
+                }
+            } else {
+                clear_pending_java_exception(env, "partial-listener class");
+            }
+            if (bridge.method != nullptr) {
+                bridge.env = env;
+                bridge.listener = partial_listener;
+            }
         }
 
         int status;
@@ -323,6 +405,8 @@ Java_com_slide_asr_WhisperNative_transcribe(
             params.translate = false;
             params.abort_callback = should_abort;
             params.abort_callback_user_data = cancellation;
+            params.new_segment_callback = emit_partial_segment;
+            params.new_segment_callback_user_data = &bridge;
             params.no_context = true;
             params.single_segment = false;
             params.print_progress = false;

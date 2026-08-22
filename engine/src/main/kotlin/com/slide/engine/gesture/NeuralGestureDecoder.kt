@@ -61,50 +61,57 @@ class NeuralGestureDecoder private constructor(
         previousPreviousWord: String?,
     ): List<GestureCandidate> {
         val input = NeuralSwipePreprocessor.prepare(points, keys) ?: return emptyList()
-        val encoderOutput = encoder.forward(
-            EValue.from(Tensor.fromBlob(input.features, longArrayOf(1, 2, INPUT_POINTS.toLong()))),
-            EValue.from(Tensor.fromBlob(input.layoutKeys, longArrayOf(1, MAX_KEYS.toLong(), 2))),
-            EValue.from(Tensor.fromBlob(input.layoutMask, longArrayOf(1, MAX_KEYS.toLong()))),
-        )
-        check(encoderOutput.size == 3) { "Swipe encoder returned ${encoderOutput.size} outputs" }
 
-        val emissions = encoderOutput[0].toTensor().getDataAsFloatArray()
-        val coefficients = encoderOutput[1].toTensor().getDataAsFloatArray()
-        val intention = encoderOutput[2].toTensor().getDataAsFloatArray()
-        check(emissions.size == TIME_STEPS * (MAX_KEYS + 1)) { "Unexpected encoder emissions" }
-        check(coefficients.size == TIME_STEPS * COEFFICIENTS) { "Unexpected encoder coefficients" }
-        check(intention.size == TIME_STEPS) { "Unexpected encoder intention gate" }
-
-        val decoderInput = FloatArray(TIME_STEPS * DECODER_INPUT)
-        for (time in 0 until TIME_STEPS) {
-            val destination = time * DECODER_INPUT
-            val emissionSource = time * (MAX_KEYS + 1)
-            emissions.copyInto(
-                decoderInput,
-                destination,
-                emissionSource,
-                emissionSource + LETTERS,
+        // One process hosts several decoder consumers (the IME service, and debug tooling such as
+        // the capture activity), and the packaged ExecuTorch JNI is not proven safe under
+        // concurrent calls from independent Module instances — it has segfaulted exactly there.
+        // Every crossing into it therefore takes this process-wide lock.
+        val logProbabilities = synchronized(RUNTIME_LOCK) {
+            val encoderOutput = encoder.forward(
+                EValue.from(Tensor.fromBlob(input.features, longArrayOf(1, 2, INPUT_POINTS.toLong()))),
+                EValue.from(Tensor.fromBlob(input.layoutKeys, longArrayOf(1, MAX_KEYS.toLong(), 2))),
+                EValue.from(Tensor.fromBlob(input.layoutMask, longArrayOf(1, MAX_KEYS.toLong()))),
             )
-            decoderInput[destination + LETTERS] = emissions[emissionSource + MAX_KEYS]
-            coefficients.copyInto(
-                decoderInput,
-                destination + LETTERS + 1,
-                time * COEFFICIENTS,
-                (time + 1) * COEFFICIENTS,
-            )
-            decoderInput[destination + DECODER_INPUT - 1] = intention[time]
-        }
+            check(encoderOutput.size == 3) { "Swipe encoder returned ${encoderOutput.size} outputs" }
 
-        val refined = decoder.forward(
-            EValue.from(
-                Tensor.fromBlob(
+            val emissions = encoderOutput[0].toTensor().getDataAsFloatArray()
+            val coefficients = encoderOutput[1].toTensor().getDataAsFloatArray()
+            val intention = encoderOutput[2].toTensor().getDataAsFloatArray()
+            check(emissions.size == TIME_STEPS * (MAX_KEYS + 1)) { "Unexpected encoder emissions" }
+            check(coefficients.size == TIME_STEPS * COEFFICIENTS) { "Unexpected encoder coefficients" }
+            check(intention.size == TIME_STEPS) { "Unexpected encoder intention gate" }
+
+            val decoderInput = FloatArray(TIME_STEPS * DECODER_INPUT)
+            for (time in 0 until TIME_STEPS) {
+                val destination = time * DECODER_INPUT
+                val emissionSource = time * (MAX_KEYS + 1)
+                emissions.copyInto(
                     decoderInput,
-                    longArrayOf(1, TIME_STEPS.toLong(), DECODER_INPUT.toLong()),
+                    destination,
+                    emissionSource,
+                    emissionSource + LETTERS,
+                )
+                decoderInput[destination + LETTERS] = emissions[emissionSource + MAX_KEYS]
+                coefficients.copyInto(
+                    decoderInput,
+                    destination + LETTERS + 1,
+                    time * COEFFICIENTS,
+                    (time + 1) * COEFFICIENTS,
+                )
+                decoderInput[destination + DECODER_INPUT - 1] = intention[time]
+            }
+
+            val refined = decoder.forward(
+                EValue.from(
+                    Tensor.fromBlob(
+                        decoderInput,
+                        longArrayOf(1, TIME_STEPS.toLong(), DECODER_INPUT.toLong()),
+                    ),
                 ),
-            ),
-        )
-        check(refined.size == 1) { "Swipe decoder returned ${refined.size} outputs" }
-        val logProbabilities = refined[0].toTensor().getDataAsFloatArray()
+            )
+            check(refined.size == 1) { "Swipe decoder returned ${refined.size} outputs" }
+            refined[0].toTensor().getDataAsFloatArray()
+        }
         check(logProbabilities.size == TIME_STEPS * CTC_CLASSES) { "Unexpected decoder output" }
         return beamSearch.decode(
             logProbabilities,
@@ -157,39 +164,45 @@ class NeuralGestureDecoder private constructor(
             fallback: GestureDecodingEngine? = null,
         ): NeuralGestureDecoder? =
             runCatching {
-                val encoderFile = SwipeModelStore.materialize(context, "encoder.pte", ENCODER_SHA)
-                val decoderFile = SwipeModelStore.materialize(context, "decoder.pte", DECODER_SHA)
-                val encoder = Module.load(encoderFile.absolutePath, Module.LOAD_MODE_MMAP)
-                try {
-                    val decoder = Module.load(decoderFile.absolutePath, Module.LOAD_MODE_MMAP)
+                // Model loading is the other ExecuTorch crossing; see RUNTIME_LOCK on decodeNeural.
+                synchronized(RUNTIME_LOCK) {
+                    val encoderFile = SwipeModelStore.materialize(context, "encoder.pte", ENCODER_SHA)
+                    val decoderFile = SwipeModelStore.materialize(context, "decoder.pte", DECODER_SHA)
+                    val encoder = Module.load(encoderFile.absolutePath, Module.LOAD_MODE_MMAP)
                     try {
-                        val loaded = NeuralGestureDecoder(
-                            encoder = encoder,
-                            decoder = decoder,
-                            lexicon = lexicon,
-                            bigrams = bigrams,
-                            userBigrams = userBigrams,
-                            trie = trie,
-                            trigrams = trigrams,
-                            fallback = fallback,
-                        )
-                        check(loaded.passesHealthCheck()) {
-                            "Packaged swipe model failed its known-trace health check"
+                        val decoder = Module.load(decoderFile.absolutePath, Module.LOAD_MODE_MMAP)
+                        try {
+                            val loaded = NeuralGestureDecoder(
+                                encoder = encoder,
+                                decoder = decoder,
+                                lexicon = lexicon,
+                                bigrams = bigrams,
+                                userBigrams = userBigrams,
+                                trie = trie,
+                                trigrams = trigrams,
+                                fallback = fallback,
+                            )
+                            check(loaded.passesHealthCheck()) {
+                                "Packaged swipe model failed its known-trace health check"
+                            }
+                            loaded
+                        } catch (failure: Throwable) {
+                            decoder.destroy()
+                            throw failure
                         }
-                        loaded
                     } catch (failure: Throwable) {
-                        decoder.destroy()
+                        encoder.destroy()
                         throw failure
                     }
-                } catch (failure: Throwable) {
-                    encoder.destroy()
-                    throw failure
                 }
             }.onFailure { failure ->
                 Log.w(TAG, "Neural swipe unavailable; deterministic decoder will be used", failure)
             }.getOrNull()
 
         private const val TAG = "SlideSwipe"
+
+        /** Serialises every ExecuTorch JNI crossing in this process, load and inference alike. */
+        private val RUNTIME_LOCK = Any()
     }
 }
 

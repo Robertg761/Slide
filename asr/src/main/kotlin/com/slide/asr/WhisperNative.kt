@@ -45,6 +45,11 @@ internal object WhisperNative {
      * Whisper produces ordinary UTF-8. Returning its bytes keeps that encoding out of JNI's
      * Modified-UTF-8 string API; [WhisperTranscriber] performs the standards-compliant decode.
      * Returns null if recognition failed.
+     *
+     * While decoding runs, each segment whisper finalises is handed to [partialListener] as raw
+     * UTF-8 on the decode thread — the same thread that will eventually return the full array. A
+     * chunk is the segment alone; the receiver accumulates. Callbacks stop once recognition ends,
+     * whether it succeeded, failed, or was cancelled.
      */
     @JvmStatic
     external fun transcribe(
@@ -52,5 +57,11 @@ internal object WhisperNative {
         samples: FloatArray,
         threads: Int,
         cancellationToken: Long,
+        partialListener: PartialListener?,
     ): ByteArray?
+
+    /** Receives one finalised whisper segment mid-decode. */
+    fun interface PartialListener {
+        fun onPartialSegment(chunkUtf8: ByteArray?)
+    }
 }

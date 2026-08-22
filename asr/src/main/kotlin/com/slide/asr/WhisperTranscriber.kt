@@ -101,8 +101,14 @@ class WhisperTranscriber(
      * Returns [Result.NoSpeech] rather than an empty string for silence: whisper suppresses its
      * own hallucinated output on quiet input, and a caller needs to tell "nothing was said" apart
      * from "something went wrong" to say anything useful about it.
+     *
+     * [onPartial], when given, receives the growing transcript every time whisper finalises a
+     * segment — invoked on this class's decode thread, so the receiver must move it off that
+     * thread itself. The final [Result.Text] remains the only authoritative transcript: a
+     * cancelled or failed decode can still have emitted partials for audio whose tail never made
+     * it through.
      */
-    suspend fun transcribe(samples: FloatArray): Result = try {
+    suspend fun transcribe(samples: FloatArray, onPartial: ((String) -> Unit)? = null): Result = try {
         withContext(dispatcher) {
             mutex.withLock {
                 if (handle == 0L) return@withLock Result.Failed("No speech model loaded")
@@ -118,6 +124,18 @@ class WhisperTranscriber(
                 if (token == 0L) return@withLock Result.Failed("Speech recognition failed")
 
                 synchronized(cancellationLock) { activeCancellationToken = token }
+                // One buffer, owned by the decode thread that appends to it and read only after
+                // the native call has returned: no cross-thread access needs synchronising.
+                val accumulated = StringBuilder()
+                val partialListener = onPartial?.let { receiver ->
+                    WhisperNative.PartialListener { chunk ->
+                        val piece = decodeTranscript(chunk)
+                        if (!piece.isNullOrEmpty()) {
+                            accumulated.append(piece)
+                            receiver(accumulated.toString())
+                        }
+                    }
+                }
                 try {
                     val started = System.nanoTime()
                     val text = suspendCancellableCoroutine { continuation ->
@@ -130,6 +148,7 @@ class WhisperTranscriber(
                                 samples,
                                 threadCount(),
                                 token,
+                                partialListener,
                             ),
                         )
                         if (continuation.isActive) continuation.resume(decoded)

@@ -2,16 +2,24 @@ package com.slide.ime.view
 
 import android.content.Context
 import android.graphics.Canvas
+import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.os.Bundle
+import android.text.Layout
+import android.text.StaticLayout
+import android.text.TextPaint
+import android.text.TextUtils
 import android.util.TypedValue
 import android.view.MotionEvent
 import android.view.View
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.animation.AccelerateInterpolator
 import android.view.animation.AnimationUtils
+import android.view.animation.DecelerateInterpolator
 import androidx.core.view.ViewCompat
 import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
 import androidx.customview.widget.ExploreByTouchHelper
@@ -20,6 +28,7 @@ import com.slide.core.theme.KeyboardTheme
 import com.slide.core.theme.Themes
 import kotlin.math.PI
 import kotlin.math.cos
+import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
@@ -34,9 +43,11 @@ import kotlin.math.sin
  *
  * The microphone stays visually anchored through every state. Speech drives the surrounding bars
  * while listening; model loading and inference use a rotating arc, so the panel never appears
- * frozen while it is doing work. A Done/Cancel pair sits where the space bar would be — tapping
- * anywhere else on the panel still finishes, but the buttons make both exits discoverable — and a
- * timer next to the status line shows the microphone has been live exactly as long as expected.
+ * frozen while it is doing work. Once decoding starts producing segments, the growing transcript
+ * itself takes over the panel's centre band — watching words arrive reads as progress in a way no
+ * spinner can. A Done/Cancel pair sits where the space bar would be — tapping anywhere else on the
+ * panel still finishes, but the buttons make both exits discoverable — and a timer next to the
+ * status line shows the microphone has been live exactly as long as expected.
  */
 class VoiceOverlayView(context: Context) : View(context) {
 
@@ -59,6 +70,9 @@ class VoiceOverlayView(context: Context) : View(context) {
                 listeningSinceMs = AnimationUtils.currentAnimationTimeMillis()
                 timerSecondCache = -1L
             }
+            // A transcript belongs to one decode. Any state change out of (or into) Transcribing
+            // retires whatever the previous decode had produced.
+            if (value != VoiceInput.State.Transcribing) partialTranscript = null
             field = value
             if (value != VoiceInput.State.Listening) levelDynamics.reset()
             syncAnimation()
@@ -74,6 +88,61 @@ class VoiceOverlayView(context: Context) : View(context) {
             invalidate()
         }
 
+    /** The growing transcript shown while whisper decodes; cumulative, replaced whole. */
+    var partialTranscript: String? = null
+        set(value) {
+            if (field == value) return
+            field = value
+            invalidate()
+        }
+
+    /**
+     * Slides the panel up over the keys. The offset and fade are one motion: a bare fade reads as
+     * flicker, a bare slide as a different surface arriving from nowhere.
+     */
+    fun showAnimated() {
+        animate().cancel()
+        alpha = 0f
+        translationY = dp(SHEET_SLIDE_DP)
+        visibility = View.VISIBLE
+        animate()
+            .alpha(1f)
+            .translationY(0f)
+            .setDuration(SHEET_ENTER_MS)
+            .setInterpolator(DecelerateInterpolator(1.6f))
+            .start()
+    }
+
+    /**
+     * Slides the panel back down and only then tears its session visuals down. Cancelling a running
+     * exit drops its end action, so a quick re-show cannot be undone by the dismissal it raced.
+     */
+    fun hideAnimated() {
+        if (visibility != View.VISIBLE) {
+            resetSessionVisuals()
+            return
+        }
+        animate().cancel()
+        animate()
+            .alpha(0f)
+            .translationY(dp(SHEET_SLIDE_DP))
+            .setDuration(SHEET_EXIT_MS)
+            .setInterpolator(AccelerateInterpolator(1.2f))
+            .withEndAction {
+                visibility = View.GONE
+                resetSessionVisuals()
+            }
+            .start()
+    }
+
+    private fun resetSessionVisuals() {
+        errorText = null
+        partialTranscript = null
+        state = VoiceInput.State.Idle
+        alpha = 1f
+        translationY = 0f
+    }
+
     private val levelDynamics = VoiceLevelDynamics()
 
     fun setLevel(value: Float) {
@@ -86,7 +155,18 @@ class VoiceOverlayView(context: Context) : View(context) {
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, value, resources.displayMetrics)
 
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val sheetPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
+    private val labelTypeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+
+    /** The growing transcript. A [TextPaint] because [StaticLayout] requires one. */
+    private val transcriptPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+        typeface = labelTypeface
+    }
+    private var transcriptLayout: StaticLayout? = null
+    private var transcriptKey: TranscriptKey? = null
+
+    private data class TranscriptKey(val text: String, val width: Int, val maxLines: Int)
 
     /** Reused across draws; `Paint.fontMetrics` allocates a fresh object per read. */
     private val reusableFontMetrics = Paint.FontMetrics()
@@ -97,6 +177,11 @@ class VoiceOverlayView(context: Context) : View(context) {
         strokeJoin = Paint.Join.ROUND
     }
     private val arcBounds = RectF()
+    private val sheetBounds = RectF()
+
+    /** Per-bar smoothed heights, in units of the mic radius. Speech, not a metronome. */
+    private val barLevels = FloatArray(BAR_COUNT)
+    private var lastBarsFrameMs = 0L
 
     private enum class ActionButton { CANCEL, DONE }
 
@@ -251,7 +336,8 @@ class VoiceOverlayView(context: Context) : View(context) {
     }
 
     private fun drawListeningIndicator(canvas: Canvas, centerX: Float, centerY: Float, radius: Float) {
-        val elapsed = (AnimationUtils.currentAnimationTimeMillis() - animationStartMs) / 1000f
+        val now = AnimationUtils.currentAnimationTimeMillis()
+        val elapsed = (now - animationStartMs) / 1000f
         val level = levelDynamics.level
 
         // A translucent halo makes volume readable even in peripheral vision. It grows from a
@@ -266,11 +352,23 @@ class VoiceOverlayView(context: Context) : View(context) {
         indicatorPaint.strokeWidth = dp(4f)
         val halfSpan = min(centerX - dp(16f), radius * BAR_SPAN)
         val spacing = halfSpan * 2f / (BAR_COUNT - 1)
+        val frameGapMs = (now - lastBarsFrameMs).coerceIn(0L, MAX_FRAME_GAP_MS)
+        lastBarsFrameMs = now
         for (index in 0 until BAR_COUNT) {
             val position = index.toFloat() / (BAR_COUNT - 1) * 2f - 1f
             val envelope = 0.4f + 0.6f * cos(position * PI.toFloat() / 2f)
-            val motion = 0.78f + 0.22f * sin(elapsed * 5.2f + index * 1.37f)
-            val halfHeight = radius * (BAR_IDLE_HEIGHT + level * envelope * motion)
+            // Two incommensurate oscillators multiplied together never settle into a visible
+            // period, which is what made the single-sine version read as fake.
+            val phaseA = sin(elapsed * (3.7f + index * 0.31f) + index * 1.9f)
+            val phaseB = sin(elapsed * (6.3f - index * 0.17f) + index * index * 0.13f)
+            val flicker = (0.55f + 0.30f * phaseA * phaseB + 0.15f * phaseA).coerceIn(0.1f, 1f)
+            val target = BAR_IDLE_HEIGHT + level * envelope * flicker
+            // Fast attack, slow release, normalised to the measured frame gap so the character of
+            // the motion survives a 60Hz and a 120Hz panel alike.
+            val timeConstant = if (target > barLevels[index]) BAR_ATTACK_MS else BAR_RELEASE_MS
+            barLevels[index] += (target - barLevels[index]) *
+                (1f - exp(-frameGapMs / timeConstant))
+            val halfHeight = radius * barLevels[index]
             val x = centerX - halfSpan + spacing * index
             canvas.drawLine(x, centerY - halfHeight, x, centerY + halfHeight, indicatorPaint)
         }
@@ -301,7 +399,7 @@ class VoiceOverlayView(context: Context) : View(context) {
     // endregion
 
     override fun onDraw(canvas: Canvas) {
-        canvas.drawColor(keyboardTheme.background)
+        drawSheet(canvas)
 
         val centerX = width / 2f
         val centerY = height * MIC_CENTRE_FRACTION
@@ -315,19 +413,95 @@ class VoiceOverlayView(context: Context) : View(context) {
             VoiceInput.State.Idle -> drawMicrophoneButton(canvas, centerX, centerY, baseRadius)
         }
 
-        textPaint.color = keyboardTheme.keyText
-        textPaint.textSize = sp(15f)
+        val pillTop = height * ACTIONS_CENTRE_FRACTION - actionPillHalfHeight()
+        // The status line hangs from the buttons rather than the circle, so a short landscape
+        // keyboard compresses the transcript band instead of overlapping something.
         textPaint.typeface = Typeface.DEFAULT
-        // Placed off the circle's edge whether or not the circle is what is drawn, so that swapping
-        // between the mic and the wave does not move the text.
+        textPaint.textSize = sp(13f)
+        textPaint.color = if (state == VoiceInput.State.Listening && errorText == null) {
+            keyboardTheme.suggestionText
+        } else {
+            keyboardTheme.hintText
+        }
         val statusLine = if (state == VoiceInput.State.Listening && errorText == null) {
             "${statusText()} · ${recordingTimerText()}"
         } else {
             statusText()
         }
-        canvas.drawText(statusLine, centerX, centerY + baseRadius + dp(36f), textPaint)
+        textPaint.getFontMetrics(reusableFontMetrics)
+        val statusBaseline = pillTop - dp(14f)
+        canvas.drawText(statusLine, centerX, statusBaseline, textPaint)
 
-        drawActionButtons(canvas)
+        drawTranscript(
+            canvas,
+            centerX,
+            bottomLimit = statusBaseline - reusableFontMetrics.ascent - dp(6f),
+            topLimit = centerY + baseRadius + dp(2f),
+        )
+        drawActionButtons(canvas, pillTop)
+    }
+
+    /**
+     * The panel as its own raised surface: rounded top corners over the frame's background, with a
+     * soft shadow fading down from the top edge to seat it under the app's content.
+     */
+    private fun drawSheet(canvas: Canvas) {
+        sheetBounds.set(0f, 0f, width.toFloat(), height.toFloat())
+        sheetPaint.color = keyboardTheme.specialKeyBackground
+        sheetPaint.shader = null
+        canvas.drawRoundRect(
+            sheetBounds,
+            dp(SHEET_CORNER_DP),
+            dp(SHEET_CORNER_DP),
+            sheetPaint,
+        )
+        // Square the bottom corners back off; only the top edge faces the app's content.
+        canvas.drawRect(0f, height - dp(SHEET_CORNER_DP), width.toFloat(), height.toFloat(), sheetPaint)
+        val scrimHeight = dp(SHEET_SCRIM_DP)
+        sheetPaint.shader = LinearGradient(
+            0f,
+            0f,
+            0f,
+            scrimHeight,
+            intArrayOf(keyboardTheme.keyShadow, android.graphics.Color.TRANSPARENT),
+            floatArrayOf(0f, 1f),
+            Shader.TileMode.CLAMP,
+        )
+        canvas.drawRect(0f, 0f, width.toFloat(), scrimHeight, sheetPaint)
+        sheetPaint.shader = null
+    }
+
+    /** Two lines of growing transcript where there is room for them; nothing when there is not. */
+    private fun drawTranscript(canvas: Canvas, centerX: Float, bottomLimit: Float, topLimit: Float) {
+        val text = partialTranscript ?: return
+        val available = bottomLimit - topLimit
+        transcriptPaint.textSize = sp(15f)
+        transcriptPaint.color = keyboardTheme.keyText
+        transcriptPaint.getFontMetrics(reusableFontMetrics)
+        val lineHeight = reusableFontMetrics.descent - reusableFontMetrics.ascent
+        val maxLines = (available / lineHeight).toInt().coerceIn(0, TRANSCRIPT_MAX_LINES)
+        if (maxLines == 0) return
+        val layoutWidth = (width - dp(2f * TRANSCRIPT_MARGIN_DP)).toInt()
+
+        val key = TranscriptKey(text, layoutWidth, maxLines)
+        if (key != transcriptKey) {
+            transcriptKey = key
+            transcriptLayout = StaticLayout.Builder
+                .obtain(text, 0, text.length, transcriptPaint, layoutWidth.coerceAtLeast(1))
+                .setAlignment(Layout.Alignment.ALIGN_CENTER)
+                .setMaxLines(maxLines)
+                .setEllipsize(TextUtils.TruncateAt.START)
+                .build()
+        }
+
+        val layout = transcriptLayout ?: return
+        canvas.save()
+        canvas.translate(
+            centerX - layoutWidth / 2f,
+            bottomLimit - layout.height,
+        )
+        layout.draw(canvas)
+        canvas.restore()
     }
 
     /** The elapsed listening time as `m:ss`, rebuilt only when the second ticks over. */
@@ -342,16 +516,17 @@ class VoiceOverlayView(context: Context) : View(context) {
         return timerTextCache
     }
 
-    private fun drawActionButtons(canvas: Canvas) {
-        updateButtonBounds()
+    private fun drawActionButtons(canvas: Canvas, pillTop: Float) {
+        updateButtonBounds(pillTop)
         textPaint.textSize = sp(14f)
+        textPaint.typeface = labelTypeface
 
         drawPill(
             canvas,
             cancelBounds,
             CANCEL_LABEL,
-            fill = keyboardTheme.specialKeyBackground,
-            labelColor = keyboardTheme.suggestionText,
+            fill = keyboardTheme.keyBackground,
+            labelColor = keyboardTheme.keyText,
             pressed = pressedButton == ActionButton.CANCEL,
             enabled = true,
         )
@@ -409,16 +584,26 @@ class VoiceOverlayView(context: Context) : View(context) {
     private fun doneActionable(): Boolean =
         state == VoiceInput.State.Listening || state == VoiceInput.State.Idle
 
-    private fun updateButtonBounds() {
+    /**
+     * Half the pill height. 48dp is the touch target worth aiming for; a short landscape keyboard
+     * gets whatever its bottom band can actually hold instead.
+     */
+    private fun actionPillHalfHeight(): Float = max(
+        dp(14f),
+        min(dp(24f), height * (1f - ACTIONS_CENTRE_FRACTION) / 2f - dp(2f)),
+    )
+
+    private fun updateButtonBounds(pillTop: Float? = null) {
         textPaint.textSize = sp(14f)
+        textPaint.typeface = labelTypeface
         // Both pills take the wider label's width so the pair reads as one balanced control.
         val halfWidth =
             max(textPaint.measureText(CANCEL_LABEL), textPaint.measureText(DONE_LABEL)) / 2f +
-                dp(22f)
-        val halfGap = dp(7f)
+                dp(26f)
+        val halfGap = dp(8f)
         val centerX = width / 2f
-        val centerY = height * ACTIONS_CENTRE_FRACTION
-        val halfHeight = dp(19f)
+        val centerY = pillTop ?: (height * ACTIONS_CENTRE_FRACTION - actionPillHalfHeight())
+        val halfHeight = actionPillHalfHeight()
         cancelBounds = floatArrayOf(
             centerX - halfGap - halfWidth * 2f,
             centerY - halfHeight,
@@ -575,7 +760,19 @@ class VoiceOverlayView(context: Context) : View(context) {
         const val BAR_COUNT = 11
         const val BAR_SPAN = 3.15f
         const val BAR_IDLE_HEIGHT = 0.08f
+        /** Bar envelope time constants, in milliseconds. Fast up, slow down. */
+        const val BAR_ATTACK_MS = 40f
+        const val BAR_RELEASE_MS = 200f
         const val MAX_FRAME_GAP_MS = 64L
+
+        const val SHEET_CORNER_DP = 28f
+        const val SHEET_SCRIM_DP = 20f
+        const val SHEET_SLIDE_DP = 36f
+        const val SHEET_ENTER_MS = 220L
+        const val SHEET_EXIT_MS = 160L
+
+        const val TRANSCRIPT_MAX_LINES = 2
+        const val TRANSCRIPT_MARGIN_DP = 28f
     }
 }
 

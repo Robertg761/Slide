@@ -192,9 +192,6 @@ class SlideInputMethodService :
     /** One policy shared by typing, swiping, prediction, and personalized learning. */
     private var editorInputPolicy = EditorInputPolicy.NaturalText
 
-    /** Re-evaluated for each input view because enabled IMEs can change while Slide is alive. */
-    private var imeSwitcherOffered = false
-
     /** A permission cannot conjure microphone hardware on devices that do not have any. */
     private val deviceHasMicrophone by lazy {
         packageManager.hasSystemFeature(PackageManager.FEATURE_MICROPHONE)
@@ -762,7 +759,6 @@ class SlideInputMethodService :
         layer = Layer.ALPHA
         hideEmojiPanel()
         editorInputPolicy = EditorInputPolicy.from(info.inputType)
-        imeSwitcherOffered = shouldOfferImeSwitcher()
         editorBaseLayout = layoutFor(editorInputPolicy.keyboardMode)
         passwordField = editorInputPolicy.isPassword
         editorRequestsNoLearning =
@@ -1144,10 +1140,6 @@ class SlideInputMethodService :
             }
             KeyType.EMOJI -> {
                 showEmojiPanel()
-                false
-            }
-            KeyType.GLOBE -> {
-                switchToNextIme()
                 false
             }
             KeyType.SETTINGS -> false
@@ -2420,10 +2412,6 @@ class SlideInputMethodService :
                 searchResults().firstOrNull()?.let { onSearchEmojiPicked(it) }
                 return
             }
-            KeyType.GLOBE -> {
-                switchToNextIme()
-                return
-            }
             KeyType.SHIFT, KeyType.SYMBOLS, KeyType.SYMBOLS_ALT, KeyType.ALPHA, KeyType.EMOJI,
             KeyType.MIC, KeyType.SETTINGS -> return
         }
@@ -2459,7 +2447,7 @@ class SlideInputMethodService :
         searchPreviousShift = shiftState()
         keyboardView?.apply {
             shiftState = ShiftState.OFF
-            keyboardLayout = Layouts.withImeSwitcher(Layouts.QwertyEn, imeSwitcherOffered)
+            keyboardLayout = Layouts.QwertyEn
             searchQuery = ""
             searchMode = true
             searchResults = recentEmoji.take(MAX_SEARCH_RESULTS)
@@ -2562,7 +2550,7 @@ class SlideInputMethodService :
         voiceOverlay?.apply {
             errorText = null
             state = VoiceInput.State.Preparing
-            visibility = View.VISIBLE
+            showAnimated()
         }
         setBackCallbackRegistered(true)
         clearSuggestions()
@@ -2604,6 +2592,12 @@ class SlideInputMethodService :
     override fun onVoiceLevel(level: Float) {
         if (voiceEditorGeneration != editorGeneration) return
         voiceOverlay?.setLevel(level)
+    }
+
+    override fun onVoicePartial(text: String) {
+        if (voiceCancellationPending) return
+        if (voiceEditorGeneration != editorGeneration) return
+        voiceOverlay?.partialTranscript = text
     }
 
     override fun onVoiceResult(text: String) {
@@ -2675,11 +2669,7 @@ class SlideInputMethodService :
     }
 
     private fun hideVoiceOverlay() {
-        voiceOverlay?.apply {
-            visibility = View.GONE
-            errorText = null
-            state = VoiceInput.State.Idle
-        }
+        voiceOverlay?.hideAnimated()
         updateGestureAvailability()
         refreshBackCallback()
     }
@@ -3378,40 +3368,10 @@ class SlideInputMethodService :
         updateGestureAvailability()
     }
 
-    private fun layoutFor(layer: Layer): KeyboardLayout {
-        val base = when (layer) {
-            Layer.ALPHA -> editorBaseLayout
-            Layer.SYMBOLS -> Layouts.SymbolsEn
-            Layer.SYMBOLS_ALT -> Layouts.SymbolsAltEn
-        }
-        return Layouts.withImeSwitcher(base, imeSwitcherOffered)
-    }
-
-    private fun shouldOfferImeSwitcher(): Boolean {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            return shouldOfferSwitchingToNextInputMethod()
-        }
-        val token = window?.window?.attributes?.token ?: return false
-        val manager = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-            ?: return false
-        @Suppress("DEPRECATION")
-        return manager.shouldOfferSwitchingToNextInputMethod(token)
-    }
-
-    private fun switchToNextIme() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            if (!switchToNextInputMethod(false)) announce("No other input method is available")
-            return
-        }
-        val token = window?.window?.attributes?.token ?: run {
-            announce("Input method switcher is unavailable")
-            return
-        }
-        val manager = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-        @Suppress("DEPRECATION")
-        if (manager?.switchToNextInputMethod(token, false) != true) {
-            announce("No other input method is available")
-        }
+    private fun layoutFor(layer: Layer): KeyboardLayout = when (layer) {
+        Layer.ALPHA -> editorBaseLayout
+        Layer.SYMBOLS -> Layouts.SymbolsEn
+        Layer.SYMBOLS_ALT -> Layouts.SymbolsAltEn
     }
 
     private fun layoutFor(mode: EditorKeyboardMode): KeyboardLayout = when (mode) {
