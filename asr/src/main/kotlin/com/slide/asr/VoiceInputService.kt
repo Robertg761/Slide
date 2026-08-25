@@ -20,6 +20,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 
 /**
  * Records and transcribes on behalf of the keyboard, in its own process.
@@ -83,8 +84,21 @@ class VoiceInputService : Service() {
         if (active != VoiceInput.NO_SESSION_ID) abandonSession(active) else recorder.cancel()
         if (transcriberDelegate.isInitialized()) {
             // close() first aborts an active decode, then waits for its mutex before freeing the
-            // context. This short blocking handoff prevents use-after-free and a cached-process leak.
-            runBlocking { transcriber.close() }
+            // context — which prevents use-after-free and a cached-process leak. How long that
+            // wait lasts depends on where the aborted decode sits between checkpoints, so the
+            // handoff happens off this looper: blocking main here queues every pending
+            // MSG_START/MSG_CANCEL behind native teardown. Nothing touches this instance again
+            // after destroy, and a replacement service constructs its own transcriber.
+            Thread(
+                {
+                    try {
+                        runBlocking { transcriber.close() }
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "Transcriber shutdown failed", e)
+                    }
+                },
+                "slide-asr-close",
+            ).apply { isDaemon = true }.start()
         }
         scope.cancel()
         super.onDestroy()
@@ -148,7 +162,10 @@ class VoiceInputService : Service() {
                 pending?.join() // stop may arrive while the model is still loading
                 if (!sessions.isCurrent(sessionId)) return@launch
 
-                audio = recorder.stop()
+                // recorder.stop() joins the capture worker under a bounded wait and then copies
+                // the buffer. Both are blocking calls with nothing main-thread about them, and
+                // the session gates before and after this line keep the ordering intact.
+                audio = withContext(Dispatchers.IO) { recorder.stop() }
                 if (!sessions.isCurrent(sessionId)) return@launch
                 sendState(sessionId, VoiceInput.State.Transcribing)
 

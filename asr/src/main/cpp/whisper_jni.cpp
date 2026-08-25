@@ -174,6 +174,13 @@ bool should_abort(void *data) {
  * Bytes rather than a jstring keep every byte sequence, including 4-byte UTF-8 an emoji transcript
  * would contain, out of JNI's Modified-UTF-8 string API entirely. A receiver that throws gets cleared once and then
  * detached: a broken UI callback must not retry on every segment of every future decode.
+ *
+ * Raw, deliberately untidied: whisper starts every segment with a space, and that space is what
+ * separates words across the segment boundary. Kotlin assembles both the live caption and the
+ * final result by concatenating these bytes and trimming only the whole (PartialAssembler /
+ * tidy below), so a UI replacing its last partial with the result sees identical text. Trimming
+ * per segment instead would glue multi-segment captions into "Helloworld" while the final kept
+ * its spaces.
  */
 void emit_partial_segment(
         whisper_context *ctx, whisper_state *, int n_new, void *user_data) {
@@ -260,7 +267,14 @@ bool load_dynamic_cpu_backend() {
 #endif
 }
 
-/** Trims the leading space whisper puts on every segment, and any stray newlines. */
+/**
+ * Trims the leading space whisper puts on every segment, and any stray newlines.
+ *
+ * KEEP IN SYNC with WhisperTranscriber.kt's PartialAssembler.tidy, which trims exactly these same
+ * three characters (' ', '\t', '\n') from the whole it assembles: live captions are built by
+ * concatenating this function's raw segment inputs and applying that trim, so the last partial
+ * equals the final transcript below only while both sides agree on the character set.
+ */
 std::string tidy(const std::string &text) {
     const auto first = text.find_first_not_of(" \t\n");
     if (first == std::string::npos) {

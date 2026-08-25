@@ -101,7 +101,12 @@ class EmojiPanelView(context: Context) : View(context) {
             field = value
             invalidatePage()
             // Redrawing while the user is looking at another tab is harmless; yanking the grid out
-            // from under a scroll on the recents tab is not, so the offset is left alone.
+            // from under a scroll on the recents tab is not. Keeping the offset means clamping it:
+            // a shorter list can leave the old offset past the new end, where no cells would draw.
+            // A fling aimed at the old list dies with it — its velocity is meaningless now, and
+            // letting it run would fight this clamp on every frame.
+            scroller.forceFinished(true)
+            scrollY = scrollY.coerceIn(0f, maxScroll())
             refreshAccessibilityDescription()
             invalidate()
         }
@@ -331,7 +336,10 @@ class EmojiPanelView(context: Context) : View(context) {
             val position = id - A11Y_EMOJI_BASE
             val emoji = page().getOrNull(position).orEmpty()
             node.contentDescription = "Emoji $emoji"
-            if (data?.hasVariants(entryAt(position)) == true) {
+            // A recent without a home in the current catalogue has no entry index (-1); asking
+            // about its variants would index out of bounds rather than answer "none".
+            val entry = entryAt(position)
+            if (entry >= 0 && data?.hasVariants(entry) == true) {
                 node.isLongClickable = true
                 node.addAction(AccessibilityNodeInfoCompat.ACTION_LONG_CLICK)
             }
@@ -899,7 +907,7 @@ class EmojiPanelView(context: Context) : View(context) {
 
             else -> {
                 pressedIndex = positionAt(event.x, event.y)
-                if (pressedIndex >= 0) postDelayed(longPress, LONG_PRESS_MS)
+                if (pressedIndex >= 0) postDelayed(longPress, longPressTimeout())
             }
         }
         invalidate()
@@ -1258,7 +1266,9 @@ class EmojiPanelView(context: Context) : View(context) {
         const val POPUP_SLOTS = EmojiData.TONE_COUNT + 1
 
         const val BACK_BUTTON_FRACTION = 0.2f
-        const val LONG_PRESS_MS = 350L
+
+        /** The platform long-press timeout, so the skin-tone row matches the keys' timing. */
+        private fun longPressTimeout(): Long = ViewConfiguration.getLongPressTimeout().toLong()
 
         /** Long enough that a normal tap never repeats, then accelerating to a comfortable rate. */
         const val FIRST_REPEAT_MS = 400L

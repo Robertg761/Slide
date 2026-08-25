@@ -81,7 +81,12 @@ cleanup() {
     if [[ -n "$EMULATOR_PID" ]]; then wait "$EMULATOR_PID" 2>/dev/null || true; fi
     rm -rf "$TEMP_DIR"
 }
-trap cleanup EXIT INT TERM
+# INT/TERM share the handler, but a signal must not resume the interrupted loop afterwards: the
+# emulator is already dead and polling it would burn out every remaining timeout before the EXIT
+# trap re-runs. Convert the signal into the normal failure exit after one cleanup pass.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 export ANDROID_AVD_HOME="$TEMP_DIR/avd"
 export ANDROID_USER_HOME="$TEMP_DIR/android-user"
@@ -188,9 +193,11 @@ for _ in $(seq 1 60); do
         tail -200 "$TEMP_DIR/emulator.log" >&2
         exit 1
     fi
-    available_kb="$($ADB -s "$SERIAL" shell df -k /data 2>/dev/null \
+    # A transient adb failure here must read as "not stable yet", not abort the whole run under
+    # set -euo pipefail — riding out exactly these windows is what this loop is for.
+    available_kb="$( ($ADB -s "$SERIAL" shell df -k /data 2>/dev/null \
         | tr -d '\r' \
-        | awk 'NR == 2 { print $4 }')"
+        | awk 'NR == 2 { print $4 }') || true)"
     system_server_pid="$($ADB -s "$SERIAL" shell pidof system_server 2>/dev/null \
         | tr -d '\r' || true)"
     if [[ "$available_kb" =~ ^[0-9]+$ ]] \

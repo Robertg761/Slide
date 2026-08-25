@@ -180,6 +180,15 @@ class KeyboardView @JvmOverloads constructor(
 
     private var placedKeys: List<PlacedKey> = emptyList()
 
+    /**
+     * The alternate each advertised accessibility action promised, captured when the node was
+     * populated. [alternatesFor] is shift-dependent, so resolving the action's index against a
+     * freshly rebuilt list could commit a different character than its label showed — an
+     * auto-capitalise between enumeration and invocation is all it takes. The promise, not the
+     * live list, is what gets kept; entries die with the geometry that produced them.
+     */
+    private val a11yPromisedAlternates = HashMap<Pair<Int, Int>, String>()
+
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -357,6 +366,7 @@ class KeyboardView @JvmOverloads constructor(
                         .take(AlternateAccessibilityActions.size)
                         .forEachIndexed { alternateIndex, alternate ->
                         val actionId = AlternateAccessibilityActions.idAt(alternateIndex) ?: return@forEachIndexed
+                        a11yPromisedAlternates[virtualViewId to actionId] = alternate
                         node.addAction(
                             AccessibilityNodeInfoCompat.AccessibilityActionCompat(
                                 actionId,
@@ -380,9 +390,12 @@ class KeyboardView @JvmOverloads constructor(
             val alternateIndex = AlternateAccessibilityActions.indexOf(action)
             if (alternateIndex >= 0) {
                 val placed = placedKeys.getOrNull(virtualViewId - A11Y_KEY_BASE) ?: return false
-                val alternate = alternatesFor(placed.key)
-                    .drop(1)
-                    .getOrNull(alternateIndex) ?: return false
+                val actionId = AlternateAccessibilityActions.idAt(alternateIndex) ?: return false
+                val alternate = AlternateAccessibilityActions.resolveAdvertised(
+                    promised = a11yPromisedAlternates[virtualViewId to actionId],
+                    alternateIndex = alternateIndex,
+                    liveAlternates = alternatesFor(placed.key),
+                ) ?: return false
                 listener?.onKeyDown(placed.key)
                 listener?.onKeyCommit(placed.key, alternate)
                 return true
@@ -448,6 +461,7 @@ class KeyboardView @JvmOverloads constructor(
             contentHeight = contentHeight,
             topOffset = topPadding + header,
         )
+        a11yPromisedAlternates.clear()
         updateSystemGestureExclusion(width)
         accessibilityHelper.invalidateRoot()
     }

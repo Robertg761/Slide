@@ -306,6 +306,25 @@ for class_name in "${FBJNI_JNI_CLASSES[@]}"; do
         exit 1
     }
 done
+# whisper_jni.cpp resolves this callback by name; R8 renaming it silently drops live dictation
+# partials while the final transcript still arrives, so assert both class and method survive.
+# Dollar sign below is a literal nested-class separator, not a variable reference.
+# shellcheck disable=SC2016
+SLIDE_ASR_JNI_CLASSES=('com/slide/asr/WhisperNative$PartialListener')
+for class_name in "${SLIDE_ASR_JNI_CLASSES[@]}"; do
+    grep -Fq "Class descriptor  : 'L${class_name};'" "$dex_dump" || {
+        echo "Release minification removed ASR JNI class $class_name." >&2
+        exit 1
+    }
+done
+# The method check is scoped to the PartialListener class's dexdump section: a name-only grep
+# over the whole dump would pass if any unrelated retained member happened to share the name.
+# shellcheck disable=SC2016
+partial_listener_section="$(awk '/Class descriptor/ { keep = index($0, "Lcom/slide/asr/WhisperNative$PartialListener;") != 0 } keep' "$dex_dump")"
+grep -Eq "name[[:space:]]+: ['\"]onPartialSegment['\"]" <<< "$partial_listener_section" || {
+    echo "Release minification removed WhisperNative.PartialListener.onPartialSegment." >&2
+    exit 1
+}
 manifest_tree="$($AAPT dump xmltree "$APK" AndroidManifest.xml)"
 if grep -q 'E: instrumentation' <<< "$manifest_tree"; then
     echo "Release APK contains a test instrumentation component." >&2
@@ -406,7 +425,7 @@ actual_model_sha="$(unzip -p "$APK" "$MODEL_PATH" | sha256sum | awk '{print $1}'
 mapfile -t packaged_abis < <(
     unzip -Z1 "$APK" \
         | sed -n 's#^lib/\([^/]*\)/libslide_asr\.so$#\1#p' \
-        | sort
+        | LC_ALL=C sort
 )
 if [[ "${packaged_abis[*]}" != "${EXPECTED_ABIS[*]}" ]]; then
     echo "Wrong libslide_asr.so ABI set: expected ${EXPECTED_ABIS[*]}, got ${packaged_abis[*]:-(none)}" >&2
@@ -416,7 +435,7 @@ fi
 mapfile -t executorch_abis < <(
     unzip -Z1 "$APK" \
         | sed -n 's#^lib/\([^/]*\)/libexecutorch\.so$#\1#p' \
-        | sort
+        | LC_ALL=C sort
 )
 if [[ "${executorch_abis[*]}" != "${EXECUTORCH_ABIS[*]}" ]]; then
     echo "Wrong libexecutorch.so ABI set: expected ${EXECUTORCH_ABIS[*]}, got ${executorch_abis[*]:-(none)}" >&2
@@ -425,7 +444,7 @@ fi
 
 # Every packaged native object must at least be a real ELF image, and the ASR bridge must carry the
 # tracked whisper.cpp snapshot identity rather than ambient Slide Git state or "unknown".
-mapfile -t native_paths < <(unzip -Z1 "$APK" | sed -n '/^lib\/[^/][^/]*\/[^/][^/]*\.so$/p' | sort)
+mapfile -t native_paths < <(unzip -Z1 "$APK" | sed -n '/^lib\/[^/][^/]*\/[^/][^/]*\.so$/p' | LC_ALL=C sort)
 verify_exact_manifest "native library" EXPECTED_NATIVE_PATHS native_paths
 SYMBOL_READELF="${READELF:-}"
 if [[ -z "$SYMBOL_READELF" ]]; then

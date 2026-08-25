@@ -262,19 +262,29 @@ private class ArrowButton(
                 scheduleRepeat()
                 return true
             }
+            MotionEvent.ACTION_MOVE -> {
+                // A finger that slides off the button has released it as far as the user is
+                // concerned: stop drawing it pressed and stop stepping the cursor. The repeat
+                // stays off when the finger returns, so re-entering cannot fire unexpectedly.
+                if (ArrowButtonPolicy.slidOff(isPressed, event.x, event.y, width, height)) {
+                    isPressed = false
+                    cancelRepeat()
+                }
+                return true
+            }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 isPressed = false
                 cancelRepeat()
-                if (event.actionMasked == MotionEvent.ACTION_UP) performClick()
                 return true
             }
         }
         return super.onTouchEvent(event)
     }
 
-    // The action already fired on the down event; this exists so accessibility clicks work too.
+    // The touch stream fires on the down event, so an accessibility click is the only path here.
     override fun performClick(): Boolean {
         super.performClick()
+        onFire()
         return true
     }
 
@@ -328,4 +338,20 @@ private class ArrowButton(
     private companion object {
         const val REPEAT_INTERVAL_MS = 120L
     }
+}
+
+/**
+ * Hold-to-repeat arrow press policy, separated from MotionEvent plumbing for JVM coverage.
+ *
+ * The button fires on touch-down and keeps firing while held; a finger that leaves the bounds
+ * has released it as far as the user is concerned, and re-entering must not silently resume.
+ */
+internal object ArrowButtonPolicy {
+
+    /** True when a pressed contact sits outside the button; far edges are exclusive. */
+    fun slidOff(isPressed: Boolean, x: Float, y: Float, width: Int, height: Int): Boolean =
+        isPressed && !contains(x, y, width, height)
+
+    fun contains(x: Float, y: Float, width: Int, height: Int): Boolean =
+        x >= 0f && x < width && y >= 0f && y < height
 }

@@ -135,8 +135,13 @@ class NeuralGestureDecoder private constructor(
         if (closed) return
         closed = true
         failover.disablePrimary()
-        decoder.destroy()
-        encoder.destroy()
+        // Destruction is an ExecuTorch crossing like any other: another instance (the capture
+        // activity while the IME is up) may be mid-inference, and concurrent JNI calls into
+        // independent Modules have segfaulted exactly there. See RUNTIME_LOCK on decodeNeural.
+        synchronized(RUNTIME_LOCK) {
+            decoder.destroy()
+            encoder.destroy()
+        }
     }
 
     companion object {

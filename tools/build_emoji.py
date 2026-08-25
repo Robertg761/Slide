@@ -52,6 +52,7 @@ import json
 import re
 import struct
 import sys
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
@@ -133,6 +134,18 @@ def verify_source(data: bytes, spec: dict[str, object], label: str) -> bytes:
     return data
 
 
+class HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuses any redirect that leaves https, matching the curl scripts' --proto '=https'."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not str(newurl).startswith("https://"):
+            raise urllib.error.URLError(f"refusing non-HTTPS redirect target {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(HttpsOnlyRedirectHandler)
+
+
 def fetch(spec: dict[str, object], label: str) -> bytes:
     url = spec.get("retrieval_url")
     expected_size = spec.get("size")
@@ -142,7 +155,7 @@ def fetch(spec: dict[str, object], label: str) -> bytes:
     if not isinstance(expected_size, int) or not isinstance(expected_hash, str):
         raise ValueError(f"incomplete source lock for {label}")
     print(f"  fetching {url}", file=sys.stderr)
-    with urllib.request.urlopen(url, timeout=60) as response:
+    with _OPENER.open(url, timeout=60) as response:
         return read_verified_stream(
             response,
             expected_size=expected_size,

@@ -43,14 +43,20 @@ if [[ -f "$DEST" ]]; then
 fi
 
 echo "Downloading ggml-$MODEL.bin"
-trap 'rm -f "$DEST.part"' EXIT
+# Staged under a unique name, like every other fetcher: a fixed ".part" lets two concurrent
+# invocations (parallel CI jobs on a shared workspace, or a double-run) truncate and rename the
+# same inode out from under each other and install a corrupt model while both report success.
+# The pre-existing fixed-name leftover from older revisions is best-effort removed.
+rm -f "$DEST.part"
+PART="$(mktemp "$DEST.part.XXXXXX")"
+trap 'rm -f "$PART"' EXIT
 curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --progress-bar \
-    "$BASE_URL/ggml-$MODEL.bin" -o "$DEST.part"
-if ! verify_model "$DEST.part"; then
+    "$BASE_URL/ggml-$MODEL.bin" -o "$PART"
+if ! verify_model "$PART"; then
     echo "Downloaded model failed SHA-256 verification." >&2
     exit 1
 fi
-mv "$DEST.part" "$DEST"
+mv "$PART" "$DEST"
 trap - EXIT
 
 echo "Wrote $DEST ($(du -h "$DEST" | cut -f1))"

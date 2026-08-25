@@ -492,9 +492,13 @@ class SuggestionStripView(context: Context) : View(context) {
     private fun suggestionWidth(): Float =
         SuggestionStripLayout.suggestionWidth(width.toFloat(), height.toFloat(), voiceEnabled)
 
+    /** The touch that owns the current press, so a resting second finger cannot steal or fire it. */
+    private var activePointerId = MotionEvent.INVALID_POINTER_ID
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                activePointerId = event.getPointerId(event.actionIndex)
                 settingsPressed = isOverSettings(event.x)
                 clipboardPressed = !settingsPressed && isOverClipboard(event.x)
                 editPressed = !settingsPressed && !clipboardPressed && isOverEdit(event.x)
@@ -508,14 +512,22 @@ class SuggestionStripView(context: Context) : View(context) {
                 return overButton || pressedIndex >= 0
             }
 
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                // A strip has no second target: whatever was pressed ends here, so neither the
+                // original finger nor the new one can fire through the other's lift later.
+                releasePress()
+            }
+
             MotionEvent.ACTION_MOVE -> {
-                // Sliding off cancels the press, matching how the keys behave.
-                val inBounds = event.y in 0f..height.toFloat()
-                val stillOnSettings = settingsPressed && isOverSettings(event.x) && inBounds
-                val stillOnClipboard = clipboardPressed && isOverClipboard(event.x) && inBounds
-                val stillOnEdit = editPressed && isOverEdit(event.x) && inBounds
-                val stillOnMic = micPressed && isOverMic(event.x) && inBounds
-                val stillOnWord = pressedIndex >= 0 && indexAt(event.x) == pressedIndex && inBounds
+                // Sliding off cancels the press, matching how the keys behave. Coordinates come
+                // from the pressing finger, not index 0, which may belong to a different touch.
+                val (x, y) = activeCoordinates(event) ?: return true
+                val inBounds = y in 0f..height.toFloat()
+                val stillOnSettings = settingsPressed && isOverSettings(x) && inBounds
+                val stillOnClipboard = clipboardPressed && isOverClipboard(x) && inBounds
+                val stillOnEdit = editPressed && isOverEdit(x) && inBounds
+                val stillOnMic = micPressed && isOverMic(x) && inBounds
+                val stillOnWord = pressedIndex >= 0 && indexAt(x) == pressedIndex && inBounds
                 if (
                     settingsPressed != stillOnSettings ||
                     clipboardPressed != stillOnClipboard ||
@@ -535,51 +547,77 @@ class SuggestionStripView(context: Context) : View(context) {
                 }
             }
 
-            MotionEvent.ACTION_UP -> {
-                val index = pressedIndex
-                val settings = settingsPressed
-                val clipboard = clipboardPressed
-                val edit = editPressed
-                val mic = micPressed
-                val held = longPressFired
-                pressedIndex = -1
-                settingsPressed = false
-                clipboardPressed = false
-                editPressed = false
-                micPressed = false
-                cancelPendingLongPress()
-                invalidate()
-
-                if (settings) {
-                    announceForAccessibility("Keyboard settings")
-                    listener?.onSettingsRequested()
-                } else if (clipboard) {
-                    announceForAccessibility("Clipboard")
-                    listener?.onClipboardRequested()
-                } else if (edit) {
-                    announceForAccessibility("Edit text")
-                    listener?.onTextEditRequested()
-                } else if (mic) {
-                    announceForAccessibility("Voice typing")
-                    listener?.onVoiceRequested()
-                } else if (index in words.indices && !held) {
-                    announceForAccessibility("Suggestion ${words[index]}")
-                    listener?.onSuggestionPicked(index, words[index])
+            MotionEvent.ACTION_POINTER_UP -> {
+                // Only the pressing finger's lift finishes its tap. Another finger lifting must
+                // leave the armed hold and pressed flags exactly as they are.
+                if (!StripPointerRouting.liftIsAuthoritative(
+                        activePointerId,
+                        event.getPointerId(event.actionIndex),
+                    )
+                ) {
+                    return true
                 }
-                return true
+                if (event.findPointerIndex(activePointerId) < 0) {
+                    releasePress()
+                    return true
+                }
+                finishTap()
+            }
+
+            MotionEvent.ACTION_UP -> {
+                finishTap()
             }
 
             MotionEvent.ACTION_CANCEL -> {
-                pressedIndex = -1
-                settingsPressed = false
-                clipboardPressed = false
-                editPressed = false
-                micPressed = false
-                cancelPendingLongPress()
-                invalidate()
+                releasePress()
             }
         }
         return true
+    }
+
+    private fun activeCoordinates(event: MotionEvent): Pair<Float, Float>? {
+        val index = event.findPointerIndex(activePointerId)
+        return if (index >= 0) event.getX(index) to event.getY(index) else null
+    }
+
+    /** Resolves the current press: fires whichever control the pressing finger still holds. */
+    private fun finishTap() {
+        val index = pressedIndex
+        val settings = settingsPressed
+        val clipboard = clipboardPressed
+        val edit = editPressed
+        val mic = micPressed
+        val held = longPressFired
+        releasePress()
+
+        if (settings) {
+            announceForAccessibility("Keyboard settings")
+            listener?.onSettingsRequested()
+        } else if (clipboard) {
+            announceForAccessibility("Clipboard")
+            listener?.onClipboardRequested()
+        } else if (edit) {
+            announceForAccessibility("Edit text")
+            listener?.onTextEditRequested()
+        } else if (mic) {
+            announceForAccessibility("Voice typing")
+            listener?.onVoiceRequested()
+        } else if (index in words.indices && !held) {
+            announceForAccessibility("Suggestion ${words[index]}")
+            listener?.onSuggestionPicked(index, words[index])
+        }
+    }
+
+    /** Clears every pressed flag and the armed hold without firing anything. */
+    private fun releasePress() {
+        activePointerId = MotionEvent.INVALID_POINTER_ID
+        pressedIndex = -1
+        settingsPressed = false
+        clipboardPressed = false
+        editPressed = false
+        micPressed = false
+        cancelPendingLongPress()
+        invalidate()
     }
 
     private fun scheduleLongPress(index: Int) {
@@ -750,4 +788,22 @@ internal object SuggestionPlacement {
     }
 
     private const val NONE = -1
+}
+
+/**
+ * Which finger owns the strip's single press.
+ *
+ * The strip has one press slot but any number of fingers. Kept outside the View so the
+ * ownership rule — the part that was wrong when a resting second thumb could steal or fire
+ * another finger's tap — stays regression-tested.
+ */
+internal object StripPointerRouting {
+
+    /**
+     * True when [liftedPointerId] is the pressing finger's own lift, the only one allowed to
+     * resolve anything. A press that has already ended (invalid active id) owns no lift either,
+     * so a trailing finger's UP stays a harmless no-op.
+     */
+    fun liftIsAuthoritative(activePointerId: Int, liftedPointerId: Int): Boolean =
+        activePointerId != MotionEvent.INVALID_POINTER_ID && activePointerId == liftedPointerId
 }

@@ -66,6 +66,8 @@ class AudioRecorder internal constructor(
     private val backendFactory: AudioCaptureBackendFactory = AndroidAudioCaptureBackendFactory,
     private val joinTimeoutMs: Long = JOIN_TIMEOUT_MS,
     private val maxSamples: Int = MAX_SAMPLES,
+    /** How long the capture worker waits for the dedicated stop thread before releasing anyway. */
+    private val stopJoinTimeoutMs: Long = STOP_JOIN_TIMEOUT_MS,
 ) {
 
     fun interface LevelListener {
@@ -323,15 +325,21 @@ class AudioRecorder internal constructor(
         fun append(chunk: ShortArray, count: Int, observe: (Float) -> Unit): Boolean =
             synchronized(samplesLock) {
                 if (drained.get()) return@synchronized false
-                if (sampleCount + count > maxSamples) return@synchronized true
-                ensureCapacity(sampleCount + count)
-                for (index in 0 until count) {
-                    val sample = chunk[index] / PCM_16_FULL_SCALE
-                    samples[sampleCount + index] = sample
-                    observe(sample)
+                val limitReached = sampleCount + count > maxSamples
+                // At the cap the fitting prefix of this chunk is kept rather than dropping the
+                // whole thing: the overflow lands mid-utterance, so discarding it would throw
+                // away exactly the speech the recording limit cut off.
+                val accepted = if (limitReached) (maxSamples - sampleCount).coerceAtLeast(0) else count
+                if (accepted > 0) {
+                    ensureCapacity(sampleCount + accepted)
+                    for (index in 0 until accepted) {
+                        val sample = chunk[index] / PCM_16_FULL_SCALE
+                        samples[sampleCount + index] = sample
+                        observe(sample)
+                    }
+                    sampleCount += accepted
                 }
-                sampleCount += count
-                false
+                limitReached
             }
 
         fun copyAndWipe(): FloatArray = synchronized(samplesLock) {
@@ -375,15 +383,38 @@ class AudioRecorder internal constructor(
                 }
             } else {
                 var interrupted = false
-                while (true) {
+                // Bounded overall, not per attempt: an interrupt mid-await retries against the
+                // same deadline rather than restarting the clock.
+                val deadlineNanos = System.nanoTime() + stopJoinTimeoutMs * 1_000_000
+                var stopThreadSettled = false
+                while (!stopThreadSettled) {
+                    val remainingNanos = deadlineNanos - System.nanoTime()
+                    if (remainingNanos <= 0) break
                     try {
-                        stopFinished.await()
-                        break
+                        stopThreadSettled =
+                            stopFinished.await(remainingNanos, TimeUnit.NANOSECONDS)
                     } catch (_: InterruptedException) {
                         // Releasing while backend.stop is still inside vendor code can race native
                         // ownership. Finish the handoff, then restore the worker's interrupt bit.
                         interrupted = true
                     }
+                }
+                if (!stopThreadSettled) {
+                    // A vendor stop() that never returns must not hold the microphone open for
+                    // the rest of the process, which is what waiting indefinitely here would do:
+                    // the terminated latch below would never fire and every future start() would
+                    // be refused for ever. Releasing from the worker instead races a wedged
+                    // native stop, but that is the lesser failure — the isolated :asr process can
+                    // be killed and restarted, whereas a permanently captured mic cannot be given
+                    // back by anything short of that same kill.
+                    //
+                    // The residual window is real and accepted: release() below runs while the
+                    // stop thread may still sit inside vendor code, so the driver can observe
+                    // release-during-stop and crash this process natively. There is no local way
+                    // to make that safe — skipping release() trades a bounded crash risk for a
+                    // microphone held until process death — so this path only ever runs after
+                    // STOP_JOIN_TIMEOUT_MS, i.e. against a driver already believed wedged.
+                    Log.e(TAG, "Audio stop did not settle within ${stopJoinTimeoutMs}ms; releasing regardless")
                 }
                 if (interrupted) Thread.currentThread().interrupt()
             }
@@ -416,6 +447,13 @@ class AudioRecorder internal constructor(
         const val MAX_SAMPLES = WhisperTranscriber.SAMPLE_RATE * 120
 
         const val JOIN_TIMEOUT_MS = 500L
+
+        /**
+         * Generous bound on the dedicated stop thread. Real AudioRecord.stop() calls return in
+         * single-digit milliseconds; anything approaching this is a wedged vendor driver.
+         */
+        const val STOP_JOIN_TIMEOUT_MS = 3_000L
+
         const val LEVEL_GAIN = 4f
     }
 }

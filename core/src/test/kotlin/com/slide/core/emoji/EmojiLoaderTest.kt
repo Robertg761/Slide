@@ -148,6 +148,20 @@ class EmojiLoaderTest {
     }
 
     @Test
+    fun `classifies an entry from any word-start occurrence not only the first`() {
+        // The first occurrence of "shake" inside "handshake" is mid-word, but the entry also
+        // carries "shake" as its own keyword. Classifying from the first hit alone would bury it
+        // behind entries that only ever match mid-word.
+        val bytes = catalogueOf(
+            "🅰" to "ashake", // mid-word only
+            "🅱" to "handshake shake", // first hit mid-word, second at a word start
+        )
+        val synthetic = EmojiLoader.read(ByteArrayInputStream(bytes))
+
+        assertEquals(listOf("🅱", "🅰"), synthetic.search("shake").map(synthetic::emojiAt))
+    }
+
+    @Test
     fun `returns nothing for an empty or unmatched query`() {
         assertEquals(0, data.search("").size)
         assertEquals(0, data.search("   ").size)
@@ -228,6 +242,27 @@ class EmojiLoaderTest {
             val search = "pizza".toByteArray(Charsets.UTF_8)
             out.writeShort(search.size)
             out.write(search)
+        }
+        return bytes.toByteArray()
+    }
+
+    /** Entries in order, each untone, all in one category, with the given searchable text. */
+    private fun catalogueOf(vararg entries: Pair<String, String>): ByteArray {
+        val bytes = ByteArrayOutputStream()
+        DataOutputStream(bytes).use { out ->
+            out.writeInt(0x53454D4A) // "SEMJ"
+            out.writeByte(1) // version
+            out.writeByte(1) // one category
+            out.writeShortString("Category")
+            out.writeShort(entries.size)
+            for ((emoji, search) in entries) {
+                out.writeByte(0) // category 0
+                out.writeShortString(emoji)
+                out.writeByte(0) // no skin tones
+                val encoded = search.toByteArray(Charsets.UTF_8)
+                out.writeShort(encoded.size)
+                out.write(encoded)
+            }
         }
         return bytes.toByteArray()
     }

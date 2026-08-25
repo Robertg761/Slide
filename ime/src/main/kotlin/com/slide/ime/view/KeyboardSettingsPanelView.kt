@@ -341,20 +341,6 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
             // TalkBack's slider actions keep working.
             contentDescription = title
         }
-        control.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
-                valueLabel.text = formatValue(valueAt(progress))
-            }
-
-            override fun onStartTrackingTouch(bar: SeekBar) = Unit
-
-            override fun onStopTrackingTouch(bar: SeekBar) {
-                if (binding) return
-                val updated = update(settings, valueAt(bar.progress))
-                settings = updated
-                listener?.onKeyboardSettingsChanged(updated)
-            }
-        })
 
         val row = LinearLayout(context).apply {
             orientation = VERTICAL
@@ -365,7 +351,9 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
         parent.addView(row, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         addDivider(parent)
 
-        sliders += SliderBinding(
+        val span = valueRange.endInclusive - valueRange.start
+        val initialFraction = ((read(settings) - valueRange.start) / span).coerceIn(0f, 1f)
+        val slider = SliderBinding(
             row = row,
             control = control,
             valueLabel = valueLabel,
@@ -374,7 +362,42 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
             read = read,
             formatValue = formatValue,
             enabledWhen = enabledWhen,
+            lastPublishedProgress = Math.round(initialFraction * positions),
         )
+
+        var tracking = false
+        fun publish(progress: Int) {
+            // The setting already holding this value means a tap landed where it was or TalkBack
+            // re-stepped onto it; republishing would relayout the keyboard for nothing.
+            if (!SliderCommitPolicy.valueChanged(progress, slider.lastPublishedProgress)) return
+            slider.lastPublishedProgress = progress
+            val updated = update(settings, valueAt(progress))
+            settings = updated
+            listener?.onKeyboardSettingsChanged(updated)
+        }
+        control.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
+                valueLabel.text = formatValue(valueAt(progress))
+                // A finger drag publishes once, when it lifts. TalkBack's slider actions and
+                // hardware/rotary input move the thumb without ever starting or stopping
+                // tracking, so those changes have to commit here instead — otherwise the label
+                // shows a value that was never applied. See SliderCommitPolicy for the matrix.
+                if (!SliderCommitPolicy.commitsOnProgress(fromUser, tracking, binding)) return
+                publish(progress)
+            }
+
+            override fun onStartTrackingTouch(bar: SeekBar) {
+                tracking = true
+            }
+
+            override fun onStopTrackingTouch(bar: SeekBar) {
+                tracking = false
+                if (binding) return
+                publish(bar.progress)
+            }
+        })
+
+        sliders += slider
     }
 
     /**
@@ -453,6 +476,9 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
             val span = slider.valueRange.endInclusive - slider.valueRange.start
             val fraction = ((value - slider.valueRange.start) / span).coerceIn(0f, 1f)
             slider.control.progress = Math.round(fraction * slider.positions)
+            // The bound value is now the published one; without this a later identical
+            // user action could be wrongly deduplicated against the stale position.
+            slider.lastPublishedProgress = slider.control.progress
             slider.valueLabel.text = slider.formatValue(value)
         }
         binding = false
@@ -533,6 +559,13 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
         val update: (KeyboardSettings, Boolean) -> KeyboardSettings,
     )
 
+    /**
+     * A bound slider row, plus the seek-bar position the setting was last published at.
+     *
+     * [lastPublishedProgress] is what keeps a no-change tap or a TalkBack step onto the current
+     * value from republishing; [bindSettings] rewrites it whenever the UI is re-bound to state
+     * that changed elsewhere.
+     */
     private data class SliderBinding(
         val row: View,
         val control: SeekBar,
@@ -542,6 +575,7 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
         val read: (KeyboardSettings) -> Float,
         val formatValue: (Float) -> String,
         val enabledWhen: (KeyboardSettings) -> Boolean,
+        var lastPublishedProgress: Int,
     )
 
     private data class ThemeOption(
@@ -577,4 +611,23 @@ internal class BackIconView(context: Context) : View(context) {
         canvas.drawLine(centerX + horizontal / 2f, centerY - vertical, centerX - horizontal / 2f, centerY, paint)
         canvas.drawLine(centerX - horizontal / 2f, centerY, centerX + horizontal / 2f, centerY + vertical, paint)
     }
+}
+
+/**
+ * When a seek-bar movement becomes a published setting change.
+ *
+ * Separated from the SeekBar listener plumbing because the interesting part is the matrix of
+ * input sources: a finger drag must commit once on lift, TalkBack's slider actions and
+ * hardware/rotary input move the thumb without ever starting or stopping tracking, and programmatic
+ * rebinds report fromUser=false and must never publish.
+ */
+internal object SliderCommitPolicy {
+
+    /** True for a progress change that should publish immediately (non-drag user input). */
+    fun commitsOnProgress(fromUser: Boolean, tracking: Boolean, binding: Boolean): Boolean =
+        fromUser && !tracking && !binding
+
+    /** True unless the thumb already sits at the last published position. */
+    fun valueChanged(progress: Int, lastPublishedProgress: Int): Boolean =
+        progress != lastPublishedProgress
 }

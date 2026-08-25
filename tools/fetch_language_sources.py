@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -160,12 +161,28 @@ def read_verified_stream(
     return bytes(payload)
 
 
+class HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuses any redirect that leaves https, matching the curl scripts' --proto '=https'."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not str(newurl).startswith("https://"):
+            raise urllib.error.URLError(f"refusing non-HTTPS redirect target {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(HttpsOnlyRedirectHandler)
+
+
 def download(spec: SourceSpec) -> bytes:
+    # Fail closed even when called with a hand-built spec rather than one from load_lock(),
+    # whose validate_spec normally provides this guarantee.
+    if not spec.retrieval_url.startswith("https://"):
+        raise ValueError(f"source {spec.key!r} must use HTTPS")
     print(f"fetching {spec.key}: {spec.retrieval_url}", file=sys.stderr)
     request = urllib.request.Request(
         spec.retrieval_url, headers={"User-Agent": "Slide-source-fetch/1"}
     )
-    with urllib.request.urlopen(request, timeout=120) as response:
+    with _OPENER.open(request, timeout=120) as response:
         return read_verified_stream(
             response,
             expected_size=spec.size,

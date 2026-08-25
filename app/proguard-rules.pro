@@ -2,6 +2,12 @@
 # method names, but keeping this boundary explicitly makes that release-critical contract visible.
 -keep class com.slide.asr.WhisperNative { *; }
 
+# The partial-transcript callback is resolved by name and signature from JNI
+# (whisper_jni.cpp GetMethodID "onPartialSegment") and is otherwise referenced only by a SAM
+# lambda, so R8 is free to rename or remove the nested interface and its method in release
+# builds — which would silently drop live dictation captions while keeping the final result.
+-keep class com.slide.asr.WhisperNative$PartialListener { *; }
+
 # ExecuTorch's prebuilt libexecutorch.so resolves this Java API by exact JNI class, method, and
 # field names. The patched AAR does not carry consumer rules, so preserve the complete boundary;
 # otherwise R8 can retain Module while removing EValue/Tensor and release-only neural inference

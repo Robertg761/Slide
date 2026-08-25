@@ -199,7 +199,11 @@ class VoiceInputClient(private val context: Context) {
         if (sessionId == VoiceInput.NO_SESSION_ID) return
         pendingStart = null
         if (service == null) {
-            reportActiveFailure(VoiceInput.Error.ServiceUnavailable)
+            // The connection has not arrived yet, so MSG_START never left and there is no audio
+            // to transcribe. Nothing failed — ending here locally is the same treatment cancel()
+            // gives the identical situation, and the overlay needs the Idle to close.
+            session.finish(sessionId)
+            listener?.onVoiceState(VoiceInput.State.Idle)
             return
         }
         send(request(VoiceInput.MSG_STOP, sessionId))

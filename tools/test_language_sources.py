@@ -3,16 +3,20 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import io
 import os
 import stat
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
 import build_emoji
+import fetch_language_sources
 from rebuild_language_assets import replace_file
 from fetch_language_sources import (
     SourceSpec,
@@ -215,22 +219,52 @@ class LanguageSourceLockTest(unittest.TestCase):
             "sha256": source_spec.sha256,
         }
 
+        # Both fetchers go through their module-level opener, not bare urlopen; patching
+        # anything else would silently stop intercepting and attempt real network I/O.
         source_response = ChunkedResponse(expected + b"overflow", max_chunk_size=2)
-        with mock.patch(
-            "fetch_language_sources.urllib.request.urlopen",
-            return_value=source_response,
+        with mock.patch.object(
+            fetch_language_sources._OPENER, "open", return_value=source_response
         ):
             with self.assertRaisesRegex(ValueError, "exceeds the lock size"):
                 download(source_spec)
         self.assertEqual(len(expected) + 1, source_response.bytes_read)
 
         emoji_response = ChunkedResponse(expected + b"overflow", max_chunk_size=2)
-        with mock.patch.object(
-            build_emoji.urllib.request, "urlopen", return_value=emoji_response
-        ):
+        with mock.patch.object(build_emoji._OPENER, "open", return_value=emoji_response):
             with self.assertRaisesRegex(ValueError, "exceeds the locked source size"):
                 build_emoji.fetch(emoji_spec, "fixture")
         self.assertEqual(len(expected) + 1, emoji_response.bytes_read)
+
+    def test_non_https_redirect_is_refused_by_both_fetchers(self) -> None:
+        for module in (fetch_language_sources, build_emoji):
+            handler = module.HttpsOnlyRedirectHandler()
+            for target in ("http://example.invalid/payload", "ftp://example.invalid/x"):
+                with self.assertRaises(urllib.error.URLError):
+                    handler.redirect_request(
+                        object(), None, 302, "Found", {}, target,
+                    )
+            # An https redirect still goes through, delegating to the standard handler.
+            redirected = handler.redirect_request(
+                urllib.request.Request("https://example.invalid/a"),
+                None, 302, "Found", {}, "https://example.invalid/b",
+            )
+            self.assertEqual("https://example.invalid/b", redirected.full_url)
+
+    def test_plain_http_retrieval_urls_are_rejected(self) -> None:
+        expected = b"x"
+        insecure_source = dataclasses.replace(
+            fixture_spec(expected), retrieval_url="http://example.invalid/fixture.dat"
+        )
+        with self.assertRaisesRegex(ValueError, "HTTPS"):
+            download(insecure_source)
+
+        insecure_emoji: dict[str, object] = {
+            "retrieval_url": "http://example.invalid/fixture.dat",
+            "size": len(expected),
+            "sha256": hashlib.sha256(expected).hexdigest(),
+        }
+        with self.assertRaisesRegex(ValueError, "retrieval URL"):
+            build_emoji.fetch(insecure_emoji, "fixture")
 
 
 if __name__ == "__main__":

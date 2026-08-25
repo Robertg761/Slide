@@ -67,14 +67,11 @@ class EmojiData(
         var trailingCount = 0
 
         for (index in emoji.indices) {
-            val at = searchText[index].indexOf(needle)
-            if (at < 0) continue
-            val atWordStart = at == 0 || searchText[index][at - 1] == ' '
-            if (atWordStart) {
+            if (matchesAtWordStart(index, needle)) {
                 if (leadingCount < limit) leading[leadingCount++] = index
                 // Nothing beats a full page of word-start matches, so stop looking for weaker ones.
                 if (leadingCount == limit) break
-            } else if (trailingCount < limit) {
+            } else if (searchText[index].contains(needle) && trailingCount < limit) {
                 trailing[trailingCount++] = index
             }
         }
@@ -86,6 +83,23 @@ class EmojiData(
             trailing.copyInto(result, leadingCount, 0, total - leadingCount)
         }
         return result
+    }
+
+    /**
+     * Whether any occurrence of [needle] in entry [index]'s searchable text starts a word.
+     *
+     * Every occurrence has to be considered, not only the first: "handshake" contains "shake"
+     * mid-word but also carries "shake" as its own keyword, and classifying the entry from the
+     * first hit alone would bury it behind weaker matches.
+     */
+    private fun matchesAtWordStart(index: Int, needle: String): Boolean = run {
+        val text = searchText[index]
+        var at = text.indexOf(needle)
+        while (at >= 0) {
+            if (at == 0 || text[at - 1] == ' ') return@run true
+            at = text.indexOf(needle, at + 1)
+        }
+        false
     }
 
     /**

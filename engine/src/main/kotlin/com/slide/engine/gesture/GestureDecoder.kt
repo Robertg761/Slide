@@ -149,10 +149,16 @@ class GestureDecoder(
     ): List<GestureCandidate> {
         contextIndex = contextIndexFor(previousWord)
         olderContextIndex = contextIndexFor(previousPreviousWord)
-        if (points.size < config.minimumPoints) return emptyList()
+        if (points.size < config.minimumPoints) {
+            lastScoredCount = 0
+            return emptyList()
+        }
 
         val trace = SampledTrace.of(points, config.sampleCount)
-        if (trace.pathLength() < keys.keyWidth * config.minimumPathLengthFactor) return emptyList()
+        if (trace.pathLength() < keys.keyWidth * config.minimumPathLengthFactor) {
+            lastScoredCount = 0
+            return emptyList()
+        }
 
         val normalizedTrace = trace.normalized()
         buildNearIndices(trace, keys)
@@ -169,7 +175,10 @@ class GestureDecoder(
             maxDistance = keys.keyWidth * config.endpointRadiusFactor,
             limit = config.endpointCandidates,
         )
-        if (startLetters.isEmpty() || endLetters.isEmpty()) return emptyList()
+        if (startLetters.isEmpty() || endLetters.isEmpty()) {
+            lastScoredCount = 0
+            return emptyList()
+        }
 
         results.reset()
         var scored = 0

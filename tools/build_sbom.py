@@ -90,7 +90,9 @@ def resolved_runtime_artifacts(
                 raise ValueError(f"{context}: invalid artifact SHA-256")
 
             if kind == "maven":
-                if not all((group, name, version)) or "-" in (group, name, version):
+                # Coordinates may legitimately contain hyphens ("1.2.0-alpha01"); only a field
+                # that is literally the local-artifact placeholder is rejected.
+                if not all((group, name, version)) or "-" in {group, name, version}:
                     raise ValueError(f"{context}: incomplete Maven coordinate")
                 artifact = Path(raw_path)
                 if not artifact.is_absolute():

@@ -30,13 +30,9 @@ class GestureKeyMap private constructor(
 
     fun centerY(letter: Char): Float = centerY[index(letter)]
 
-    fun distanceTo(letter: Char, x: Float, y: Float): Float {
-        val i = index(letter)
-        return hypot(centerX[i] - x, centerY[i] - y)
-    }
-
     /** Letters nearest to a point, closest first, limited to those within [maxDistance]. */
     fun lettersNear(x: Float, y: Float, maxDistance: Float, limit: Int): CharArray {
+        if (limit <= 0) return CharArray(0)
         // A 26-entry selection sort beats allocating and sorting a list, and this runs on the
         // touch-up path where the user is already waiting to see a word.
         val chosen = CharArray(limit)

@@ -194,8 +194,52 @@ class AudioRecorderTest {
         assertTrue(ended.await(1, TimeUnit.SECONDS))
         val audio = recorder.stop()
 
-        assertArrayEquals(floatArrayOf(1_000f / 32_768f, 2_000f / 32_768f), audio, 0f)
+        // The second chunk overflows the cap by one sample: the fitting prefix is kept rather
+        // than discarding the whole chunk at the exact moment speech is cut off.
+        assertArrayEquals(
+            floatArrayOf(
+                1_000f / 32_768f,
+                2_000f / 32_768f,
+                3_000f / 32_768f,
+            ),
+            audio,
+            0f,
+        )
         assertEquals(1, backend.releaseCount.get())
+    }
+
+    @Test
+    fun `hung backend stop cannot hold the microphone for ever`() {
+        val stopGate = CountDownLatch(1) // Never opened; stands in for a wedged vendor driver.
+        val readGate = CountDownLatch(1)
+        val first = FakeBackend(
+            actions = listOf(
+                ReadAction.Data(shortArrayOf(4_096)),
+                // The capture worker sits here until released independently of stop(), which is
+                // what a real wedged AudioRecord.stop() looks like from the read loop's side.
+                ReadAction.ExternalBlock(readGate, shortArrayOf(8_192)),
+            ),
+            stopGate = stopGate,
+        )
+        val second = FakeBackend(
+            actions = listOf(ReadAction.Data(shortArrayOf(16_384)), ReadAction.BlockUntilStop),
+        )
+        val factory = QueueFactory(first, second)
+        val recorder = AudioRecorder(factory, joinTimeoutMs = 50L, stopJoinTimeoutMs = 100L)
+
+        assertTrue(recorder.start())
+        assertTrue(first.secondReadEntered.await(1, TimeUnit.SECONDS))
+        recorder.stop()
+        readGate.countDown()
+
+        // The worker released the backend itself after the bounded wait, so termination fires
+        // and a new capture becomes possible without waiting on the stuck stop thread.
+        assertTrue(first.released.await(2, TimeUnit.SECONDS))
+        assertEquals(1, first.releaseCount.get())
+        assertTrue(awaitStart(recorder))
+        assertTrue(second.secondReadEntered.await(1, TimeUnit.SECONDS))
+        val secondAudio = recorder.stop()
+        assertArrayEquals(floatArrayOf(16_384f / 32_768f), secondAudio, 0f)
     }
 
     private fun awaitStart(recorder: AudioRecorder, timeoutMs: Long = 1_000L): Boolean {

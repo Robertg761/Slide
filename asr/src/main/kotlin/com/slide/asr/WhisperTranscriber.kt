@@ -6,6 +6,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ExecutorService
 import kotlin.math.abs
 import kotlin.math.min
+import kotlin.math.sqrt
 import kotlin.coroutines.resume
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.NonCancellable
@@ -116,24 +117,23 @@ class WhisperTranscriber(
                 // Whisper's learned no-speech token is probabilistic and can still hallucinate a
                 // short word from digital silence (the packaged base model has produced "you" on
                 // both API 26 and API 37 emulators). Reject audio with no meaningful signal before
-                // inference. Peak amplitude is intentionally used rather than RMS so a brief real
-                // consonant is not erased by a long quiet lead-in or tail.
+                // inference, in two stages: the peak gate asks whether any single sample rises
+                // above the capture quantisation step — peak, not RMS, so a brief consonant is not
+                // erased by a long quiet lead-in or tail — and the RMS floor then reclassifies
+                // buffers whose entire energy sits at dither level, which a peak test alone cannot
+                // see. See isDigitallySilent.
                 if (isDigitallySilent(samples)) return@withLock Result.NoSpeech
 
                 val token = WhisperNative.createCancellationToken()
                 if (token == 0L) return@withLock Result.Failed("Speech recognition failed")
 
                 synchronized(cancellationLock) { activeCancellationToken = token }
-                // One buffer, owned by the decode thread that appends to it and read only after
-                // the native call has returned: no cross-thread access needs synchronising.
-                val accumulated = StringBuilder()
+                // The assembler owns the growing caption; the native callback only hands over
+                // one raw segment at a time.
+                val partials = PartialAssembler()
                 val partialListener = onPartial?.let { receiver ->
                     WhisperNative.PartialListener { chunk ->
-                        val piece = decodeTranscript(chunk)
-                        if (!piece.isNullOrEmpty()) {
-                            accumulated.append(piece)
-                            receiver(accumulated.toString())
-                        }
+                        partials.append(decodeTranscript(chunk))?.let(receiver)
                     }
                 }
                 try {
@@ -241,10 +241,67 @@ class WhisperTranscriber(
             }
         }
 
-        /** True only for effectively zero PCM, below one 16-bit capture quantisation step. */
-        internal fun isDigitallySilent(samples: FloatArray): Boolean =
-            samples.none { abs(it) >= MIN_AUDIBLE_PEAK }
+    /**
+     * True for audio that cannot carry speech: either literally digital silence, or a signal
+     * confined to the capture chain's last quantisation step. Peak alone answered only the first,
+     * so ordinary dithered room tone — every sample oscillating between ±1 LSB — read as speech
+     * and went to inference, which is precisely where its hallucinations come from. The RMS floor
+     * is set far above any dither yet far below the quietest real voice content, so it reclassifies
+     * converter noise without threatening a brief consonant inside a long quiet lead-in: that
+     * consonant's energy lifts the whole-buffer RMS by orders of magnitude over the floor.
+     */
+    internal fun isDigitallySilent(samples: FloatArray): Boolean {
+        var sumOfSquares = 0.0
+        var peakAudible = false
+        for (sample in samples) {
+            val magnitude = abs(sample.toDouble())
+            sumOfSquares += magnitude * magnitude
+            if (magnitude >= MIN_AUDIBLE_PEAK) peakAudible = true
+        }
+        if (!peakAudible) return true
+        val rootMeanSquare = sqrt(sumOfSquares / samples.size)
+        return rootMeanSquare < DITHER_FLOOR_RMS
+    }
 
-        private const val MIN_AUDIBLE_PEAK = 1f / 32768f
+    private const val MIN_AUDIBLE_PEAK = 1f / 32768f
+
+    /** About two quantisation steps of RMS: dither territory, orders below any real speech. */
+    private const val DITHER_FLOOR_RMS = 2.0 / 32768.0
+    }
+}
+
+/**
+ * Assembles live captions exactly like the native final assembly.
+ *
+ * whisper starts every segment with a space, and that space is what separates words across the
+ * segment boundary — so segments are concatenated verbatim and only the whole is trimmed at the
+ * end, mirroring `tidy()` in whisper_jni.cpp down to its exact character set. Trimming each
+ * segment before appending instead would glue multi-segment captions into "Helloworld" while the
+ * final transcript kept its spaces, and then no UI could treat its last partial as replaceable.
+ * The decode thread is the only caller, so no locking is needed.
+ */
+internal class PartialAssembler {
+
+    private val accumulated = StringBuilder()
+
+    /**
+     * Appends one raw native segment and returns the cumulative transcript to display, or null
+     * while nothing visible has accumulated yet.
+     */
+    fun append(piece: String?): String? {
+        if (piece.isNullOrEmpty()) return null
+        accumulated.append(piece)
+        return tidy(accumulated.toString()).ifEmpty { null }
+    }
+
+    companion object {
+        /**
+         * The same three characters whisper_jni.cpp's tidy() trims; interiors pass through
+         * untouched. KEEP IN SYNC with that function: the last-partial-equals-final guarantee
+         * holds only while both sides trim exactly ' ', '\t', '\n' — and nothing more — from the
+         * assembled whole.
+         */
+        internal fun tidy(value: String): String =
+            value.trim { it == ' ' || it == '\t' || it == '\n' }
     }
 }
