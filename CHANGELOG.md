@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.5.3] - 2026-08-26
+
+### Fixed
+
+- Live dictation captions no longer run words together when a long dictation spans multiple
+  whisper segments. Segments are now assembled exactly the way the final transcript is, so the
+  last caption a panel shows equals the text that gets committed in its place.
+- Dithered room tone at the capture chain's least significant bit is recognised as silence rather
+  than speech, which removes the quietest class of input that whisper answered with hallucinated
+  words; real audio — even a brief consonant inside a long silent lead-in — still decodes.
+- A wedged vendor audio stop can no longer hold the microphone for the rest of the process. The
+  recorder gives up on the stuck driver after a bounded wait instead of refusing every future
+  dictation until the speech process is killed.
+- The speech that a two-minute recording limit cuts off mid-utterance keeps its fitting tail
+  instead of discarding the whole final chunk.
+- Stopping a dictation before the speech process has finished connecting now closes the overlay
+  quietly, like Cancel, instead of reporting a service failure for audio that never existed.
+- Emoji search finds an entry whose keyword appears at a word start later in its text even when an
+  earlier occurrence is buried mid-word, so "shake" reaches handshake instead of burying it.
+- An emoji recents entry missing from the current catalogue no longer crashes the picker's
+  accessibility nodes, and a shrunken recents list clamps its scroll offset so cells keep drawing.
+- Keyboard alternate accessibility actions commit the character their advertised label showed,
+  even when shift state changed between enumeration and invocation, falling back to a live lookup
+  only for actions never populated under the current tree.
+- Settings sliders commit TalkBack slider-action and hardware or rotary changes — previously the
+  label could show a value that was never applied — and no longer republish positions the setting
+  already holds.
+
+### Changed
+
+- The suggestion strip ignores resting second fingers entirely: whatever one finger pressed ends
+  the moment another lands, so neither thumb can fire the other's tap through its lift.
+- Text-editing arrow buttons stop auto-repeating and stop drawing pressed when the finger slides
+  off them, re-entering does not silently resume, and their accessibility click now moves the
+  cursor where touch always did.
+- Emoji long-press timing follows the platform long-press timeout, matching the keys' feel.
+- Speech teardown happens off the service's main looper and recording stops off it too, so slow
+  native shutdown cannot queue new dictation commands behind it.
+
+- Source-fetch tooling refuses non-HTTPS redirects and plain-http sources, concurrent model
+  downloads stage under unique names instead of corrupting each other, transient adb failures no
+  longer abort emulator CI, and release verification asserts the JNI-resolved dictation callback
+  survives minification.
+
 ## [0.5.2] - 2026-08-22
 
 ### Fixed
