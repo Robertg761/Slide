@@ -101,6 +101,7 @@ import com.slide.ime.view.TextEditPanelView
 import com.slide.ime.view.VoiceOverlayView
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -129,7 +130,20 @@ class SlideInputMethodService :
     ClipboardPanelView.Listener {
 
     private lateinit var settingsRepository: SettingsRepository
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    /**
+     * A failure that escapes one of the service's own coroutines is logged, not fatal. The
+     * children of this scope are asset loads, settings collection, emoji bookkeeping and
+     * learned-data saves: any one of them failing leaves the keyboard poorer, but a keyboard
+     * that vanishes mid-sentence from under whatever app the user is in is strictly worse, and
+     * the stack trace is still in logcat. [SupervisorJob] keeps the sibling coroutines running
+     * after one fails; on its own it does nothing to stop the exception reaching the thread's
+     * uncaught handler, which is what took the process down.
+     */
+    private val uncaughtFailureHandler = CoroutineExceptionHandler { _, failure ->
+        Log.e(TAG, "Uncaught failure in a keyboard coroutine", failure)
+    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate + uncaughtFailureHandler)
 
     private var keyboardView: KeyboardView? = null
     private var suggestionStrip: SuggestionStripView? = null
@@ -4529,8 +4543,16 @@ class SlideInputMethodService :
             KeyType.ENTER,
         )
 
-        /** Process-lifetime IO for a final snapshot after an IME service instance is destroyed. */
-        val LEARNED_DATA_FINALIZER_SCOPE = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        /**
+         * Process-lifetime IO for a final snapshot after an IME service instance is destroyed.
+         * Outlives every service instance, so it carries its own handler: a failed final save
+         * is logged and the snapshot stays dirty for the next instance to retry.
+         */
+        val LEARNED_DATA_FINALIZER_SCOPE = CoroutineScope(
+            SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, failure ->
+                Log.e(TAG, "Uncaught failure in a learned-data finalizer", failure)
+            },
+        )
 
         /** Most recently scheduled finalizer; each new finalizer and service startup joins it. */
         @Volatile

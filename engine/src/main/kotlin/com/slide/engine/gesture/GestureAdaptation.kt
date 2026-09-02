@@ -166,7 +166,7 @@ class GestureAdaptation internal constructor(
     fun snapshot(): GestureAdaptationSnapshot {
         return GestureAdaptationSnapshot(
             version = SNAPSHOT_VERSION,
-            saltHex = salt.toHex(),
+            saltHex = salt.toHexString(),
             epoch = epoch,
             alternatives = alternatives.entries
                 .filter { effective(it.value) > 0 }
@@ -325,10 +325,6 @@ class GestureAdaptation internal constructor(
         digest.update(salt)
         val bytes = digest.digest(normalized.toByteArray(StandardCharsets.UTF_8))
         return ByteBuffer.wrap(bytes).long
-    }
-
-    private fun ByteArray.toHex(): String = joinToString(separator = "") { byte ->
-        "%02x".format(Locale.ROOT, byte.toInt() and 0xff)
     }
 
     private fun String.hexToBytes(): ByteArray? {

@@ -2,6 +2,7 @@ package com.slide.engine.lexicon
 
 import android.content.Context
 import android.util.Log
+import com.slide.core.io.AtomicFiles
 import com.slide.engine.gesture.GestureAdaptation
 import com.slide.engine.gesture.GestureAdaptationSnapshot
 import com.slide.engine.gesture.GestureAlternativePreference
@@ -14,10 +15,6 @@ import java.io.IOException
 import java.io.OutputStreamWriter
 import java.nio.channels.FileChannel
 import java.nio.charset.StandardCharsets
-import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption.ATOMIC_MOVE
-import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.nio.file.StandardOpenOption
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArraySet
@@ -380,13 +377,7 @@ class UserDictionaryStore(
             // check also makes an externally-created marker fail closed before replacement.
             if (deletionPending()) return false
 
-            try {
-                Files.move(temporary.toPath(), target.toPath(), REPLACE_EXISTING, ATOMIC_MOVE)
-            } catch (_: AtomicMoveNotSupportedException) {
-                // The app's private files normally live on one filesystem and support atomic
-                // rename. Replacement is still collision-safe on unusual filesystems that do not.
-                Files.move(temporary.toPath(), target.toPath(), REPLACE_EXISTING)
-            }
+            AtomicFiles.replace(temporary, target)
             // The bytes were synced above, but the rename that made them the dictionary lives in
             // the directory, and that is a separate write. Without this a power cut can leave the
             // old file — or no file — behind data we have already told the caller is saved.
