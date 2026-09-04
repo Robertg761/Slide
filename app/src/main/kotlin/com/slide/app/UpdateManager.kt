@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
+import com.slide.core.io.Sha256
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
@@ -623,7 +624,7 @@ object UpdateManager {
             if (!looksLikeZip(partial)) {
                 throw IOException("The downloaded file is not an APK")
             }
-            val actualDigest = digest.digest().toHex()
+            val actualDigest = digest.digest().toHexString()
             if (actualDigest != update.apkSha256) {
                 throw IOException("The downloaded APK failed its GitHub SHA-256 check")
             }
@@ -687,16 +688,7 @@ object UpdateManager {
 
     private fun stagedApkMatches(file: File, expectedSize: Long, expectedSha256: String): Boolean {
         if (file.length() != expectedSize || !looksLikeZip(file)) return false
-        val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { input ->
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                digest.update(buffer, 0, count)
-            }
-        }
-        return digest.digest().toHex() == expectedSha256
+        return Sha256.hex(file) == expectedSha256
     }
 
     /** Every APK is a zip, and an error page served in its place is the thing this catches. */
@@ -835,8 +827,7 @@ object UpdateManager {
             .maxWithOrNull { left, right -> compare(left.version, right.version) }
     }
 
-    internal fun sha256Hex(bytes: ByteArray): String =
-        MessageDigest.getInstance("SHA-256").digest(bytes).toHex()
+    internal fun sha256Hex(bytes: ByteArray): String = Sha256.hex(bytes)
 
     internal fun requiredFreeBytes(downloadSize: Long): Long = try {
         Math.addExact(Math.multiplyExact(downloadSize, 2L), FREE_SPACE_HEADROOM)
@@ -860,10 +851,6 @@ object UpdateManager {
             end--
         }
         return notes.substring(0, end)
-    }
-
-    private fun ByteArray.toHex(): String = joinToString(separator = "") { byte ->
-        "%02x".format(byte.toInt() and 0xff)
     }
 
     private data class SemVer(

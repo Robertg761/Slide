@@ -101,6 +101,7 @@ import com.slide.ime.view.TextEditPanelView
 import com.slide.ime.view.VoiceOverlayView
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -129,7 +130,20 @@ class SlideInputMethodService :
     ClipboardPanelView.Listener {
 
     private lateinit var settingsRepository: SettingsRepository
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    /**
+     * A failure that escapes one of the service's own coroutines is logged, not fatal. The
+     * children of this scope are asset loads, settings collection, emoji bookkeeping and
+     * learned-data saves: any one of them failing leaves the keyboard poorer, but a keyboard
+     * that vanishes mid-sentence from under whatever app the user is in is strictly worse, and
+     * the stack trace is still in logcat. [SupervisorJob] keeps the sibling coroutines running
+     * after one fails; on its own it does nothing to stop the exception reaching the thread's
+     * uncaught handler, which is what took the process down.
+     */
+    private val uncaughtFailureHandler = CoroutineExceptionHandler { _, failure ->
+        Log.e(TAG, "Uncaught failure in a keyboard coroutine", failure)
+    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate + uncaughtFailureHandler)
 
     private var keyboardView: KeyboardView? = null
     private var suggestionStrip: SuggestionStripView? = null
@@ -3592,7 +3606,18 @@ class SlideInputMethodService :
     private fun scheduleLearnedDataDelete() {
         val ticket = learnedPersistence.beginDeletion() ?: return
         scope.launch {
-            val deleted = deleteLearnedDataWithRetry()
+            val deleted = try {
+                deleteLearnedDataWithRetry()
+            } catch (failure: CancellationException) {
+                throw failure
+            } catch (failure: Exception) {
+                // The ticket has to be handed back whatever happens: the scope's exception handler
+                // keeps the process alive after a failure here, and a deletion left "in flight"
+                // would refuse every later save and clear for the rest of this service's life.
+                // A failed delete keeps the marker pending, exactly as an ordinary failure does.
+                Log.e(TAG, "Learned-data deletion failed", failure)
+                false
+            }
             val current = learnedPersistence.finishDeletion(ticket, deleted)
             if (!current) {
                 // Another settings request persisted a newer marker while this IO result was on
@@ -3637,25 +3662,38 @@ class SlideInputMethodService :
 
         val (words, pairs, touches, gestures) = copyLearnedModels()
         scope.launch {
-            val result = withContext(Dispatchers.IO) {
-                LEARNED_DATA_IO.withLock {
-                    if (!learnedPersistence.isCurrent(ticket.generation)) return@withLock null
-                    val deleted =
-                        !ticket.completePendingDeletionFirst ||
-                            userDictionaryStore.completePendingDeletion()
-                    if (!deleted) {
-                        LearnedDataWriteResult(saved = false, pendingDeleteResolved = false)
-                    } else {
-                        val wordsSaved = userDictionaryStore.save(words)
-                        val pairsSaved = userDictionaryStore.save(pairs)
-                        val touchesSaved = userDictionaryStore.save(touches)
-                        val gesturesSaved = userDictionaryStore.save(gestures)
-                        LearnedDataWriteResult(
-                            saved = wordsSaved && pairsSaved && touchesSaved && gesturesSaved,
-                            pendingDeleteResolved = true,
-                        )
+            val result = try {
+                withContext(Dispatchers.IO) {
+                    LEARNED_DATA_IO.withLock {
+                        if (!learnedPersistence.isCurrent(ticket.generation)) return@withLock null
+                        val deleted =
+                            !ticket.completePendingDeletionFirst ||
+                                userDictionaryStore.completePendingDeletion()
+                        if (!deleted) {
+                            LearnedDataWriteResult(saved = false, pendingDeleteResolved = false)
+                        } else {
+                            val wordsSaved = userDictionaryStore.save(words)
+                            val pairsSaved = userDictionaryStore.save(pairs)
+                            val touchesSaved = userDictionaryStore.save(touches)
+                            val gesturesSaved = userDictionaryStore.save(gestures)
+                            LearnedDataWriteResult(
+                                saved = wordsSaved && pairsSaved && touchesSaved && gesturesSaved,
+                                pendingDeleteResolved = true,
+                            )
+                        }
                     }
                 }
+            } catch (failure: CancellationException) {
+                // Teardown. The ticket deliberately stays open so needsFinalization hands the
+                // unsaved snapshot to the process-lifetime finalizer.
+                throw failure
+            } catch (failure: Exception) {
+                // Anything else is a failed save. The ticket has to be handed back: the scope's
+                // exception handler keeps the process alive, and a save left "in flight" would
+                // make beginSave() refuse every later save for the rest of this service's life.
+                // Reporting saved=false marks the snapshot dirty again for the next opportunity.
+                Log.e(TAG, "Learned-data save failed", failure)
+                LearnedDataWriteResult(saved = false, pendingDeleteResolved = false)
             }
 
             learnedPersistence.finishSave(
@@ -4529,8 +4567,16 @@ class SlideInputMethodService :
             KeyType.ENTER,
         )
 
-        /** Process-lifetime IO for a final snapshot after an IME service instance is destroyed. */
-        val LEARNED_DATA_FINALIZER_SCOPE = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        /**
+         * Process-lifetime IO for a final snapshot after an IME service instance is destroyed.
+         * Outlives every service instance, so it carries its own handler: a failed final save
+         * is logged and the snapshot stays dirty for the next instance to retry.
+         */
+        val LEARNED_DATA_FINALIZER_SCOPE = CoroutineScope(
+            SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, failure ->
+                Log.e(TAG, "Uncaught failure in a learned-data finalizer", failure)
+            },
+        )
 
         /** Most recently scheduled finalizer; each new finalizer and service startup joins it. */
         @Volatile
