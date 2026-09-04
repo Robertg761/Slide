@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.4] - 2026-09-03
+
+### Fixed
+
+- Background failures escaping keyboard coroutines no longer crash the IME process. An uncaught
+  exception handler on the service scope and process finalizer scope logs the stack trace while
+  keeping the keyboard active under host applications.
+- Learned-data persistence tickets are released when an asynchronous save or delete fails, so a
+  transient I/O error no longer permanently deadlocks future user dictionary and touch model saves.
+
+### Changed
+
+- Consolidated atomic file replacement and streaming SHA-256 verification into shared `:core`
+  utilities.
+
 ## [0.5.3] - 2026-08-26
 
 ### Fixed
