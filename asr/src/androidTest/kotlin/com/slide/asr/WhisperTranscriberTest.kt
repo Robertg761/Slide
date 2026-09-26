@@ -2,18 +2,24 @@ package com.slide.asr
 
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.InputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.After
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * End-to-end checks of the speech path, on real hardware.
+ * End-to-end checks of the packaged speech runtime on an Android device or emulator.
  *
- * These cannot be local tests: everything interesting here is in a native library compiled for
- * arm64, and the numbers that matter — how long a model takes to load and to decode — are
- * properties of the phone, not of the code.
+ * These load the Android JNI library and run real inference. Timing measurements describe the
+ * device on which this suite runs.
  */
 class WhisperTranscriberTest {
 
@@ -42,6 +48,44 @@ class WhisperTranscriberTest {
         assertTrue(
             "Transcript did not contain the expected phrase: $text",
             "ask not what your country can do for you" in text,
+        )
+    }
+
+    @Test
+    fun cancelledNativeDecodeWipesAudioAndAllowsAnotherTranscription() = runBlocking {
+        assertTrue(transcriber.load(WhisperModel.Default))
+        val audio = readTestAudio()
+        val partialEntered = CompletableDeferred<Unit>()
+        val releasePartial = CountDownLatch(1)
+        val decode = launch {
+            transcriber.transcribe(audio) {
+                if (partialEntered.complete(Unit)) {
+                    // Hold the JNI callback until the test cancels the coroutine. A timer alone
+                    // could cancel before inference starts or after it has already returned.
+                    check(releasePartial.await(30, TimeUnit.SECONDS)) {
+                        "Timed out waiting to release the native partial callback"
+                    }
+                }
+            }
+        }
+
+        try {
+            withTimeout(90_000) { partialEntered.await() }
+            decode.cancel()
+        } finally {
+            releasePartial.countDown()
+            withTimeout(30_000) { decode.cancelAndJoin() }
+        }
+
+        assertTrue("The active native decode was not cancelled", decode.isCancelled)
+        assertArrayEquals("Cancelled microphone samples were retained", FloatArray(audio.size), audio, 0f)
+
+        val recovered = withTimeout(90_000) { transcriber.transcribe(readTestAudio()) }
+        assertTrue("Transcriber could not be reused: $recovered", recovered is WhisperTranscriber.Result.Text)
+        assertTrue(
+            "Reused transcriber lost the expected speech: $recovered",
+            "ask not what your country can do for you" in
+                (recovered as WhisperTranscriber.Result.Text).value.lowercase(),
         )
     }
 

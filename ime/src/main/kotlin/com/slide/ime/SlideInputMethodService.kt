@@ -62,6 +62,7 @@ import com.slide.engine.suggest.SpatialTouchModel
 import com.slide.engine.suggest.TypingSuggester
 import com.slide.ime.text.AndroidGraphemeBoundaries
 import com.slide.ime.text.AutoSpacing
+import com.slide.ime.text.DoubleSpacePeriod
 import com.slide.ime.text.EditorComposingSettlement
 import com.slide.ime.text.EditorInputPolicy
 import com.slide.ime.text.EditorKeyboardMode
@@ -193,7 +194,7 @@ class SlideInputMethodService :
     private var searchPreviousShift = ShiftState.OFF
     private var preservedCapsLock = false
     private var lastShiftTapMs = 0L
-    private var lastSpaceCommitMs = 0L
+    private val doubleSpacePeriod = DoubleSpacePeriod(DOUBLE_SPACE_WINDOW_MS)
 
     /** Set when the field or the user asks us not to learn from input. */
     // Fail closed until the first persisted settings snapshot arrives. The language engines are
@@ -731,6 +732,7 @@ class SlideInputMethodService :
     }
 
     override fun onStartInput(attribute: EditorInfo, restarting: Boolean) {
+        doubleSpacePeriod.reset()
         super.onStartInput(attribute, restarting)
         // This callback precedes the visual input-view transition, so it closes the small window in
         // which an old speech result could otherwise see the framework's new InputConnection.
@@ -746,6 +748,7 @@ class SlideInputMethodService :
     }
 
     override fun onFinishInput() {
+        doubleSpacePeriod.reset()
         editorGeneration++
         cancelGestureInputSequence()
         expectedSelections.invalidate()
@@ -759,6 +762,7 @@ class SlideInputMethodService :
     }
 
     override fun onStartInputView(info: EditorInfo, restarting: Boolean) {
+        doubleSpacePeriod.reset()
         super.onStartInputView(info, restarting)
         editorGeneration++
         cancelGestureInputSequence()
@@ -851,6 +855,7 @@ class SlideInputMethodService :
      * instant and still lets the memory go once the user has moved on.
      */
     override fun onWindowHidden() {
+        doubleSpacePeriod.reset()
         super.onWindowHidden()
         editorGeneration++
         cancelGestureInputSequence()
@@ -883,6 +888,7 @@ class SlideInputMethodService :
      * underlined fragment of the last one's sentence sitting in it.
      */
     override fun onFinishInputView(finishingInput: Boolean) {
+        doubleSpacePeriod.reset()
         super.onFinishInputView(finishingInput)
         editorGeneration++
         cancelGestureInputSequence()
@@ -1056,7 +1062,7 @@ class SlideInputMethodService :
         // Taken here rather than where the key is applied: a tap released while a swipe is still
         // decoding runs minutes-of-thought later in queue order, and a double-tap window measured
         // from that moment turns two unhurried shift taps into caps lock.
-        val pressedAtMs = System.currentTimeMillis()
+        val pressedAtMs = SystemClock.uptimeMillis()
         if (queueBehindGestureInput { processKeyCommit(key, text, touchX, touchY, pressedAtMs) }) {
             return
         }
@@ -1083,6 +1089,7 @@ class SlideInputMethodService :
         // capitalised word about to follow it its separating space.
         if (key.type != KeyType.DELETE && key.type != KeyType.SHIFT) gestureUndoState.invalidate()
         if (key.type != KeyType.SHIFT) lastShiftTapMs = 0L
+        if (key.type != KeyType.SPACE) doubleSpacePeriod.reset()
         if (keyboardView?.searchMode == true) {
             handleSearchKey(key, text)
             return
@@ -1197,6 +1204,7 @@ class SlideInputMethodService :
             return
         }
 
+        doubleSpacePeriod.reset()
         // This executes after all earlier queued input, so both language context and undo state
         // describe the text that is actually in the editor, including a preceding rapid swipe.
         gestureUndoState.invalidate()
@@ -1629,6 +1637,7 @@ class SlideInputMethodService :
     }
 
     private fun processCursorMove(steps: Int) {
+        doubleSpacePeriod.reset()
         gestureUndoState.invalidate()
         val connection = currentInputConnection ?: return
         val selfEditWasPending = selfEdit
@@ -1728,6 +1737,7 @@ class SlideInputMethodService :
     }
 
     private fun processDeleteWordGesture() {
+        doubleSpacePeriod.reset()
         gestureUndoState.invalidate()
         val connection = currentInputConnection ?: return
         val selfEditWasPending = selfEdit
@@ -1900,11 +1910,11 @@ class SlideInputMethodService :
         hideKeyboardSettingsPanel(restoreEditorUi = true)
     }
 
-    override fun onKeyboardSettingsChanged(settings: KeyboardSettings) {
+    override fun onKeyboardSettingsChanged(change: (KeyboardSettings) -> KeyboardSettings) {
         performHaptic()
-        // The panel carries its complete latest snapshot, so two quick toggles cannot overwrite
-        // each other while DataStore serialises the writes.
-        scope.launch { settingsRepository.update { settings } }
+        // Rebase the selected field inside DataStore's serialized edit. A whole panel snapshot
+        // could revert a newer privacy setting or learned-data clear epoch while this write waits.
+        scope.launch { settingsRepository.update(change) }
     }
 
     private fun showKeyboardSettingsPanel() {
@@ -2027,6 +2037,7 @@ class SlideInputMethodService :
     }
 
     override fun onTextEditAction(action: TextEditPanelView.Action) {
+        doubleSpacePeriod.reset()
         val connection = currentInputConnection ?: return
         performHaptic()
         when (action) {
@@ -2137,6 +2148,7 @@ class SlideInputMethodService :
 
     /** Mirrors the emoji commit path, which is the other panel that inserts literal text. */
     private fun processClipboardPaste(text: String) {
+        doubleSpacePeriod.reset()
         gestureUndoState.invalidate()
         performHaptic()
         val connection = currentInputConnection ?: return
@@ -2667,6 +2679,7 @@ class SlideInputMethodService :
      * joining it to what is already in the field.
      */
     private fun commitDictation(connection: InputConnection, text: String): Boolean {
+        doubleSpacePeriod.reset()
         val finish = finishComposing(connection)
         if (!finish.settled) return finish.callbackPossible
 
@@ -2748,6 +2761,7 @@ class SlideInputMethodService :
     }
 
     private fun processEmojiPicked(emoji: String) {
+        doubleSpacePeriod.reset()
         gestureUndoState.invalidate()
         performHaptic()
         val connection = currentInputConnection ?: return
@@ -3063,32 +3077,40 @@ class SlideInputMethodService :
             Character.getType(codePoint) in COMBINING_MARK_TYPES
 
     private fun handleSpace(connection: InputConnection, text: String, pressedAtMs: Long): Boolean {
-        // Space is where a typed word is settled, and so where autocorrect actually happens.
-        val finish = finishComposing(connection)
-        if (!finish.settled) return finish.callbackPossible
-
-        // The interval between the two presses, not between the two moments the keyboard got round
-        // to applying them.
-        val isDoubleSpace = settings.doubleSpacePeriod &&
-            pressedAtMs - lastSpaceCommitMs < DOUBLE_SPACE_WINDOW_MS &&
-            endsWithLetterThenSpace(connection)
-
+        // Settling composition can report unchanged selection before the separator moves it.
+        // Deliver one net callback so the first report cannot consume the one-shot selfEdit
+        // marker and make our own space look like an external cursor move.
         var separatorCommitted = false
-        var editorChanged = false
-        if (isDoubleSpace) {
-            // One edit, so the editor reports one selection change: the intermediate position
-            // between the delete and the full stop matches no expectation and would be read as the
-            // user moving the cursor.
-            connection.beginBatchEdit()
-            var punctuated = false
-            try {
+        var callbackPossible = false
+        connection.beginBatchEdit()
+        try {
+            // Space is where a typed word is settled, and so where autocorrect actually happens.
+            val finish = finishComposing(connection)
+            if (!finish.settled) return finish.callbackPossible
+
+            // The interval between the two presses, not between the two moments the keyboard got round
+            // to applying them.
+            val isDoubleSpace = settings.doubleSpacePeriod &&
+                editorInputPolicy.allowsSuggestions &&
+                doubleSpacePeriod.isWithinWindow(pressedAtMs) &&
+                doubleSpacePeriod.shouldReplace(
+                    pressedAtMs = pressedAtMs,
+                    allowsAutomaticPunctuation = editorInputPolicy.allowsSuggestions,
+                    hasSelection = (cachedSelectionStart >= 0 && cachedSelectionEnd >= 0 &&
+                        cachedSelectionStart != cachedSelectionEnd) ||
+                        !connection.getSelectedText(0).isNullOrEmpty(),
+                    textBeforeCursor = connection.getTextBeforeCursor(AUTO_SPACING_CONTEXT_CHARS, 0),
+                )
+
+            var editorChanged = false
+            if (isDoubleSpace) {
                 val replacement = GestureEditTransaction.replace(
                     original = " ",
                     replacement = ". ",
                     deleteBeforeCursor = { connection.deleteSurroundingText(it, 0) },
                     commit = { connection.commitText(it, 1) },
                 )
-                punctuated = replacement.replaced
+                val punctuated = replacement.replaced
                 separatorCommitted = punctuated
                 editorChanged = replacement.replaced ||
                     (replacement.deleted && !replacement.restoredOriginal)
@@ -3098,31 +3120,26 @@ class SlideInputMethodService :
                     // damage larger.
                     separatorCommitted = connection.commitText(text, 1)
                     editorChanged = editorChanged || separatorCommitted
-                    if (separatorCommitted) lastSpaceCommitMs = pressedAtMs
+                    if (separatorCommitted) doubleSpacePeriod.recordSpace(pressedAtMs)
                 }
-            } finally {
-                connection.endBatchEdit()
+                if (punctuated) {
+                    doubleSpacePeriod.reset()
+                    // The word before the full stop is no longer where the undo record says it is.
+                    lastAutocorrect = null
+                }
+            } else {
+                separatorCommitted = connection.commitText(text, 1)
+                editorChanged = separatorCommitted
+                if (separatorCommitted) doubleSpacePeriod.recordSpace(pressedAtMs)
             }
-            if (punctuated) {
-                lastSpaceCommitMs = 0L
-                // The word before the full stop is no longer where the undo record says it is.
-                lastAutocorrect = null
-            }
-        } else {
-            separatorCommitted = connection.commitText(text, 1)
-            editorChanged = separatorCommitted
-            if (separatorCommitted) lastSpaceCommitMs = pressedAtMs
+            callbackPossible = finish.callbackPossible || editorChanged
+        } finally {
+            connection.endBatchEdit()
         }
         if (separatorCommitted) literalWordInProgress = false
         updateShiftFromCursor()
         if (separatorCommitted) updatePredictions()
-        return finish.callbackPossible || editorChanged
-    }
-
-    /** True when the text is "<letter><space>", the only case where double-space should punctuate. */
-    private fun endsWithLetterThenSpace(connection: InputConnection): Boolean {
-        val before = connection.getTextBeforeCursor(2, 0) ?: return false
-        return before.length == 2 && before[1] == ' ' && before[0].isLetterOrDigit()
+        return callbackPossible
     }
 
     private fun handleDelete(connection: InputConnection): Boolean {
@@ -3163,6 +3180,7 @@ class SlideInputMethodService :
         }
 
         val selected = connection.getSelectedText(0)
+        val selectionBefore = cachedEditorSelection()
         if (!selected.isNullOrEmpty()) {
             val deleted = connection.commitText("", 1)
             callbackPossible = callbackPossible || deleted
@@ -3173,9 +3191,17 @@ class SlideInputMethodService :
                     cachedSelectionEnd = collapsed
                 }
             }
+        } else if (selectionBefore != null && selectionBefore.start != selectionBefore.end) {
+            // The editor can report selection offsets while withholding its selected text.
+            // A Delete key lets it remove that selection without touching the preceding text.
+            callbackPossible = handleRawKey(connection, KeyEvent.KEYCODE_DEL) || callbackPossible
         } else {
-            val before = connection.getTextBeforeCursor(MAX_GRAPHEME_CONTEXT_CHARS, 0)?.toString().orEmpty()
-            if (before.isNotEmpty()) {
+            val before = connection.getTextBeforeCursor(MAX_GRAPHEME_CONTEXT_CHARS, 0)?.toString()
+            if (before == null) {
+                // Unsupported/redacted context is not evidence that the cursor is at the start.
+                // Let the editor handle one Delete without guessing a UTF-16 range.
+                callbackPossible = handleRawKey(connection, KeyEvent.KEYCODE_DEL) || callbackPossible
+            } else if (before.isNotEmpty()) {
                 val boundary = AndroidGraphemeBoundaries.previousBoundary(before, before.length)
                 val toDelete = before.length - boundary
                 if (connection.deleteSurroundingText(toDelete, 0)) {
@@ -3356,7 +3382,8 @@ class SlideInputMethodService :
     private fun handleShiftTap(pressedAtMs: Long) {
         // Measured between presses. Two taps queued behind a swipe decode are applied back to back,
         // so an execution-time window would lock caps for a deliberate, unhurried pair.
-        val doubleTapped = pressedAtMs - lastShiftTapMs < DOUBLE_TAP_WINDOW_MS
+        val doubleTapped = lastShiftTapMs > 0 &&
+            pressedAtMs - lastShiftTapMs in 0 until DOUBLE_TAP_WINDOW_MS
         lastShiftTapMs = pressedAtMs
 
         setShift(
@@ -4112,7 +4139,7 @@ class SlideInputMethodService :
         recomposed = false
         composingAtEnd = true
         literalWordInProgress = false
-        lastSpaceCommitMs = 0L
+        doubleSpacePeriod.reset()
         clearSuggestions()
         updateShiftFromCursor()
         // Picking a suggestion appends a space, so the word is finished and the next one is open.
@@ -4186,7 +4213,7 @@ class SlideInputMethodService :
         learnPair(previous, word)
         lastAutocorrect = null
         literalWordInProgress = false
-        lastSpaceCommitMs = 0L
+        doubleSpacePeriod.reset()
         clearSuggestions()
         updateShiftFromCursor()
         updatePredictions()
@@ -4251,6 +4278,7 @@ class SlideInputMethodService :
         )
 
         if (update.externalSelectionChanged) {
+            doubleSpacePeriod.reset()
             // Only the speculative half. Keys the user has already released are queued behind a
             // decode with nothing to replay them, and the queue's own contract reserves
             // cancellation for editor and session transitions; a cursor moving is neither, and the

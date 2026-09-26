@@ -209,6 +209,32 @@ class AudioRecorderTest {
     }
 
     @Test
+    fun `exact recording limit ends without waiting for another microphone read`() {
+        val backend = FakeBackend(
+            actions = listOf(ReadAction.Data(shortArrayOf(1_000, 2_000))),
+        )
+        val recorder = AudioRecorder(QueueFactory(backend), joinTimeoutMs = 100L, maxSamples = 2)
+        val ended = CountDownLatch(1)
+        var reason: AudioRecorder.EndReason? = null
+
+        try {
+            assertTrue(recorder.start(endListener = AudioRecorder.EndListener {
+                reason = it
+                ended.countDown()
+            }))
+            assertTrue("capture did not finish at the exact limit", ended.await(1, TimeUnit.SECONDS))
+            assertEquals(AudioRecorder.EndReason.RecordingLimitReached, reason)
+            assertArrayEquals(
+                floatArrayOf(1_000f / 32_768f, 2_000f / 32_768f),
+                recorder.stop(),
+                0f,
+            )
+        } finally {
+            recorder.cancel()
+        }
+    }
+
+    @Test
     fun `hung backend stop cannot hold the microphone for ever`() {
         val stopGate = CountDownLatch(1) // Never opened; stands in for a wedged vendor driver.
         val readGate = CountDownLatch(1)

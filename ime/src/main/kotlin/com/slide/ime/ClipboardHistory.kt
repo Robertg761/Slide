@@ -102,11 +102,13 @@ internal class ClipboardHistory(
             Log.w(TAG, "Clipboard read denied", e)
             null
         } ?: return
-        if (clip.description?.isSensitive() == true) return
+        if (clip.description?.isSensitive() == true || clip.itemCount == 0) return
         val item = clip.getItemAt(0) ?: return
-        // coerceToText resolves URIs and styled spans to something committable.
-        val text = item.coerceToText(context).toString()
-        if (text.isBlank() || text.length > MAX_CLIP_CHARS) return
+        // History passively observes copies on the IME thread. Coercing a URI here opens its
+        // provider and reads its entire contents before the size check, potentially blocking the
+        // keyboard or retaining a document the user never copied as text. Text and styled text
+        // already live in item.text; non-text clips belong to the editor's explicit Paste action.
+        val text = clipboardHistoryText(item.text) ?: return
 
         recents.removeAll { it.text == text }
         recents.addFirst(Entry(text, pinned = false, recordedAt = clock()))
@@ -169,10 +171,13 @@ internal class ClipboardHistory(
         const val MAX_RECENT = 10
         const val MAX_PINNED = 10
 
-        /** A clip longer than this is almost certainly a document, not a paste candidate. */
-        const val MAX_CLIP_CHARS = 10_000
-
         /** A control character; [pin] strips it from stored text so records cannot be forged. */
         const val RECORD_SEPARATOR = "\u001E"
     }
+}
+
+/** Bound the existing clipboard text before materializing spans or scanning its contents. */
+internal fun clipboardHistoryText(text: CharSequence?): String? {
+    if (text == null || text.length !in 1..10_000 || text.isBlank()) return null
+    return text.toString()
 }

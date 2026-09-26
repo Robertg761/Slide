@@ -602,12 +602,12 @@ internal fun Preferences.toKeyboardSettings(): KeyboardSettings {
         showKeyBorders = this[Keys.KEY_BORDERS] ?: defaults.showKeyBorders,
         showKeyPreview = this[Keys.KEY_PREVIEW] ?: defaults.showKeyPreview,
         showNumberRow = this[Keys.NUMBER_ROW] ?: defaults.showNumberRow,
-        keyHeightScale = this[Keys.KEY_HEIGHT] ?: defaults.keyHeightScale,
-        bottomPaddingDp = this[Keys.BOTTOM_PADDING] ?: defaults.bottomPaddingDp,
+        keyHeightScale = boundedFloat(Keys.KEY_HEIGHT, defaults.keyHeightScale, 0.7f..1.4f),
+        bottomPaddingDp = boundedFloat(Keys.BOTTOM_PADDING, defaults.bottomPaddingDp, 0f..32f),
         hapticEnabled = this[Keys.HAPTIC] ?: defaults.hapticEnabled,
-        hapticStrength = this[Keys.HAPTIC_STRENGTH] ?: defaults.hapticStrength,
+        hapticStrength = boundedFloat(Keys.HAPTIC_STRENGTH, defaults.hapticStrength, 0f..1f),
         soundEnabled = this[Keys.SOUND] ?: defaults.soundEnabled,
-        soundVolume = this[Keys.SOUND_VOLUME] ?: defaults.soundVolume,
+        soundVolume = boundedFloat(Keys.SOUND_VOLUME, defaults.soundVolume, 0f..1f),
         gestureTypingEnabled = this[Keys.GESTURE_TYPING] ?: defaults.gestureTypingEnabled,
         suggestionsEnabled = this[Keys.SUGGESTIONS] ?: defaults.suggestionsEnabled,
         autocorrectEnabled = this[Keys.AUTOCORRECT] ?: defaults.autocorrectEnabled,
@@ -622,4 +622,14 @@ internal fun Preferences.toKeyboardSettings(): KeyboardSettings {
         updateChecksEnabled = this[Keys.UPDATE_CHECKS] ?: defaults.updateChecksEnabled,
         includeAlphaUpdates = this[Keys.INCLUDE_ALPHA_UPDATES] ?: defaults.includeAlphaUpdates,
     )
+}
+
+/** Protobuf accepts NaN/infinity as floats, but layout and slider rounding cannot use them. */
+private fun Preferences.boundedFloat(
+    key: Preferences.Key<Float>,
+    fallback: Float,
+    range: ClosedFloatingPointRange<Float>,
+): Float {
+    val value = this[key] ?: return fallback
+    return if (value.isFinite()) value.coerceIn(range.start, range.endInclusive) else fallback
 }

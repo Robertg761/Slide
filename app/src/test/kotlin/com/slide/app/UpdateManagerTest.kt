@@ -252,6 +252,27 @@ class UpdateManagerTest {
     }
 
     @Test
+    fun `staging sweep does not count as an active install`() {
+        assertTrue(UpdateManager.beginDownload())
+        assertTrue(UpdateManager.isDownloading.value)
+        assertFalse(UpdateManager.hasActiveInstall())
+
+        val job = Job()
+        try {
+            assertTrue(UpdateManager.registerInstallJob(job))
+            assertTrue(UpdateManager.hasActiveInstall())
+            assertTrue(UpdateManager.markExternalHandoff())
+            assertTrue(UpdateManager.hasActiveInstall())
+
+            job.complete()
+            assertFalse(UpdateManager.hasActiveInstall())
+            assertFalse(UpdateManager.isDownloading.value)
+        } finally {
+            job.cancel()
+        }
+    }
+
+    @Test
     fun `tracked install can be canceled and releases the single-flight guard`() {
         assertTrue(UpdateManager.beginDownload())
         val job = Job()

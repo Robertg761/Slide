@@ -83,13 +83,18 @@ class UserDictionary(
      * Untrusted words are withheld: offering a word seen once would put the user's own typos in
      * the strip, which is a slower way of making the same mistake as correcting to them.
      */
-    fun completions(prefix: String, limit: Int): List<String> {
-        if (prefix.isEmpty()) return emptyList()
+    fun completions(
+        prefix: String,
+        limit: Int,
+        accept: (String) -> Boolean = { true },
+    ): List<String> {
+        if (prefix.isEmpty() || limit <= 0) return emptyList()
         val lower = prefix.lowercase()
         return words.tailMap(lower)
             .asSequence()
             .takeWhile { it.key.startsWith(lower) }
             .filter { it.value.count >= trustThreshold && it.key.length > lower.length }
+            .filter { accept(it.value.surface.value) }
             .sortedByDescending { it.value.count }
             .take(limit)
             .map { it.value.surface.value }

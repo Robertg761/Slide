@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Double-space punctuation preserves password and literal-field input, leaves selected text
+  alone, and resets after other edits or editor changes. Tap timing uses the monotonic clock,
+  and word endings with combining marks or supplementary letters can be punctuated correctly.
+- Canceling dictation while the recorder hands back audio now wipes the temporary sample copy.
+  Reaching the exact recording limit ends capture without waiting for another microphone read.
+- Clipboard history reads only existing text payloads and checks their size before copying them.
+  It no longer opens content providers or reads whole documents on the keyboard thread.
+- Learned completions respect the current dictionary's offensive-word flags before limiting
+  the candidate list.
+- Invalid stored numeric preferences fall back to defaults or supported ranges, preventing
+  keyboard layout and settings-label crashes without discarding other preferences.
+- Changes in the keyboard's settings panel preserve newer preferences from elsewhere in the
+  app, including incognito mode and requests to clear learned data.
+- Backspace works when an editor withholds surrounding text, and removes a selection safely
+  when the editor reports its offsets without exposing the selected text.
+- Setup distinguishes the release keyboard from the separately installed debug keyboard.
+- System status icons follow the settings screen's light or dark theme, keeping
+  the clock and battery indicators visible against the screen background.
+- The settings screen reserves keyboard space so its test field stays visible while typing
+  with Android's edge-to-edge layout.
+- Automatic and manual update checks share one cancellable request flow. Repeated taps cannot
+  start concurrent checks, stale results cannot replace the selected update channel, and
+  rotation preserves the release shown for an active download.
+- Release runtime metadata export works with the default Gradle settings by declaring that
+  this task cannot use the configuration cache.
+
 ## [0.5.4] - 2026-09-03
 
 ### Fixed

@@ -467,7 +467,7 @@ class TypingSuggester(
             ranked = ranked,
         )
         return TypingSuggestions(
-            present(typed, ranked, autocorrection, learnedCompletions(lower)),
+            present(typed, ranked, autocorrection, learnedCompletions(lower, blockOffensive)),
             autocorrection,
         )
     }
@@ -926,10 +926,15 @@ class TypingSuggester(
     }
 
     /** Words the user has taught the keyboard that continue what they are typing. */
-    private fun learnedCompletions(lower: String): List<String> {
+    private fun learnedCompletions(lower: String, blockOffensive: Boolean): List<String> {
         val dictionary = userDictionary ?: return emptyList()
         if (lower.length < config.minCompletionLength) return emptyList()
-        return dictionary.completions(lower, config.maxResults)
+        return dictionary.completions(lower, config.maxResults) { word ->
+            // An updated corpus may now know a word learned by an older build. Apply its current
+            // offensive flag before taking the top completions, just as for corpus candidates.
+            val index = if (blockOffensive) lexicon.indexOf(word) else -1
+            index < 0 || !lexicon.isOffensive(index)
+        }
     }
 
     /**

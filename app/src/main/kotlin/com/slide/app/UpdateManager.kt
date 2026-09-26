@@ -149,6 +149,11 @@ object UpdateManager {
     private var activeInstallJob: Job? = null
     private var activeInstallCancellable = false
 
+    /** Distinguishes a user-started install from the brief staging sweep sharing its file guard. */
+    internal fun hasActiveInstall(): Boolean = synchronized(installJobLock) {
+        activeInstallJob != null
+    }
+
     private val lastOutcome = MutableStateFlow<InstallOutcome?>(null)
 
     /** The most recent finished install attempt, until a UI takes it with [consumeOutcome]. */

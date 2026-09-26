@@ -2,6 +2,7 @@ package com.slide.core.settings
 
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.emptyPreferences
+import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.mutablePreferencesOf
 import androidx.datastore.preferences.core.stringPreferencesKey
@@ -332,6 +333,50 @@ class KeyboardSettingsTest {
     // endregion
 
     // region Persistence round trip
+
+    @Test
+    fun `nonfinite stored numbers use their defaults without losing other settings`() {
+        for (invalid in listOf(Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY)) {
+            val preferences = mutablePreferencesOf(
+                floatPreferencesKey("key_height_scale") to invalid,
+                floatPreferencesKey("bottom_padding_dp") to invalid,
+                floatPreferencesKey("haptic_strength") to invalid,
+                floatPreferencesKey("sound_volume") to invalid,
+                booleanPreferencesKey("incognito_mode_enabled") to true,
+                longPreferencesKey("learned_data_clear_epoch") to 12L,
+            )
+
+            assertEquals(
+                KeyboardSettings(incognitoModeEnabled = true, learnedDataClearEpoch = 12L),
+                preferences.toKeyboardSettings(),
+            )
+        }
+    }
+
+    @Test
+    fun `stored numbers stay within keyboard and feedback limits`() {
+        val tooLow = mutablePreferencesOf(
+            floatPreferencesKey("key_height_scale") to -1f,
+            floatPreferencesKey("bottom_padding_dp") to -10f,
+            floatPreferencesKey("haptic_strength") to -1f,
+            floatPreferencesKey("sound_volume") to -1f,
+        ).toKeyboardSettings()
+        assertEquals(0.7f, tooLow.keyHeightScale, 0f)
+        assertEquals(0f, tooLow.bottomPaddingDp, 0f)
+        assertEquals(0f, tooLow.hapticStrength, 0f)
+        assertEquals(0f, tooLow.soundVolume, 0f)
+
+        val tooHigh = mutablePreferencesOf(
+            floatPreferencesKey("key_height_scale") to Float.MAX_VALUE,
+            floatPreferencesKey("bottom_padding_dp") to Float.MAX_VALUE,
+            floatPreferencesKey("haptic_strength") to Float.MAX_VALUE,
+            floatPreferencesKey("sound_volume") to Float.MAX_VALUE,
+        ).toKeyboardSettings()
+        assertEquals(1.4f, tooHigh.keyHeightScale, 0f)
+        assertEquals(32f, tooHigh.bottomPaddingDp, 0f)
+        assertEquals(1f, tooHigh.hapticStrength, 0f)
+        assertEquals(1f, tooHigh.soundVolume, 0f)
+    }
 
     @Test
     fun `every settings field survives a write and read round trip`() {

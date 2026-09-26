@@ -17,6 +17,7 @@ android {
         targetSdk = 37
         versionCode = 19
         versionName = "0.5.4"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -86,11 +87,18 @@ dependencies {
     debugImplementation(libs.androidx.ui.tooling)
 
     testImplementation(libs.junit)
+    androidTestImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.junit)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.kotlinx.coroutines.core)
 }
 
 tasks.register("writeReleaseRuntimeArtifacts") {
     group = "verification"
     description = "Writes the exact external artifacts selected for the app release runtime"
+    notCompatibleWithConfigurationCache(
+        "Reads resolved artifact identities and repository paths during execution",
+    )
 
     val runtimeClasspath = configurations.named("releaseRuntimeClasspath")
     val externalArtifacts = runtimeClasspath.get().incoming.artifactView {

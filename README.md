@@ -223,14 +223,15 @@ it from the input-method switcher.
 
 ### Instrumented tests
 
-The speech and neural swipe tests need a device because they load and execute the packaged models:
+The speech and neural swipe tests load and execute the packaged models. The app tests exercise
+keyboard input in native editors and actions in the keyboard settings panel. Run them on a device:
 
 ```bash
-./gradlew :asr:connectedDebugAndroidTest :engine:connectedDebugAndroidTest
+./gradlew --max-workers=2 --no-parallel :asr:connectedDebugAndroidTest :engine:connectedDebugAndroidTest :app:connectedDebugAndroidTest
 ```
 
 `measuresEveryModel` prints load time, decode time, and speed relative to realtime for the packaged
-Base model. CI and release workflows run both suites on isolated API 26 and API 37 emulators through
+Small English model. CI and release workflows run these suites on isolated API 26 and API 37 emulators through
 `tools/run_android_instrumentation.sh`; emulator coverage is still not physical-device signoff.
 
 ## Privacy

@@ -133,7 +133,7 @@ jobs:
       - name: Prepare every pinned runtime asset
         run: bash tools/prepare_assets.sh
 
-      - name: Run packaged speech and neural swipe tests
+      - name: Run packaged speech, neural swipe, and keyboard editor tests
         run: bash tools/run_android_instrumentation.sh "${{ matrix.api }}"
 
       - name: Upload instrumentation diagnostics on failure
@@ -146,6 +146,8 @@ jobs:
             asr/build/outputs/androidTest-results/**
             engine/build/reports/androidTests/**
             engine/build/outputs/androidTest-results/**
+            app/build/reports/androidTests/**
+            app/build/outputs/androidTest-results/**
             build/reports/instrumentation-api-*.log
             build/reports/emulator-api-*.log
           if-no-files-found: ignore

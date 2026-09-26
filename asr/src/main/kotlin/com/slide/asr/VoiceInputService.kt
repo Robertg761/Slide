@@ -20,7 +20,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
 
 /**
  * Records and transcribes on behalf of the keyboard, in its own process.
@@ -157,38 +156,33 @@ class VoiceInputService : Service() {
 
         val pending = work
         work = scope.launch {
-            var audio = FloatArray(0)
             try {
                 pending?.join() // stop may arrive while the model is still loading
                 if (!sessions.isCurrent(sessionId)) return@launch
 
-                // recorder.stop() joins the capture worker under a bounded wait and then copies
-                // the buffer. Both are blocking calls with nothing main-thread about them, and
-                // the session gates before and after this line keep the ordering intact.
-                audio = withContext(Dispatchers.IO) { recorder.stop() }
-                if (!sessions.isCurrent(sessionId)) return@launch
-                sendState(sessionId, VoiceInput.State.Transcribing)
+                // The drain blocks on a worker thread. Its copy remains owned and is wiped even
+                // if cancellation prevents the result from reaching this main-thread callback.
+                PcmBuffers.withCapturedSamples(recorder::stop) { audio ->
+                    if (!sessions.isCurrent(sessionId)) return@withCapturedSamples
+                    sendState(sessionId, VoiceInput.State.Transcribing)
 
-                // Segments arrive on the decode thread; each is marshalled to the main scope and
-                // session-gated exactly like the level events above.
-                when (
-                    val result = transcriber.transcribe(audio) { partial ->
-                        scope.launch {
-                            if (sessions.isCurrent(sessionId)) sendPartial(sessionId, partial)
+                    // Segments arrive on the decode thread; marshal them to the main scope.
+                    when (
+                        val result = transcriber.transcribe(audio) { partial ->
+                            scope.launch {
+                                if (sessions.isCurrent(sessionId)) sendPartial(sessionId, partial)
+                            }
                         }
-                    }
-                ) {
-                    is WhisperTranscriber.Result.Text -> sendResultIfCurrent(sessionId, result.value)
-                    WhisperTranscriber.Result.NoSpeech -> sendResultIfCurrent(sessionId, "")
-                    is WhisperTranscriber.Result.Failed -> {
-                        Log.w(TAG, "Decode failed: ${result.reason}")
-                        sendErrorIfCurrent(sessionId, VoiceInput.Error.DecodeFailed)
+                    ) {
+                        is WhisperTranscriber.Result.Text -> sendResultIfCurrent(sessionId, result.value)
+                        WhisperTranscriber.Result.NoSpeech -> sendResultIfCurrent(sessionId, "")
+                        is WhisperTranscriber.Result.Failed -> {
+                            Log.w(TAG, "Decode failed: ${result.reason}")
+                            sendErrorIfCurrent(sessionId, VoiceInput.Error.DecodeFailed)
+                        }
                     }
                 }
             } finally {
-                // WhisperTranscriber also wipes this copy. Keep the service boundary defensive if
-                // its implementation changes or cancellation happens before it is entered.
-                PcmBuffers.wipe(audio)
                 if (sessions.finish(sessionId)) {
                     work = null
                     sendState(sessionId, VoiceInput.State.Idle)

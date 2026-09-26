@@ -233,9 +233,10 @@ fi
 verify_spawned_emulator
 export ANDROID_SERIAL="$SERIAL"
 
-if ! "$ROOT/gradlew" --no-daemon \
+if ! "$ROOT/gradlew" --no-daemon --max-workers=2 --no-parallel \
     :asr:connectedDebugAndroidTest \
-    :engine:connectedDebugAndroidTest; then
+    :engine:connectedDebugAndroidTest \
+    :app:connectedDebugAndroidTest; then
     mkdir -p "$ROOT/build/reports"
     "$ADB" -s "$SERIAL" logcat -d > "$ROOT/build/reports/instrumentation-api-$API_LEVEL.log" || true
     tail -200 "$TEMP_DIR/emulator.log" >&2

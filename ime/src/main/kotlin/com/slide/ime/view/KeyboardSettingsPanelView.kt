@@ -33,7 +33,8 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
 
     interface Listener {
         fun onKeyboardSettingsDismissed()
-        fun onKeyboardSettingsChanged(settings: KeyboardSettings)
+        /** Apply the chosen field to the latest stored settings when the write runs. */
+        fun onKeyboardSettingsChanged(change: (KeyboardSettings) -> KeyboardSettings)
     }
 
     var listener: Listener? = null
@@ -216,9 +217,9 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
                 isClickable = true
                 isFocusable = true
                 setOnClickListener {
-                    val updated = settings.copy(themeId = option.id)
-                    settings = updated
-                    listener?.onKeyboardSettingsChanged(updated)
+                    val change = { current: KeyboardSettings -> current.copy(themeId = option.id) }
+                    settings = change(settings)
+                    listener?.onKeyboardSettingsChanged(change)
                 }
             }
             themeChips[option] = chip
@@ -294,13 +295,13 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
         parent.addView(row, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         addDivider(parent)
 
-        val toggle = ToggleBinding(row, control, title, descriptionView, describeWith, read, enabledWhen, update)
+        val toggle = ToggleBinding(row, control, title, descriptionView, describeWith, read, enabledWhen)
         switches += toggle
         control.setOnCheckedChangeListener { _, checked ->
             if (binding) return@setOnCheckedChangeListener
-            val updated = toggle.update(settings, checked)
-            settings = updated
-            listener?.onKeyboardSettingsChanged(updated)
+            val change = { current: KeyboardSettings -> update(current, checked) }
+            settings = change(settings)
+            listener?.onKeyboardSettingsChanged(change)
             row.sendAccessibilityEvent(android.view.accessibility.AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)
         }
     }
@@ -371,9 +372,10 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
             // re-stepped onto it; republishing would relayout the keyboard for nothing.
             if (!SliderCommitPolicy.valueChanged(progress, slider.lastPublishedProgress)) return
             slider.lastPublishedProgress = progress
-            val updated = update(settings, valueAt(progress))
-            settings = updated
-            listener?.onKeyboardSettingsChanged(updated)
+            val chosen = valueAt(progress)
+            val change = { current: KeyboardSettings -> update(current, chosen) }
+            settings = change(settings)
+            listener?.onKeyboardSettingsChanged(change)
         }
         control.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
@@ -556,7 +558,6 @@ class KeyboardSettingsPanelView(context: Context) : LinearLayout(context) {
         val describe: ((KeyboardSettings) -> String)?,
         val read: (KeyboardSettings) -> Boolean,
         val enabledWhen: (KeyboardSettings) -> Boolean,
-        val update: (KeyboardSettings, Boolean) -> KeyboardSettings,
     )
 
     /**

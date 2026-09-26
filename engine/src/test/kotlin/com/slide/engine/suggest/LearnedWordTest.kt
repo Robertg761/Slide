@@ -3,6 +3,7 @@ package com.slide.engine.suggest
 import com.slide.engine.TestBigrams
 import com.slide.engine.TestLexicon
 import com.slide.engine.gesture.GestureFixtures
+import com.slide.engine.lexicon.Lexicon
 import com.slide.engine.lexicon.UserDictionary
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -97,6 +98,28 @@ class LearnedWordTest {
         val offered = suggester.suggest("iphon", keys).words.map { it.word }
 
         assertTrue("expected 'iPhoneX' among $offered", "iPhoneX" in offered)
+    }
+
+    @Test
+    fun `restored learned completions obey the current corpus offensive flags`() {
+        val blocked = listOf("badalpha", "badbravo", "badcharlie")
+        val corpus = Lexicon(
+            chars = blocked.joinToString("").toCharArray(),
+            offsets = blocked.runningFold(0) { offset, word -> offset + word.length }.toIntArray(),
+            frequencies = ByteArray(blocked.size) { 100 },
+            flags = ByteArray(blocked.size) { Lexicon.FLAG_OFFENSIVE.toByte() },
+        )
+        val restored = UserDictionary().apply {
+            restore(blocked.map { it.uppercase() to 20 } + ("badCustom" to 3))
+        }
+        val personal = TypingSuggester(corpus, userDictionary = restored)
+
+        val filtered = personal.suggest("bad", keys, blockOffensive = true).words.map { it.word }
+        assertEquals(listOf("bad", "badCustom"), filtered)
+
+        val unfiltered = personal.suggest("bad", keys, blockOffensive = false).words.map { it.word }
+        assertTrue(unfiltered.any { it.lowercase() in blocked })
+        assertNull(personal.suggest("BADALPHA", keys).autocorrection)
     }
 
     /**

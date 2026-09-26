@@ -325,7 +325,7 @@ class AudioRecorder internal constructor(
         fun append(chunk: ShortArray, count: Int, observe: (Float) -> Unit): Boolean =
             synchronized(samplesLock) {
                 if (drained.get()) return@synchronized false
-                val limitReached = sampleCount + count > maxSamples
+                val limitReached = sampleCount + count >= maxSamples
                 // At the cap the fitting prefix of this chunk is kept rather than dropping the
                 // whole thing: the overflow lands mid-utterance, so discarding it would throw
                 // away exactly the speech the recording limit cut off.

@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyRow
@@ -45,6 +46,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -117,7 +119,8 @@ private fun SlideAppTheme(content: @Composable () -> Unit) {
 private fun SetupScreen(repository: SettingsRepository) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val settings by repository.settings.collectAsState(initial = KeyboardSettings())
+    val persistedSettings by repository.settings.collectAsState(initial = null)
+    val settings = persistedSettings ?: KeyboardSettings()
 
     // Sliders update visually under the finger and persist once the gesture settles. Writing
     // DataStore on every pixel of movement makes an otherwise simple settings screen feel laggy.
@@ -134,6 +137,7 @@ private fun SetupScreen(repository: SettingsRepository) {
     var availableUpdate by rememberSaveable(stateSaver = UpdateInfoSaver) {
         mutableStateOf<UpdateInfo?>(null)
     }
+    var offeredUpdateIncludesPrereleases by rememberSaveable { mutableStateOf<Boolean?>(null) }
     // The download belongs to the process, not to this composition: rotating away neither cancels
     // it nor starts a second one, and the screen that happens to exist when it finishes reports it.
     val downloading by UpdateManager.isDownloading.collectAsState()
@@ -142,6 +146,10 @@ private fun SetupScreen(repository: SettingsRepository) {
     // The automatic check runs without the user asking, so its failure is reported inline in the
     // Updates card rather than as a modal dialog that would greet them on every offline open.
     var autoCheckFailed by remember { mutableStateOf(false) }
+    var manualCheckRequest by remember { mutableIntStateOf(0) }
+    var handledManualCheckRequest by remember { mutableIntStateOf(0) }
+    var activeUpdateCheck by remember { mutableStateOf<Any?>(null) }
+    val checkingForUpdates = activeUpdateCheck != null
     LaunchedEffect(installOutcome) {
         when (val finished = installOutcome) {
             null -> return@LaunchedEffect
@@ -182,14 +190,63 @@ private fun SetupScreen(repository: SettingsRepository) {
         }.getOrElse { "Licences and notices could not be loaded." }
     }
 
-    LaunchedEffect(settings.updateChecksEnabled, settings.includeAlphaUpdates) {
-        if (settings.updateChecksEnabled) {
-            runCatchingCancellable { UpdateManager.check(context, settings.includeAlphaUpdates) }
-                .onSuccess {
-                    availableUpdate = it
-                    autoCheckFailed = false
+    LaunchedEffect(
+        persistedSettings != null,
+        settings.updateChecksEnabled,
+        settings.includeAlphaUpdates,
+        manualCheckRequest,
+    ) {
+        val manual = manualCheckRequest != handledManualCheckRequest
+        handledManualCheckRequest = manualCheckRequest
+        activeUpdateCheck = null
+        // Initial UI defaults must not invalidate a saved offer before the persisted channel is
+        // known. An active install always keeps the release it was started with after rotation.
+        if (persistedSettings == null || UpdateManager.hasActiveInstall()) return@LaunchedEffect
+        if (!settings.updateChecksEnabled) {
+            availableUpdate = null
+            offeredUpdateIncludesPrereleases = null
+            autoCheckFailed = false
+            return@LaunchedEffect
+        }
+        if (availableUpdate != null &&
+            offeredUpdateIncludesPrereleases == settings.includeAlphaUpdates
+        ) return@LaunchedEffect
+        // A completed response can arrive just before a changed channel reaches this screen.
+        // Such an idle offer must be replaced even though it is already visible.
+        availableUpdate = null
+        offeredUpdateIncludesPrereleases = null
+
+        val check = Any()
+        activeUpdateCheck = check
+        try {
+            val result = runCatchingCancellable {
+                UpdateManager.check(context, settings.includeAlphaUpdates)
+            }
+            // A replaced effect may finish its blocking network call after the new one starts.
+            // Its result cannot replace the current channel's offer or an active install dialog.
+            if (activeUpdateCheck !== check || UpdateManager.hasActiveInstall()) {
+                return@LaunchedEffect
+            }
+            result.onSuccess {
+                availableUpdate = it
+                offeredUpdateIncludesPrereleases = if (it != null) settings.includeAlphaUpdates else null
+                autoCheckFailed = false
+                if (manual) {
+                    updateMessage = if (it == null) {
+                        "You already have the newest selected release."
+                    } else {
+                        null
+                    }
                 }
-                .onFailure { autoCheckFailed = true }
+            }.onFailure {
+                if (manual) {
+                    updateMessage = "Could not check for updates: ${it.message ?: "network error"}"
+                } else {
+                    autoCheckFailed = true
+                }
+            }
+        } finally {
+            if (activeUpdateCheck === check) activeUpdateCheck = null
         }
     }
 
@@ -206,7 +263,7 @@ private fun SetupScreen(repository: SettingsRepository) {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    Scaffold { insets ->
+    Scaffold(modifier = Modifier.imePadding()) { insets ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -454,7 +511,10 @@ private fun SetupScreen(repository: SettingsRepository) {
                     }
                     if (settings.updateChecksEnabled) {
                         SettingSwitch("Include prereleases", settings.includeAlphaUpdates) { value -> scope.launch { repository.update { it.copy(includeAlphaUpdates = value) } } }
-                        Button(onClick = { scope.launch { runCatchingCancellable { UpdateManager.check(context, settings.includeAlphaUpdates) }.onSuccess { availableUpdate = it; autoCheckFailed = false; updateMessage = if (it == null) "You already have the newest selected release." else null }.onFailure { updateMessage = "Could not check for updates: ${it.message ?: "network error"}" } } }) { Text("Check now") }
+                        Button(
+                            enabled = !checkingForUpdates && !downloading,
+                            onClick = { manualCheckRequest++ },
+                        ) { Text(if (checkingForUpdates) "Checking…" else "Check now") }
                     }
                 }
             }
@@ -825,5 +885,5 @@ private fun isKeyboardEnabled(context: Context): Boolean {
 
 private fun isKeyboardSelected(context: Context): Boolean {
     val current = Settings.Secure.getString(context.contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
-    return current?.startsWith(context.packageName) == true
+    return inputMethodBelongsToPackage(current, context.packageName)
 }

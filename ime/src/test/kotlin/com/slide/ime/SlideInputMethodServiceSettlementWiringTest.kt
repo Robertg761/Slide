@@ -24,26 +24,39 @@ class SlideInputMethodServiceSettlementWiringTest {
     @Test
     fun `space and punctuation stop before their dependent commit when settlement is rejected`() {
         assertOrdered(
-            method("handleSpace", "endsWithLetterThenSpace"),
+            method("handleSpace"),
             "if (!finish.settled) return finish.callbackPossible",
             "connection.commitText(text, 1)",
         )
         assertOrdered(
-            method("handleCharacter", "cursorTouchesWord"),
+            method("handleCharacter"),
             "if (!finish.settled) return callbackPossible",
             "val committed = connection.commitText(text, 1)",
         )
     }
 
     @Test
+    fun `space batches composition settlement with its separator callback`() {
+        val space = method("handleSpace")
+        assertOrdered(space, "connection.beginBatchEdit()", "val finish = finishComposing(connection)")
+        assertOrdered(space, "val finish = finishComposing(connection)", "connection.commitText(text, 1)")
+        assertOrdered(
+            space,
+            "callbackPossible = finish.callbackPossible || editorChanged",
+            "} finally {\n            connection.endBatchEdit()",
+        )
+        assertOrdered(space, "connection.endBatchEdit()", "updateShiftFromCursor()")
+    }
+
+    @Test
     fun `swipe and whole-word delete stop before their dependent edit`() {
         assertOrdered(
-            method("decodeAndCommitGesture", "clearGesturePreview"),
+            method("decodeAndCommitGesture"),
             "if (!finish.settled)",
             "commitGestureWord(connection, best.word, selectionBeforeCommit)",
         )
         assertOrdered(
-            method("processDeleteWordGesture", "commitGestureWord"),
+            method("processDeleteWordGesture"),
             "if (!finish.settled)",
             "val selected = connection.getSelectedText(0)",
         )
@@ -51,13 +64,13 @@ class SlideInputMethodServiceSettlementWiringTest {
 
     @Test
     fun `mid-word edits stop when abandon cannot settle the active region`() {
-        val characters = method("handleCharacter", "cursorTouchesWord")
+        val characters = method("handleCharacter")
         assertOrdered(
             characters,
             "val abandonment = abandonComposing(connection)",
             "if (!abandonment.settled) return callbackPossible",
         )
-        val delete = method("handleDelete", "deleteLastGestureCommit")
+        val delete = method("handleDelete")
         assertOrdered(
             delete,
             "val abandonment = abandonComposing(connection)",
@@ -67,13 +80,13 @@ class SlideInputMethodServiceSettlementWiringTest {
 
     @Test
     fun `settlement failures retain composing state`() {
-        val finish = method("finishComposing", "abandonComposing")
+        val finish = method("finishComposing")
         assertOrdered(
             finish,
             "if (!settlement.settled)",
             "composing.setLength(0)",
         )
-        val abandon = method("abandonComposing", "discardComposingForEditorTransition")
+        val abandon = method("abandonComposing")
         assertOrdered(
             abandon,
             "if (!settlement.settled) return settlement",
@@ -83,7 +96,7 @@ class SlideInputMethodServiceSettlementWiringTest {
 
     @Test
     fun `rejected suggestion retains the accepted replacement and never learns it`() {
-        val suggestion = method("pickTypedSuggestion", "updatePredictions")
+        val suggestion = method("pickTypedSuggestion")
         assertOrdered(
             suggestion,
             "if (!suggestion.settled)",
@@ -98,7 +111,7 @@ class SlideInputMethodServiceSettlementWiringTest {
 
     @Test
     fun `finish learning follows the settlements explicit approval flags`() {
-        val finish = method("finishComposing", "abandonComposing")
+        val finish = method("finishComposing")
         assertOrdered(
             finish,
             "if (settlement.learnTypedWord && !recomposed)",
@@ -113,7 +126,7 @@ class SlideInputMethodServiceSettlementWiringTest {
 
     @Test
     fun `gesture adaptation sees only verified replacements and consumed immediate undo`() {
-        val alternative = method("pickGestureAlternative", "applyShift")
+        val alternative = method("pickGestureAlternative")
         assertOrdered(
             alternative,
             "if (!transaction.replaced)",
@@ -121,7 +134,7 @@ class SlideInputMethodServiceSettlementWiringTest {
         )
         assertTrue(alternative.contains("!incognito"))
 
-        val undo = method("deleteLastGestureCommit", "rollbackGestureLearning")
+        val undo = method("deleteLastGestureCommit")
         assertOrdered(
             undo,
             ") ?: return false",
@@ -132,14 +145,14 @@ class SlideInputMethodServiceSettlementWiringTest {
 
     @Test
     fun `both gesture decoders pass through one adaptive and measured seam`() {
-        val decode = method("decodeGesture", "recordSwipeDecision")
+        val decode = method("decodeGesture")
         assertOrdered(decode, "decoder.decode(", "gestureAdaptation.rerank(raw)")
         assertOrdered(decode, "lastDecoderSource", "gestureAdaptation.rerank(raw)")
     }
 
     @Test
     fun `tap captures the completed swipe boundary before consuming gesture undo`() {
-        val commit = method("processKeyCommit", "onGestureComplete")
+        val commit = method("processKeyCommit")
         assertOrdered(
             commit,
             "val swipedWordBehindCursor =",
@@ -153,12 +166,14 @@ class SlideInputMethodServiceSettlementWiringTest {
         )
     }
 
-    private fun method(name: String, nextName: String): String {
+    private fun method(name: String): String {
         val start = source.indexOf("fun $name(")
-        val end = source.indexOf("fun $nextName(", start + 1)
         assertTrue("Missing method $name", start >= 0)
-        assertTrue("Missing method after $name: $nextName", end > start)
-        return source.substring(start, end)
+        // Service methods close at class indentation. A neighboring helper can be renamed or
+        // removed without changing this method's settlement contract.
+        val end = Regex("(?m)^    }$").find(source, start)?.range?.last
+        assertTrue("Missing closing brace for $name", end != null)
+        return source.substring(start, requireNotNull(end) + 1)
     }
 
     private fun assertOrdered(body: String, first: String, second: String) {
