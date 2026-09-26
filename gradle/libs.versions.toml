@@ -2,7 +2,7 @@
 agp = "9.3.0"
 kotlin = "2.4.10"
 coreKtx = "1.19.0"
-customView = "1.1.0"
+customView = "1.2.0"
 appcompat = "1.7.1"
 activityCompose = "1.13.0"
 composeBom = "2026.06.01"
